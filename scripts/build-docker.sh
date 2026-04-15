@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 #
 # build-docker.sh [target]
-# Runs scripts/build.sh inside a Debian builder container. This is the
-# macOS-friendly entry point — Buildroot expects Linux, so we bring Linux.
+# Runs scripts/build.sh inside a Debian builder container. macOS-friendly
+# entry point — Buildroot expects Linux, so we bring Linux.
+#
+# Heavy Buildroot writes (output/ and dl/) go to Docker named volumes, not
+# the bind-mounted repo, because macOS virtiofs mmap misbehaves under
+# Buildroot's write pattern and takes the container down with SIGBUS / EOF.
+# Final images are copied back onto the host bind mount at the end of the
+# build so run-qemu.sh and host tooling can find them as usual.
 #
 # Requires Docker Desktop (or any Docker runtime) on the host.
 #
@@ -11,6 +17,10 @@ set -euo pipefail
 TARGET="${1:-qemu_aarch64}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE_NAME="bunzo-builder:latest"
+OUTPUT_VOL="bunzo-output"
+DL_VOL="bunzo-dl"
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "build-docker: docker is not installed or not on PATH" >&2
@@ -21,11 +31,29 @@ fi
 echo "build-docker: building builder image (cached after first run)"
 docker build -t "${IMAGE_NAME}" -f "${REPO_ROOT}/Dockerfile.builder" "${REPO_ROOT}"
 
+echo "build-docker: ensuring named volumes exist (${OUTPUT_VOL}, ${DL_VOL})"
+docker volume create "${OUTPUT_VOL}" >/dev/null
+docker volume create "${DL_VOL}" >/dev/null
+
+echo "build-docker: chowning volumes to ${HOST_UID}:${HOST_GID}"
+docker run --rm \
+    -v "${OUTPUT_VOL}:/bunzo-output" \
+    -v "${DL_VOL}:/bunzo-dl" \
+    --user 0:0 \
+    "${IMAGE_NAME}" \
+    chown -R "${HOST_UID}:${HOST_GID}" /bunzo-output /bunzo-dl
+
 echo "build-docker: running build.sh ${TARGET} inside container"
 docker run --rm -it \
+    --shm-size=2g \
     -v "${REPO_ROOT}:/src" \
+    -v "${OUTPUT_VOL}:/bunzo-output" \
+    -v "${DL_VOL}:/bunzo-dl" \
     -w /src \
-    --user "$(id -u):$(id -g)" \
+    --user "${HOST_UID}:${HOST_GID}" \
     -e HOME=/tmp \
+    -e BUNZO_OUTPUT_BASE=/bunzo-output \
+    -e BUNZO_DL_DIR=/bunzo-dl \
+    -e BUNZO_HOST_OUTPUT=/src/output \
     "${IMAGE_NAME}" \
     /src/scripts/build.sh "${TARGET}"

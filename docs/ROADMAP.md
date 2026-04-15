@@ -2,59 +2,63 @@
 
 Milestones are deliberately narrow. Each one is a shippable, testable artifact either in QEMU or on real hardware.
 
-## Phase 0 — Bootstrap (current)
+## Phase 0 — Bootstrap
 
 - [x] MIT license
 - [x] Repo scaffolding: `README.md`, `docs/`, `.gitignore`
 - [x] Build-system direction chosen: Buildroot, `BR2_EXTERNAL` pattern, Docker-wrapped, QEMU-first
-- [ ] (next) M1 scaffolding
+- [x] M1 scaffolding
+- [x] M1 Target 1 complete — bunzo boots in QEMU and identifies as bunzo
 
-## Milestone 1 — "Hello, bunzo"
+## Milestone 1 — "Hello, bunzo" ✅
 
 **Goal:** build the first bunzo image end-to-end from Linux kernel source + a from-source userland (no upstream distro), and boot it.
 
 **Scaffolding to create**
 
-- [ ] `board/external.mk`, `board/external.desc`, `board/Config.in` — Buildroot `BR2_EXTERNAL` hooks
-- [ ] `board/bunzo/common/rootfs-overlay/etc/os-release` — `ID=bunzo`, `PRETTY_NAME="bunzo 0.0.1"`
-- [ ] `board/bunzo/common/rootfs-overlay/etc/motd` — bunzo banner
-- [ ] `board/bunzo/common/rootfs-overlay/etc/hostname` — `bunzo`
-- [ ] `board/bunzo/common/linux.fragment` — kernel-config additions (cgroups v2, namespaces, seccomp, audit, overlayfs, hardware RNG)
-- [ ] `board/bunzo/common/post-build.sh` — post-rootfs hook
-- [ ] `scripts/bootstrap.sh` — clone Buildroot at a pinned tag into `./buildroot/`
-- [ ] `scripts/build.sh` — wrap `make -C buildroot` with `BR2_EXTERNAL`
-- [ ] `scripts/run-qemu.sh` — boot the image in `qemu-system-aarch64 -M virt`
-- [ ] `Dockerfile.builder` + `scripts/build-docker.sh` — macOS-friendly build wrapper
+- [x] `board/external.mk`, `board/external.desc`, `board/Config.in` — Buildroot `BR2_EXTERNAL` hooks
+- [x] `board/bunzo/common/rootfs-overlay/etc/os-release` — `ID=bunzo`, `PRETTY_NAME="bunzo 0.0.1"`
+- [x] `board/bunzo/common/rootfs-overlay/etc/motd` — bunzo banner
+- [x] `board/bunzo/common/rootfs-overlay/etc/hostname` — `bunzo`
+- [x] `board/bunzo/common/linux.fragment` — kernel-config additions (cgroups v2, namespaces, seccomp, audit, overlayfs, hardware RNG)
+- [x] `board/bunzo/common/post-build.sh` — post-rootfs hook
+- [x] `scripts/bootstrap.sh` — clone Buildroot at a pinned tag into `./buildroot/`
+- [x] `scripts/build.sh` — wrap `make -C buildroot` with `BR2_EXTERNAL`
+- [x] `scripts/run-qemu.sh` — boot the image in `qemu-system-aarch64 -M virt`
+- [x] `Dockerfile.builder` + `scripts/build-docker.sh` — macOS-friendly build wrapper
 
-**Target 1 (minimum)**
+**Target 1 (minimum) ✅**
 
-- [ ] `board/bunzo/configs/bunzo_qemu_aarch64_defconfig`
-- [ ] Full build succeeds end-to-end in Docker on macOS
-- [ ] `./scripts/run-qemu.sh qemu_aarch64` boots the image
-- [ ] Banner shows on first screen; `cat /etc/os-release` shows `ID=bunzo`; `hostname` returns `bunzo`
+- [x] `board/configs/bunzo_qemu_aarch64_defconfig`
+- [x] Full build succeeds end-to-end in Docker on macOS
+- [x] `./scripts/run-qemu.sh qemu_aarch64` boots the image
+- [x] Banner shows on first screen; `cat /etc/os-release` shows `ID=bunzo`; `hostname` returns `bunzo`; `systemctl --version` confirms systemd is init
 
 **Target 2 (stretch — real Pi hardware)**
 
-- [ ] `board/bunzo/configs/bunzo_rpi4_defconfig`
+- [ ] `board/configs/bunzo_rpi4_defconfig`
 - [ ] Build produces `dist/bunzo-rpi4-0.0.1.img`
 - [ ] Image boots on a real Pi 4 from SD
 - [ ] Same banner / os-release / hostname on hardware
 
 **Target 3 (stretch — generic PC)**
 
-- [ ] `board/bunzo/configs/bunzo_pc_x86_64_defconfig`
+- [ ] `board/configs/bunzo_pc_x86_64_defconfig`
 - [ ] Build produces `dist/bunzo-pc-x86_64-0.0.1.img` (or `.iso`)
 - [ ] USB-flashed image boots on a UEFI laptop
 - [ ] Same banner / os-release / hostname
 
-**Definition of done (minimum):** `./scripts/build.sh qemu_aarch64` builds from scratch, `./scripts/run-qemu.sh qemu_aarch64` boots it, and the running system identifies as bunzo.
+**Definition of done (minimum):** `./scripts/build-docker.sh qemu_aarch64` builds from scratch, `./scripts/run-qemu.sh qemu_aarch64` boots it, and the running system identifies as bunzo. **Met on 2026-04-15.**
+
+**Followups surfaced by the first boot:**
+
+- systemd was built without seccomp, audit, or PAM support (`systemctl --version` → `-SECCOMP -AUDIT -PAM`). The kernel has these compiled in, but systemd can't apply them to services without the userland libs. Needs `BR2_PACKAGE_LIBSECCOMP=y` + the systemd feature toggles before M4 agent sandboxing.
 
 ## Milestone 2 — "Chat shell (stub)"
 
 **Goal:** bunzo boots directly into a chat-like shell instead of a login prompt.
 
-- [ ] Migrate init from busybox init to systemd (if M1 used busybox init)
-- [ ] A simple TUI launched as a service on `tty1`, replacing getty
+- [ ] A simple TUI launched as a systemd unit on `tty1`, replacing getty
 - [ ] Echoes user input back with a bunzo-style response (no LLM yet)
 - [ ] Ctrl-Alt-F2 still gives a normal shell as an escape hatch
 - [ ] Survives reboot and works identically in QEMU and on Pi 4
