@@ -1,0 +1,4 @@
+# bunzo external Buildroot tree.
+#
+# Custom packages (e.g. bunzod, chat shell, skills) will be sourced from
+# here once they exist under board/bunzo/package/. Empty for M1.

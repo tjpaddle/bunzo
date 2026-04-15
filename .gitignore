@@ -1,0 +1,61 @@
+# --- Local working notes (kept out of git on purpose) ---
+STATE.md
+NOTES.md
+TODO.md
+SCRATCH.md
+WORKLOG.md
+*.local.md
+*.private.md
+
+# --- Tool-specific notes kept local ---
+CLAUDE.md
+claude.md
+AGENTS.md
+agents.md
+AGENT.md
+agent.md
+AI.md
+ai.md
+.claude/
+.bunzo/
+
+# --- Buildroot (cloned, not vendored) ---
+/buildroot/
+/output/
+/dl/
+
+# --- Build artifacts ---
+/build/
+/dist/
+*.img
+*.img.xz
+*.img.gz
+*.img.zip
+*.iso
+*.zip
+*.tar.gz
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- Rust (future) ---
+/target/
+
+# --- Editor / OS cruft ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Secrets / env ---
+.env
+.env.*
+!.env.example

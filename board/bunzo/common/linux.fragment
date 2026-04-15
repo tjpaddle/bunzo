@@ -1,0 +1,65 @@
+# bunzo kernel config fragment
+#
+# Layered on top of the architecture's default config via Buildroot's
+# BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES. Many of these are already set
+# in upstream defconfigs for aarch64/x86_64 — listed explicitly here so
+# bunzo's requirements are visible in one place.
+
+# --- Cgroups v2 (systemd + future agent sandboxing) ---
+CONFIG_CGROUPS=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_BPF=y
+CONFIG_CPUSETS=y
+CONFIG_MEMCG=y
+
+# --- Namespaces (systemd sandboxing + future skill sandboxes) ---
+CONFIG_NAMESPACES=y
+CONFIG_UTS_NS=y
+CONFIG_IPC_NS=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+CONFIG_USER_NS=y
+
+# --- Seccomp (filtered syscall whitelists for skills) ---
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+
+# --- Audit (action ledger) ---
+CONFIG_AUDIT=y
+CONFIG_AUDITSYSCALL=y
+
+# --- Keys / keyring (systemd credentials) ---
+CONFIG_KEYS=y
+
+# --- Overlayfs (future read-only rootfs + writable state overlay) ---
+CONFIG_OVERLAY_FS=y
+
+# --- systemd-required kernel pieces ---
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_TMPFS_XATTR=y
+CONFIG_AUTOFS_FS=y
+CONFIG_FHANDLE=y
+CONFIG_INOTIFY_USER=y
+CONFIG_SIGNALFD=y
+CONFIG_TIMERFD=y
+CONFIG_EPOLL=y
+CONFIG_NET=y
+CONFIG_SYSFS=y
+CONFIG_PROC_FS=y
+
+# --- Hardware RNG for early entropy ---
+CONFIG_HW_RANDOM=y
+CONFIG_HW_RANDOM_VIRTIO=y
+
+# --- virtio transports for QEMU ---
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_CONSOLE=y
