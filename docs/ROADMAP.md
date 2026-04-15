@@ -7,6 +7,7 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 - [x] MIT license
 - [x] Repo scaffolding: `README.md`, `docs/`, `.gitignore`
 - [x] Build-system direction chosen: Buildroot, `BR2_EXTERNAL` pattern, Docker-wrapped, QEMU-first
+- [x] Language decision: **Rust** for all bunzo-written code; WASM (via `wasmtime`) for skills
 - [x] M1 scaffolding
 - [x] M1 Target 1 complete — bunzo boots in QEMU and identifies as bunzo
 
@@ -56,39 +57,60 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 
 ## Milestone 2 — "Chat shell (stub)"
 
-**Goal:** bunzo boots directly into a chat-like shell instead of a login prompt.
+**Goal:** bunzo boots directly into a Rust-powered chat-like TUI instead of a login prompt.
 
-- [ ] A simple TUI launched as a systemd unit on `tty1`, replacing getty
-- [ ] Echoes user input back with a bunzo-style response (no LLM yet)
-- [ ] Ctrl-Alt-F2 still gives a normal shell as an escape hatch
+**Builder changes**
+
+- [ ] Extend `Dockerfile.builder` with `rustup` + the `aarch64-unknown-linux-musl` target (and later `x86_64-unknown-linux-musl`)
+- [ ] Add a `bunzo-cargo` Docker named volume for the Cargo registry/git/target caches, same pattern as `bunzo-output` / `bunzo-dl`
+
+**Crate**
+
+- [ ] `rust/bunzo-shell/` Cargo crate — minimal TUI using `ratatui` + `crossterm`
+- [ ] Stub behavior: echoes user input back with a bunzo-style canned response (no LLM yet)
+- [ ] Reads its banner/version from `/etc/os-release` so the shell and the OS stay in sync
+
+**Wiring into the image**
+
+- [ ] `scripts/build.sh` cargo-builds `bunzo-shell` before invoking Buildroot and stages the static musl binary into `board/bunzo/common/rootfs-overlay/usr/bin/bunzo-shell`
+- [ ] systemd unit `board/bunzo/common/rootfs-overlay/etc/systemd/system/bunzo-shell.service` runs `bunzo-shell` on `tty1` in place of the default getty
+- [ ] Ctrl-Alt-F2 still gives a normal `getty` shell as an escape hatch
 - [ ] Survives reboot and works identically in QEMU and on Pi 4
-- [ ] Python runtime included in the rootfs (we need it for the stub and for M3)
 
-**Definition of done:** fresh boot shows the chat shell, not a login prompt; typing "hello" gets a response; escape hatch works.
+**Non-goals for M2**
+
+- No LLM calls. No `bunzod`. No skills. The shell is fully self-contained.
+
+**Definition of done:** fresh boot shows the Rust chat shell on `tty1`, typing "hello" gets a bunzo-style stub response, Ctrl-Alt-F2 gives a normal login escape hatch, and `ps` shows `bunzo-shell` under 5 MB RSS.
 
 ## Milestone 3 — "Actual agent"
 
-**Goal:** the chat shell is backed by a real LLM.
+**Goal:** the chat shell is backed by a real LLM via a Rust daemon.
 
-- [ ] `bunzod` daemon (Python to start) with a local Unix-socket API
-- [ ] Chat shell talks to `bunzod`, not to an LLM directly
-- [ ] Pluggable backend: remote API first (easy to prototype), local model (llama.cpp) added in parallel
-- [ ] Append every exchange to an action-ledger file on disk
-- [ ] Skill registry scaffolding (even if it starts empty)
+- [ ] `rust/bunzod/` Cargo crate — Rust agent daemon on `tokio`
+- [ ] Local Unix-socket API at `/run/bunzod.sock` (length-prefixed JSON request/response to start; can move to `postcard` once the shape is stable)
+- [ ] `bunzo-shell` talks to `bunzod` over the socket; no direct LLM calls from the shell
+- [ ] Pluggable backend behind a Rust trait, with two implementations:
+  - Remote: `async-openai` (or equivalent) for easy prototyping
+  - Local: `candle` or a `llama.cpp` FFI binding, added in parallel
+- [ ] Append every exchange to an action-ledger file on disk (append-only JSONL to start)
+- [ ] Skill registry scaffolding — empty, but hook points are in place for M4
+- [ ] systemd unit for `bunzod` with socket activation
 
-**Definition of done:** user says "what time is it?", agent answers with system time, ledger records the exchange.
+**Definition of done:** from the chat shell, the user asks "what time is it?", `bunzod` answers with system time via the configured backend, the ledger records the exchange, and `bunzod` idles under 10 MB RSS when no model is loaded.
 
 ## Milestone 4 — "First skill"
 
 **Goal:** the agent can do something in the world through a sandboxed skill.
 
-- [ ] Skill interface defined (tiny — one input, one output, capability manifest)
-- [ ] One real skill end-to-end: e.g. `set-reminder` or `read-local-file` with an explicit path whitelist
+- [ ] Skill interface defined as a **WebAssembly module + manifest**: a `wasm32-wasi` binary exporting a narrow entry point, plus a TOML manifest declaring the capabilities the skill needs
+- [ ] `bunzod` embeds `wasmtime` and exposes a capability-scoped host API (path-whitelisted file reads, timers, HTTP to explicit hosts, etc.)
+- [ ] One real skill end-to-end, compiled to WASM: e.g. `set-reminder` or `read-local-file`
 - [ ] Policy check before skill invocation; denial is the default
-- [ ] Sandbox primitives in place: seccomp + namespaces + cgroups
 - [ ] Ledger records which skill ran, with what inputs, and the result
+- [ ] Sandboxing comes from the `wasmtime` boundary itself — no `bwrap`/`nsjail`/seccomp juggling for the skill runner. (systemd-side seccomp/audit still matters for non-skill services and is handled separately.)
 
-**Definition of done:** user asks for a reminder, skill fires, reminder shows up on time, ledger records it.
+**Definition of done:** user asks for a reminder, the WASM skill fires inside `bunzod`, the reminder shows up on time, the ledger records it, and the skill only touches the resources its manifest declared.
 
 ## Milestone 5 — "Phone pairing"
 
