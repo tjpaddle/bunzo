@@ -2,18 +2,15 @@
 #
 # remote-qemu.sh [target]
 #
-# Boots the most-recently-built bunzo image on the remote Linux host inside
-# a tmux session, and attaches your terminal to that session via SSH. The
-# QEMU process lives inside tmux on the remote, so an SSH disconnect leaves
-# QEMU alive — re-running this script re-attaches to the same session.
+# Boots the most-recently-built bunzo image on the remote Linux host and
+# attaches your terminal to it over SSH.
 #
-# Inside the session:
-#   Ctrl-B D    detach tmux (QEMU keeps running on the remote)
-#   Ctrl-A X    exit QEMU cleanly (kills the tmux session too)
-#   Ctrl-A C    open the QEMU monitor
+# Default mode is a direct SSH session with no tmux involved. QEMU is tied to
+# the SSH session, so closing the terminal or dropping the connection ends the
+# remote QEMU process too. This matches the normal "run it and watch it" loop.
 #
-# To kill a stuck session manually:
-#   ssh -p <port> <user>@<host> 'tmux kill-session -t bunzo-qemu'
+# Optional env override:
+#   BUNZO_REMOTE_QEMU_PERSIST=1   run QEMU inside tmux so SSH drops do not kill it
 #
 # Same host config as remote-build.sh (scripts/remote.env.local).
 #
@@ -36,25 +33,49 @@ BUNZO_REMOTE_HOST="${BUNZO_REMOTE_HOST:-filextract-server}"
 BUNZO_REMOTE_USER="${BUNZO_REMOTE_USER:-filextract}"
 BUNZO_REMOTE_PATH="${BUNZO_REMOTE_PATH:-/home/filextract/bunzo}"
 BUNZO_REMOTE_PORT="${BUNZO_REMOTE_PORT:-2299}"
+BUNZO_REMOTE_QEMU_PERSIST="${BUNZO_REMOTE_QEMU_PERSIST:-0}"
 
 SESSION="bunzo-qemu"
 
 echo "remote-qemu: target=${TARGET} on ${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}:${BUNZO_REMOTE_PORT}"
-echo "remote-qemu: tmux session '${SESSION}' (Ctrl-B D detaches; Ctrl-A X exits QEMU)"
+if [[ "${BUNZO_REMOTE_QEMU_PERSIST}" == "1" ]]; then
+    echo "remote-qemu: persistent mode via tmux session '${SESSION}' (Ctrl-B D detaches; Ctrl-A X exits QEMU)"
+else
+    echo "remote-qemu: direct mode (no tmux). Ctrl-A X exits QEMU; closing SSH ends it."
+fi
 
-# `tmux new-session -A -s NAME 'cmd'` creates the session and runs cmd if it
-# doesn't exist, or attaches to the existing session if it does. Either way
-# the local terminal ends up attached.
 run_remote() {
-    ssh \
+    if [[ "${BUNZO_REMOTE_QEMU_PERSIST}" == "1" ]]; then
+        ssh \
+            -t \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=15 \
+            -p "${BUNZO_REMOTE_PORT}" \
+            "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
+            "tmux new-session -A -s '${SESSION}' \"cd '${BUNZO_REMOTE_PATH}' && ./scripts/run-qemu.sh '${TARGET}'\""
+    else
+        ssh \
+            -t \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=3 \
+            -o ConnectTimeout=15 \
+            -p "${BUNZO_REMOTE_PORT}" \
+            "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
+            "cd '${BUNZO_REMOTE_PATH}' && ./scripts/run-qemu.sh '${TARGET}'"
+    fi
+}
+
+if [[ "${BUNZO_REMOTE_QEMU_PERSIST}" != "1" ]]; then
+    exec ssh \
         -t \
         -o ServerAliveInterval=15 \
         -o ServerAliveCountMax=3 \
         -o ConnectTimeout=15 \
         -p "${BUNZO_REMOTE_PORT}" \
         "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
-        "tmux new-session -A -s '${SESSION}' \"cd '${BUNZO_REMOTE_PATH}' && ./scripts/run-qemu.sh '${TARGET}'\""
-}
+        "cd '${BUNZO_REMOTE_PATH}' && ./scripts/run-qemu.sh '${TARGET}'"
+fi
 
 ATTEMPT=0
 while true; do

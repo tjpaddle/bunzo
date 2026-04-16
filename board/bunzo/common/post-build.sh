@@ -16,12 +16,9 @@ for f in /etc/os-release /etc/motd /etc/hostname; do
 done
 
 if [[ -f "${TARGET_DIR}/etc/systemd/system/bunzo-shell.service" ]]; then
-    mkdir -p "${TARGET_DIR}/etc/systemd/system/multi-user.target.wants"
-    ln -sf ../bunzo-shell.service \
-        "${TARGET_DIR}/etc/systemd/system/multi-user.target.wants/bunzo-shell.service"
-    ln -sf /dev/null \
-        "${TARGET_DIR}/etc/systemd/system/serial-getty@ttyAMA0.service"
-    echo "post-build: enabled bunzo-shell.service, masked serial-getty@ttyAMA0"
+    rm -f "${TARGET_DIR}/etc/systemd/system/serial-getty@ttyAMA0.service"
+    rm -f "${TARGET_DIR}/etc/systemd/system/multi-user.target.wants/bunzo-shell.service"
+    echo "post-build: recovery mode enabled; serial-getty@ttyAMA0 left available, bunzo-shell not auto-started"
 fi
 
 if [[ ! -x "${TARGET_DIR}/usr/bin/bunzo-shell" ]]; then

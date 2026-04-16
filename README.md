@@ -6,7 +6,7 @@ bunzo is an operating system built around the idea that AI agents should be a fi
 
 ## Status
 
-Early prototype. The current focus is bringing up a minimal custom image on Raspberry Pi that boots into a bunzo-branded shell. See [docs/ROADMAP.md](docs/ROADMAP.md) for milestones.
+Early prototype. QEMU boot and recovery login now work, and `bunzo-shell` has been verified manually in serial mode on the guest console. The current focus is making bunzo boot directly into that shell again without losing a recovery escape hatch. See [docs/ROADMAP.md](docs/ROADMAP.md) for milestones.
 
 ## Building
 
@@ -33,6 +33,11 @@ bunzo is built from source with Buildroot. Three supported flows:
   ```
   ./scripts/remote-build.sh qemu_aarch64   # push + remote pull + remote build
   ./scripts/remote-qemu.sh  qemu_aarch64   # boot on remote, serial over ssh
+  ```
+  `remote-build.sh` builds the branch state that has been committed and pushed to `origin`; it does not include uncommitted local edits unless you sync them to the remote separately.
+  If you want the old persistent QEMU session that survives SSH drops, run:
+  ```
+  BUNZO_REMOTE_QEMU_PERSIST=1 ./scripts/remote-qemu.sh qemu_aarch64
   ```
   `scripts/remote.env.local` is gitignored so host details stay off GitHub.
 

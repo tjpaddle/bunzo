@@ -59,6 +59,7 @@ bunzo's own code is written in **Rust**. This is a foundational decision driven 
 - **Why Rust over Python:** no interpreter, no GC, no runtime baggage. A `tokio`-based service idles at 5–10 MB RSS; a tight service can sit under 5 MB. Python would add ~30 MB to the rootfs plus per-process interpreter overhead.
 - **Why Rust over Go:** Go's runtime adds a 2–5 MB floor per process plus GC overhead. Rust gives a cleaner single-static-binary story on embedded targets and lets us share buffers with C libraries (`llama.cpp` etc.) at zero cost.
 - **TUI:** `ratatui` + `crossterm`. The chat shell on `tty1` is a Rust TUI, not a Python script or a shell loop.
+- **Current serial-shell reality:** on the QEMU / PL011 serial console, the proven interaction mode today is plain line-oriented stdin/stdout on `ttyAMA0`. The richer `ratatui` / `crossterm` fullscreen path is still in the codebase, but it is not yet reliable enough to be the boot-critical path there.
 - **Async runtime:** `tokio` for `bunzod` and any other long-lived network-facing services. Keep it single-threaded where possible to minimize per-process overhead.
 - **Skill runtime:** WebAssembly via `wasmtime` embedded in `bunzod`. Skills compile to `wasm32-wasi` and run inside the daemon with capability-scoped host functions. This replaces the earlier plan to juggle `bwrap`/`nsjail` + seccomp for skill isolation — the `wasmtime` boundary is the sandbox.
 - **Not written in Rust:** the kernel, libc, systemd, coreutils, openssh, and everything else Buildroot assembles for us. We pick and configure those but write none of their code.
@@ -72,6 +73,7 @@ bunzo's own code is written in **Rust**. This is a foundational decision driven 
 - **Init / service manager:** **systemd**. Decided in the M1 scaffolding batch — rejected the "busybox init first, migrate in M2" path because we would have replaced it immediately for socket activation and service supervision. The 20–40 MB cost is acceptable for an agent OS.
 - **Userland:** Buildroot-assembled minimal rootfs — coreutils, bash, openssh, networking tools, `ca-certificates`, `haveged`, `sudo`. No language runtime — bunzo's own code (M2+) is Rust, cross-compiled to static musl binaries and staged via the rootfs overlay.
 - **Identity:** `/etc/os-release`, `/etc/motd`, `/etc/hostname` — set to bunzo.
+- **Shell stub (M2 in progress):** `bunzo-shell` is in the image. Recovery boot to `serial-getty@ttyAMA0` works, and launching `/usr/bin/bunzo-shell` manually from that console works in serial mode. The remaining work is boot-time console ownership plus a deliberate recovery mechanism.
 - **No agent runtime yet.** M1 exists to prove the from-source build-boot loop, not to land the agent layer.
 
 ## Later

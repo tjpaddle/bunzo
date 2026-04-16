@@ -57,7 +57,7 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 
 ## Milestone 2 — "Chat shell (stub)"
 
-**Goal:** bunzo boots directly into a Rust-powered chat-like TUI instead of a login prompt.
+**Goal:** bunzo boots directly into a Rust-powered chat-like shell instead of a login prompt.
 
 **Builder changes**
 
@@ -67,23 +67,25 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 
 **Crate**
 
-- [x] `rust/bunzo-shell/` Cargo crate — minimal TUI using `ratatui` + `crossterm`
+- [x] `rust/bunzo-shell/` Cargo crate — minimal Rust chat shell; current proven path is line-oriented serial mode, with a richer `ratatui` / `crossterm` path still scaffolded
 - [x] Stub behavior: echoes user input back with a bunzo-style canned response (no LLM yet)
 - [x] Reads its banner/version from `/etc/os-release` so the shell and the OS stay in sync
 
 **Wiring into the image**
 
 - [x] `scripts/build.sh` cargo-builds `bunzo-shell` before invoking Buildroot and stages the static musl binary into `board/bunzo/common/rootfs-overlay/usr/bin/bunzo-shell`
-- [x] systemd unit `board/bunzo/common/rootfs-overlay/etc/systemd/system/bunzo-shell.service` runs `bunzo-shell` on `ttyAMA0` in place of the default getty (note: `tty1` doesn't exist on `-M virt`; we use `ttyAMA0`)
-- [ ] **OPEN:** TUI actually renders on the PL011 serial console (currently boots to a blank console after `Reached target multi-user.target`). See `STATE.md` "Current focus" for the diagnostic plan.
-- [ ] An escape hatch (recovery getty, sshd, or kernel-cmdline-toggleable getty) — see `STATE.md` "Open questions"
+- [x] Recovery boot path restored: `serial-getty@ttyAMA0` is available again, so QEMU boots to `bunzo login:` instead of a blind handoff
+- [x] Manual `/usr/bin/bunzo-shell` works from the recovery console in serial mode on `ttyAMA0`
+- [ ] **OPEN:** boot directly into the proven serial-mode shell instead of the login prompt
+- [ ] An explicit recovery path once `bunzo-shell` owns boot again — see `STATE.md` "Open questions"
+- [ ] **OPEN:** decide whether fullscreen `ratatui` on the PL011 serial console is part of M2 or deferred
 - [ ] Survives reboot and works identically in QEMU and on Pi 4
 
 **Non-goals for M2**
 
 - No LLM calls. No `bunzod`. No skills. The shell is fully self-contained.
 
-**Definition of done:** fresh boot shows the Rust chat shell on the serial console, typing "hello" gets a bunzo-style stub response, an escape hatch exists for recovery, and `ps` shows `bunzo-shell` under 5 MB RSS.
+**Definition of done:** fresh boot shows the Rust chat shell on the serial console, typing "hello" gets a bunzo-style stub response, an explicit recovery path exists, and `ps` shows `bunzo-shell` under 5 MB RSS.
 
 ## Milestone 3 — "Actual agent"
 
