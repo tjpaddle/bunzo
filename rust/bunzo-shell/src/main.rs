@@ -2,9 +2,9 @@ use std::fs;
 use std::io::{self, Stdout};
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -74,17 +74,16 @@ fn main() -> io::Result<()> {
 fn setup_terminal() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // No EnterAlternateScreen / EnableMouseCapture: bunzo's primary console is a
+    // PL011 UART (ttyAMA0), which is a dumb serial line — neither escape works
+    // there. Clear the screen instead so the TUI starts on a fresh canvas.
+    execute!(stdout, Clear(ClearType::All))?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
 fn restore_terminal(terminal: &mut Tui) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), Clear(ClearType::All))?;
     terminal.show_cursor()
 }
 
