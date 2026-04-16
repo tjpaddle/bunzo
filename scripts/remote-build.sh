@@ -80,6 +80,13 @@ if [[ ! -d buildroot ]]; then
     ./scripts/bootstrap.sh
 fi
 
+# rustup installs cargo to ~/.cargo/bin and sources it from ~/.cargo/env, which
+# interactive shells pick up but `ssh host bash -s` does not. Pull it in here so
+# build.sh can find cargo for the bunzo-shell cross-compile step.
+if [[ -f "\${HOME}/.cargo/env" ]]; then
+    . "\${HOME}/.cargo/env"
+fi
+
 ./scripts/build.sh "\${TARGET}"
 echo "[remote] build complete for \${TARGET}"
 REMOTE
