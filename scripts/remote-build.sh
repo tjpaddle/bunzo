@@ -9,8 +9,9 @@
 #
 # The build runs detached on the remote (setsid + nohup), writing to
 # build.log, with its pid in build.pid and final exit code in build.exit.
-# The local ssh session just tails build.log, so dropping the SSH tunnel
-# does not kill the build — reconnect with scripts/remote-attach.sh.
+# The local ssh session just tails build.log. If the SSH connection drops
+# (consumer NAT, Wi-Fi blip, ISP CGNAT reset), this script auto-reconnects
+# and re-attaches to the still-running build.
 #
 # Configure once by copying scripts/remote.env.example to
 # scripts/remote.env.local and filling in your host details. That file is
@@ -56,19 +57,21 @@ echo "remote-build: ssh -p ${BUNZO_REMOTE_PORT} ${BUNZO_REMOTE_USER}@${BUNZO_REM
 echo "remote-build: target=${TARGET} branch=${BUNZO_REMOTE_BRANCH} path=${BUNZO_REMOTE_PATH}"
 echo "remote-build: repo=${REPO_URL}"
 
-# Env vars are passed via `VAR=... bash -s` rather than heredoc expansion, so
-# the heredoc can be quoted (<<'REMOTE') and read as literal bash with no
-# client-side escaping gymnastics.
-exec ssh \
-    -o ServerAliveInterval=30 \
-    -o ServerAliveCountMax=10 \
-    -p "${BUNZO_REMOTE_PORT}" \
-    "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
-    "BUNZO_REMOTE_PATH='${BUNZO_REMOTE_PATH}' \
-     BUNZO_REMOTE_BRANCH='${BUNZO_REMOTE_BRANCH}' \
-     TARGET='${TARGET}' \
-     REPO_URL='${REPO_URL}' \
-     bash -s" <<'REMOTE'
+# Wrap the ssh invocation in a function so the heredoc can be re-evaluated
+# on each retry. Bash does NOT rewind a heredoc in a while-loop-around-`ssh`
+# construct, but it does re-read it on every function call.
+run_remote() {
+    ssh \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=3 \
+        -o ConnectTimeout=15 \
+        -p "${BUNZO_REMOTE_PORT}" \
+        "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
+        "BUNZO_REMOTE_PATH='${BUNZO_REMOTE_PATH}' \
+         BUNZO_REMOTE_BRANCH='${BUNZO_REMOTE_BRANCH}' \
+         TARGET='${TARGET}' \
+         REPO_URL='${REPO_URL}' \
+         bash -s" <<'REMOTE'
 set -euo pipefail
 
 REMOTE_PATH="${BUNZO_REMOTE_PATH}"
@@ -112,8 +115,6 @@ else
     : > "${LOG_FILE}"
     rm -f "${EXIT_FILE}"
     # setsid + nohup + stdin from /dev/null = survives SSH disconnect.
-    # The exit code of build.sh is written to EXIT_FILE so the caller can
-    # report it after tail finishes.
     setsid nohup bash -c "
         cd '${REMOTE_PATH}'
         if [[ -f \"\${HOME}/.cargo/env\" ]]; then . \"\${HOME}/.cargo/env\"; fi
@@ -123,28 +124,57 @@ else
     BUILD_PID=$!
     echo "${BUILD_PID}" > "${PID_FILE}"
     disown || true
-    # Give nohup a beat to flush its first lines so tail -F starts from content.
     sleep 1
 fi
 
 echo "[remote] tailing build.log (Ctrl-C here is safe — build keeps running)"
-echo "[remote] to reconnect later: ./scripts/remote-attach.sh"
 echo "----"
-
-# tail --pid exits when the build process dies. || true keeps set -e happy.
 tail -n +1 -F --pid="${BUILD_PID}" "${LOG_FILE}" || true
-
 echo "----"
+
 if [[ -f "${EXIT_FILE}" ]]; then
     EXIT_CODE="$(cat "${EXIT_FILE}")"
     rm -f "${PID_FILE}"
     echo "[remote] build finished with exit code ${EXIT_CODE}"
-    if [[ "${EXIT_CODE}" == "0" ]]; then
-        echo "[remote] boot it with: ./scripts/remote-qemu.sh ${TARGET}"
-    fi
     exit "${EXIT_CODE}"
 else
-    echo "[remote] build ended but no exit code recorded (see ${LOG_FILE})"
+    echo "[remote] build ended but no exit code recorded (see build.log)"
     exit 1
 fi
 REMOTE
+}
+
+# Retry loop: if ssh itself dies (code 255 = transport failure), reconnect
+# and re-run the remote script. The remote script is idempotent — on
+# reconnect it finds the still-running build via build.pid and re-tails
+# build.log rather than starting a second build.
+ATTEMPT=0
+while true; do
+    ATTEMPT=$((ATTEMPT + 1))
+    if [[ "${ATTEMPT}" -gt 1 ]]; then
+        echo "remote-build: reconnecting (attempt ${ATTEMPT})"
+    fi
+
+    set +e
+    run_remote
+    SSH_CODE=$?
+    set -e
+
+    case "${SSH_CODE}" in
+        0)
+            exit 0
+            ;;
+        130)
+            echo "remote-build: interrupted by user (Ctrl-C). Build still running on remote — reconnect with ./scripts/remote-attach.sh"
+            exit 130
+            ;;
+        255)
+            echo "remote-build: ssh transport failure (code 255); reconnecting in 3s..."
+            sleep 3
+            ;;
+        *)
+            echo "remote-build: exited with code ${SSH_CODE}"
+            exit "${SSH_CODE}"
+            ;;
+    esac
+done

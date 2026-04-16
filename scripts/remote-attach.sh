@@ -8,7 +8,8 @@
 # prints the tail of the last log instead.
 #
 # Safe to run from any machine/network — the build lives in a setsid'd
-# process on the remote, independent of any SSH tunnel.
+# process on the remote, independent of any SSH tunnel. If the SSH
+# connection drops mid-tail, this script auto-reconnects.
 #
 set -euo pipefail
 
@@ -28,12 +29,14 @@ source "${ENV_FILE}"
 : "${BUNZO_REMOTE_PATH:?set BUNZO_REMOTE_PATH in scripts/remote.env.local}"
 BUNZO_REMOTE_PORT="${BUNZO_REMOTE_PORT:-22}"
 
-exec ssh \
-    -o ServerAliveInterval=30 \
-    -o ServerAliveCountMax=10 \
-    -p "${BUNZO_REMOTE_PORT}" \
-    "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
-    "BUNZO_REMOTE_PATH='${BUNZO_REMOTE_PATH}' bash -s" <<'REMOTE'
+run_remote() {
+    ssh \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=3 \
+        -o ConnectTimeout=15 \
+        -p "${BUNZO_REMOTE_PORT}" \
+        "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
+        "BUNZO_REMOTE_PATH='${BUNZO_REMOTE_PATH}' bash -s" <<'REMOTE'
 set -euo pipefail
 LOG_FILE="${BUNZO_REMOTE_PATH}/build.log"
 EXIT_FILE="${BUNZO_REMOTE_PATH}/build.exit"
@@ -66,3 +69,34 @@ if [[ -f "${EXIT_FILE}" ]]; then
     echo "remote-attach: last build exit code: $(cat "${EXIT_FILE}")"
 fi
 REMOTE
+}
+
+ATTEMPT=0
+while true; do
+    ATTEMPT=$((ATTEMPT + 1))
+    if [[ "${ATTEMPT}" -gt 1 ]]; then
+        echo "remote-attach: reconnecting (attempt ${ATTEMPT})"
+    fi
+
+    set +e
+    run_remote
+    SSH_CODE=$?
+    set -e
+
+    case "${SSH_CODE}" in
+        0)
+            exit 0
+            ;;
+        130)
+            echo "remote-attach: interrupted by user"
+            exit 130
+            ;;
+        255)
+            echo "remote-attach: ssh transport failure (code 255); reconnecting in 3s..."
+            sleep 3
+            ;;
+        *)
+            exit "${SSH_CODE}"
+            ;;
+    esac
+done
