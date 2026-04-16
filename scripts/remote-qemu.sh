@@ -32,10 +32,10 @@ fi
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 
-: "${BUNZO_REMOTE_HOST:?set BUNZO_REMOTE_HOST in scripts/remote.env.local}"
-: "${BUNZO_REMOTE_USER:?set BUNZO_REMOTE_USER in scripts/remote.env.local}"
-: "${BUNZO_REMOTE_PATH:?set BUNZO_REMOTE_PATH in scripts/remote.env.local}"
-BUNZO_REMOTE_PORT="${BUNZO_REMOTE_PORT:-22}"
+BUNZO_REMOTE_HOST="${BUNZO_REMOTE_HOST:-filextract-server}"
+BUNZO_REMOTE_USER="${BUNZO_REMOTE_USER:-filextract}"
+BUNZO_REMOTE_PATH="${BUNZO_REMOTE_PATH:-/home/filextract/bunzo}"
+BUNZO_REMOTE_PORT="${BUNZO_REMOTE_PORT:-2299}"
 
 SESSION="bunzo-qemu"
 

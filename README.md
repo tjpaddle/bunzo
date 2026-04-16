@@ -26,8 +26,8 @@ bunzo is built from source with Buildroot. Three supported flows:
 - **macOS driving a remote Linux builder (recommended for iteration).** Edit locally, let a helper script push to GitHub, pull on the remote, and build there. Boot the resulting image in QEMU over SSH. One-time setup:
   ```
   cp scripts/remote.env.example scripts/remote.env.local
-  $EDITOR scripts/remote.env.local         # host/port/user/path
-  ssh-copy-id -p <port> <user>@<host>      # optional but recommended
+  $EDITOR scripts/remote.env.local         # host alias/port/user/path
+  ssh-copy-id -p 2299 filextract@filextract-server
   ```
   Then:
   ```
