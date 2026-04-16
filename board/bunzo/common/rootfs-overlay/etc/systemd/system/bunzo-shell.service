@@ -1,0 +1,22 @@
+[Unit]
+Description=bunzo chat shell (TUI stub)
+After=systemd-user-sessions.service
+Conflicts=serial-getty@ttyAMA0.service
+Before=getty.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bunzo-shell
+Restart=always
+RestartSec=1
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/ttyAMA0
+TTYReset=yes
+TTYVHangup=yes
+UtmpIdentifier=bunzo
+UtmpMode=user
+
+[Install]
+WantedBy=multi-user.target

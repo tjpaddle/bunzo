@@ -43,8 +43,12 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# --- Rust (future) ---
+# --- Rust ---
 /target/
+/rust/*/target/
+
+# --- Staged Rust binaries (built by scripts/build.sh into the overlay) ---
+/board/bunzo/common/rootfs-overlay/usr/bin/bunzo-shell
 
 # --- Editor / OS cruft ---
 .DS_Store
@@ -59,3 +63,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# --- Local-only config (host details, not secrets but not for GitHub) ---
+scripts/*.env.local
+scripts/remote.env.local

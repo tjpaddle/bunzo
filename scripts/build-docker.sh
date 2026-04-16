@@ -19,6 +19,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGE_NAME="bunzo-builder:latest"
 OUTPUT_VOL="bunzo-output"
 DL_VOL="bunzo-dl"
+CARGO_VOL="bunzo-cargo"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 
@@ -31,17 +32,19 @@ fi
 echo "build-docker: building builder image (cached after first run)"
 docker build -t "${IMAGE_NAME}" -f "${REPO_ROOT}/Dockerfile.builder" "${REPO_ROOT}"
 
-echo "build-docker: ensuring named volumes exist (${OUTPUT_VOL}, ${DL_VOL})"
+echo "build-docker: ensuring named volumes exist (${OUTPUT_VOL}, ${DL_VOL}, ${CARGO_VOL})"
 docker volume create "${OUTPUT_VOL}" >/dev/null
 docker volume create "${DL_VOL}" >/dev/null
+docker volume create "${CARGO_VOL}" >/dev/null
 
 echo "build-docker: chowning volumes to ${HOST_UID}:${HOST_GID}"
 docker run --rm \
     -v "${OUTPUT_VOL}:/bunzo-output" \
     -v "${DL_VOL}:/bunzo-dl" \
+    -v "${CARGO_VOL}:/bunzo-cargo" \
     --user 0:0 \
     "${IMAGE_NAME}" \
-    chown -R "${HOST_UID}:${HOST_GID}" /bunzo-output /bunzo-dl
+    chown -R "${HOST_UID}:${HOST_GID}" /bunzo-output /bunzo-dl /bunzo-cargo
 
 echo "build-docker: running build.sh ${TARGET} inside container"
 docker run --rm -it \
@@ -49,11 +52,14 @@ docker run --rm -it \
     -v "${REPO_ROOT}:/src" \
     -v "${OUTPUT_VOL}:/bunzo-output" \
     -v "${DL_VOL}:/bunzo-dl" \
+    -v "${CARGO_VOL}:/bunzo-cargo" \
     -w /src \
     --user "${HOST_UID}:${HOST_GID}" \
     -e HOME=/tmp \
     -e BUNZO_OUTPUT_BASE=/bunzo-output \
     -e BUNZO_DL_DIR=/bunzo-dl \
     -e BUNZO_HOST_OUTPUT=/src/output \
+    -e CARGO_HOME=/bunzo-cargo \
+    -e CARGO_TARGET_DIR=/bunzo-cargo/target \
     "${IMAGE_NAME}" \
     /src/scripts/build.sh "${TARGET}"

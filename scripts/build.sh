@@ -37,6 +37,35 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 
+# --- bunzo userland (Rust) ---
+# Build bunzo's own binaries first and stage them into the rootfs overlay so
+# Buildroot picks them up during image assembly. Target triple is derived
+# from the Buildroot target name; qemu_aarch64 and rpi4 both map to
+# aarch64-unknown-linux-musl for a fully static binary.
+case "${TARGET}" in
+    qemu_aarch64|rpi4) RUST_TARGET="aarch64-unknown-linux-musl" ;;
+    pc_x86_64)         RUST_TARGET="x86_64-unknown-linux-musl" ;;
+    *)                 RUST_TARGET="" ;;
+esac
+
+if [[ -n "${RUST_TARGET}" && -f "${REPO_ROOT}/rust/bunzo-shell/Cargo.toml" ]]; then
+    echo "build: cargo build bunzo-shell for ${RUST_TARGET}"
+    (
+        cd "${REPO_ROOT}/rust/bunzo-shell"
+        cargo build --release --target "${RUST_TARGET}"
+    )
+    CARGO_BIN_BASE="${CARGO_TARGET_DIR:-${REPO_ROOT}/rust/bunzo-shell/target}"
+    SHELL_BIN="${CARGO_BIN_BASE}/${RUST_TARGET}/release/bunzo-shell"
+    if [[ ! -x "${SHELL_BIN}" ]]; then
+        echo "build: cargo build succeeded but ${SHELL_BIN} is missing" >&2
+        exit 1
+    fi
+    OVERLAY_BIN_DIR="${BOARD_DIR}/bunzo/common/rootfs-overlay/usr/bin"
+    mkdir -p "${OVERLAY_BIN_DIR}"
+    install -m 0755 "${SHELL_BIN}" "${OVERLAY_BIN_DIR}/bunzo-shell"
+    echo "build: staged bunzo-shell into overlay"
+fi
+
 MAKE_ARGS=(
     -C "${BUILDROOT_DIR}"
     BR2_EXTERNAL="${BOARD_DIR}"
