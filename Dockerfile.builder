@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget cpio rsync file unzip bzip2 xz-utils lzop \
         patch zip bc which \
         git ca-certificates curl \
+        gcc-aarch64-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust toolchain for cross-compiling bunzo's own userland (M2+).
