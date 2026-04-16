@@ -7,6 +7,11 @@
 # and build on a beefier Linux box. Serial console of run-qemu.sh is
 # handled separately by scripts/remote-qemu.sh.
 #
+# The build runs detached on the remote (setsid + nohup), writing to
+# build.log, with its pid in build.pid and final exit code in build.exit.
+# The local ssh session just tails build.log, so dropping the SSH tunnel
+# does not kill the build — reconnect with scripts/remote-attach.sh.
+#
 # Configure once by copying scripts/remote.env.example to
 # scripts/remote.env.local and filling in your host details. That file is
 # gitignored, so host/user/path never land in the public repo.
@@ -51,45 +56,95 @@ echo "remote-build: ssh -p ${BUNZO_REMOTE_PORT} ${BUNZO_REMOTE_USER}@${BUNZO_REM
 echo "remote-build: target=${TARGET} branch=${BUNZO_REMOTE_BRANCH} path=${BUNZO_REMOTE_PATH}"
 echo "remote-build: repo=${REPO_URL}"
 
-# Single ssh invocation → single password prompt (if no ssh key).
-# Heredoc is unquoted on purpose so the client-side vars expand here;
-# anything that must evaluate on the remote is written as \$VAR.
-ssh -p "${BUNZO_REMOTE_PORT}" "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" bash -s <<REMOTE
+# Env vars are passed via `VAR=... bash -s` rather than heredoc expansion, so
+# the heredoc can be quoted (<<'REMOTE') and read as literal bash with no
+# client-side escaping gymnastics.
+exec ssh \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=10 \
+    -p "${BUNZO_REMOTE_PORT}" \
+    "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
+    "BUNZO_REMOTE_PATH='${BUNZO_REMOTE_PATH}' \
+     BUNZO_REMOTE_BRANCH='${BUNZO_REMOTE_BRANCH}' \
+     TARGET='${TARGET}' \
+     REPO_URL='${REPO_URL}' \
+     bash -s" <<'REMOTE'
 set -euo pipefail
 
 REMOTE_PATH="${BUNZO_REMOTE_PATH}"
 BRANCH="${BUNZO_REMOTE_BRANCH}"
-TARGET="${TARGET}"
-REPO_URL="${REPO_URL}"
 
-if [[ ! -d "\${REMOTE_PATH}" ]]; then
-    echo "[remote] cloning bunzo into \${REMOTE_PATH}"
-    git clone "\${REPO_URL}" "\${REMOTE_PATH}"
+if [[ ! -d "${REMOTE_PATH}" ]]; then
+    echo "[remote] cloning bunzo into ${REMOTE_PATH}"
+    git clone "${REPO_URL}" "${REMOTE_PATH}"
 fi
 
-cd "\${REMOTE_PATH}"
-echo "[remote] pwd: \$(pwd)"
-echo "[remote] HEAD before pull: \$(git rev-parse --short HEAD)"
+cd "${REMOTE_PATH}"
+echo "[remote] pwd: $(pwd)"
+echo "[remote] HEAD before pull: $(git rev-parse --short HEAD)"
 
 git fetch origin
-git checkout "\${BRANCH}"
-git pull --ff-only origin "\${BRANCH}"
-echo "[remote] HEAD after pull:  \$(git rev-parse --short HEAD)"
+git checkout "${BRANCH}"
+git pull --ff-only origin "${BRANCH}"
+echo "[remote] HEAD after pull:  $(git rev-parse --short HEAD)"
 
 if [[ ! -d buildroot ]]; then
     ./scripts/bootstrap.sh
 fi
 
-# rustup installs cargo to ~/.cargo/bin and sources it from ~/.cargo/env, which
-# interactive shells pick up but `ssh host bash -s` does not. Pull it in here so
-# build.sh can find cargo for the bunzo-shell cross-compile step.
-if [[ -f "\${HOME}/.cargo/env" ]]; then
-    . "\${HOME}/.cargo/env"
+LOG_FILE="${REMOTE_PATH}/build.log"
+EXIT_FILE="${REMOTE_PATH}/build.exit"
+PID_FILE="${REMOTE_PATH}/build.pid"
+
+# If a pid file exists but the process is gone, it's stale — drop it.
+if [[ -f "${PID_FILE}" ]]; then
+    STALE_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
+    if [[ -z "${STALE_PID}" ]] || ! kill -0 "${STALE_PID}" 2>/dev/null; then
+        rm -f "${PID_FILE}"
+    fi
 fi
 
-./scripts/build.sh "\${TARGET}"
-echo "[remote] build complete for \${TARGET}"
-REMOTE
+if [[ -f "${PID_FILE}" ]]; then
+    BUILD_PID="$(cat "${PID_FILE}")"
+    echo "[remote] build already running (pid ${BUILD_PID}) — re-attaching to log"
+else
+    echo "[remote] starting detached build; log at ${LOG_FILE}"
+    : > "${LOG_FILE}"
+    rm -f "${EXIT_FILE}"
+    # setsid + nohup + stdin from /dev/null = survives SSH disconnect.
+    # The exit code of build.sh is written to EXIT_FILE so the caller can
+    # report it after tail finishes.
+    setsid nohup bash -c "
+        cd '${REMOTE_PATH}'
+        if [[ -f \"\${HOME}/.cargo/env\" ]]; then . \"\${HOME}/.cargo/env\"; fi
+        ./scripts/build.sh '${TARGET}'
+        echo \$? > '${EXIT_FILE}'
+    " > "${LOG_FILE}" 2>&1 < /dev/null &
+    BUILD_PID=$!
+    echo "${BUILD_PID}" > "${PID_FILE}"
+    disown || true
+    # Give nohup a beat to flush its first lines so tail -F starts from content.
+    sleep 1
+fi
 
-echo "remote-build: done"
-echo "remote-build: to boot in QEMU over SSH: ./scripts/remote-qemu.sh ${TARGET}"
+echo "[remote] tailing build.log (Ctrl-C here is safe — build keeps running)"
+echo "[remote] to reconnect later: ./scripts/remote-attach.sh"
+echo "----"
+
+# tail --pid exits when the build process dies. || true keeps set -e happy.
+tail -n +1 -F --pid="${BUILD_PID}" "${LOG_FILE}" || true
+
+echo "----"
+if [[ -f "${EXIT_FILE}" ]]; then
+    EXIT_CODE="$(cat "${EXIT_FILE}")"
+    rm -f "${PID_FILE}"
+    echo "[remote] build finished with exit code ${EXIT_CODE}"
+    if [[ "${EXIT_CODE}" == "0" ]]; then
+        echo "[remote] boot it with: ./scripts/remote-qemu.sh ${TARGET}"
+    fi
+    exit "${EXIT_CODE}"
+else
+    echo "[remote] build ended but no exit code recorded (see ${LOG_FILE})"
+    exit 1
+fi
+REMOTE
