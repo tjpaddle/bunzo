@@ -45,8 +45,11 @@ if [[ "${BUNZO_REMOTE_PUSH}" == "1" ]]; then
     git -C "${REPO_ROOT}" push origin "${CURRENT_BRANCH}"
 fi
 
+REPO_URL="$(git -C "${REPO_ROOT}" remote get-url origin)"
+
 echo "remote-build: ssh -p ${BUNZO_REMOTE_PORT} ${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}"
 echo "remote-build: target=${TARGET} branch=${BUNZO_REMOTE_BRANCH} path=${BUNZO_REMOTE_PATH}"
+echo "remote-build: repo=${REPO_URL}"
 
 # Single ssh invocation → single password prompt (if no ssh key).
 # Heredoc is unquoted on purpose so the client-side vars expand here;
@@ -57,10 +60,11 @@ set -euo pipefail
 REMOTE_PATH="${BUNZO_REMOTE_PATH}"
 BRANCH="${BUNZO_REMOTE_BRANCH}"
 TARGET="${TARGET}"
+REPO_URL="${REPO_URL}"
 
 if [[ ! -d "\${REMOTE_PATH}" ]]; then
     echo "[remote] cloning bunzo into \${REMOTE_PATH}"
-    git clone https://github.com/tjpatel0397/bunzo.git "\${REMOTE_PATH}"
+    git clone "\${REPO_URL}" "\${REMOTE_PATH}"
 fi
 
 cd "\${REMOTE_PATH}"

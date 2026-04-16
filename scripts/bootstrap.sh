@@ -11,7 +11,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILDROOT_DIR="${REPO_ROOT}/buildroot"
 BUILDROOT_BRANCH="${BUILDROOT_BRANCH:-2025.02.x}"
-BUILDROOT_URL="${BUILDROOT_URL:-https://git.busybox.net/buildroot}"
+BUILDROOT_URL="${BUILDROOT_URL:-https://github.com/buildroot/buildroot.git}"
 
 if [[ -d "${BUILDROOT_DIR}/.git" ]]; then
     echo "bootstrap: buildroot already cloned at ${BUILDROOT_DIR}"
