@@ -61,27 +61,29 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 
 **Builder changes**
 
-- [ ] Extend `Dockerfile.builder` with `rustup` + the `aarch64-unknown-linux-musl` target (and later `x86_64-unknown-linux-musl`)
-- [ ] Add a `bunzo-cargo` Docker named volume for the Cargo registry/git/target caches, same pattern as `bunzo-output` / `bunzo-dl`
+- [x] Extend `Dockerfile.builder` with `rustup` + the `aarch64-unknown-linux-musl` target (and later `x86_64-unknown-linux-musl`)
+- [x] Add a `bunzo-cargo` Docker named volume for the Cargo registry/git/target caches, same pattern as `bunzo-output` / `bunzo-dl`
+- [x] Add `gcc-aarch64-linux-gnu` to the builder image and to the remote Linux host's apt deps — without it cargo can't link an aarch64 binary on an x86_64 host
 
 **Crate**
 
-- [ ] `rust/bunzo-shell/` Cargo crate — minimal TUI using `ratatui` + `crossterm`
-- [ ] Stub behavior: echoes user input back with a bunzo-style canned response (no LLM yet)
-- [ ] Reads its banner/version from `/etc/os-release` so the shell and the OS stay in sync
+- [x] `rust/bunzo-shell/` Cargo crate — minimal TUI using `ratatui` + `crossterm`
+- [x] Stub behavior: echoes user input back with a bunzo-style canned response (no LLM yet)
+- [x] Reads its banner/version from `/etc/os-release` so the shell and the OS stay in sync
 
 **Wiring into the image**
 
-- [ ] `scripts/build.sh` cargo-builds `bunzo-shell` before invoking Buildroot and stages the static musl binary into `board/bunzo/common/rootfs-overlay/usr/bin/bunzo-shell`
-- [ ] systemd unit `board/bunzo/common/rootfs-overlay/etc/systemd/system/bunzo-shell.service` runs `bunzo-shell` on `tty1` in place of the default getty
-- [ ] Ctrl-Alt-F2 still gives a normal `getty` shell as an escape hatch
+- [x] `scripts/build.sh` cargo-builds `bunzo-shell` before invoking Buildroot and stages the static musl binary into `board/bunzo/common/rootfs-overlay/usr/bin/bunzo-shell`
+- [x] systemd unit `board/bunzo/common/rootfs-overlay/etc/systemd/system/bunzo-shell.service` runs `bunzo-shell` on `ttyAMA0` in place of the default getty (note: `tty1` doesn't exist on `-M virt`; we use `ttyAMA0`)
+- [ ] **OPEN:** TUI actually renders on the PL011 serial console (currently boots to a blank console after `Reached target multi-user.target`). See `STATE.md` "Current focus" for the diagnostic plan.
+- [ ] An escape hatch (recovery getty, sshd, or kernel-cmdline-toggleable getty) — see `STATE.md` "Open questions"
 - [ ] Survives reboot and works identically in QEMU and on Pi 4
 
 **Non-goals for M2**
 
 - No LLM calls. No `bunzod`. No skills. The shell is fully self-contained.
 
-**Definition of done:** fresh boot shows the Rust chat shell on `tty1`, typing "hello" gets a bunzo-style stub response, Ctrl-Alt-F2 gives a normal login escape hatch, and `ps` shows `bunzo-shell` under 5 MB RSS.
+**Definition of done:** fresh boot shows the Rust chat shell on the serial console, typing "hello" gets a bunzo-style stub response, an escape hatch exists for recovery, and `ps` shows `bunzo-shell` under 5 MB RSS.
 
 ## Milestone 3 — "Actual agent"
 
