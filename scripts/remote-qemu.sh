@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# remote-qemu.sh [target]
+# remote-qemu.sh [target] [--recovery]
 #
 # Boots the most-recently-built bunzo image on the remote Linux host and
 # attaches your terminal to it over SSH.
@@ -9,14 +9,44 @@
 # the SSH session, so closing the terminal or dropping the connection ends the
 # remote QEMU process too. This matches the normal "run it and watch it" loop.
 #
-# Optional env override:
+# --recovery      forward the flag to the remote run-qemu.sh so the guest
+#                 boots with 'bunzo.recovery' on its kernel cmdline.
+#
+# Optional env overrides:
 #   BUNZO_REMOTE_QEMU_PERSIST=1   run QEMU inside tmux so SSH drops do not kill it
+#   BUNZO_QEMU_RECOVERY=1         same as --recovery
 #
 # Same host config as remote-build.sh (scripts/remote.env.local).
 #
 set -euo pipefail
 
-TARGET="${1:-qemu_aarch64}"
+TARGET=""
+RECOVERY="${BUNZO_QEMU_RECOVERY:-0}"
+for arg in "$@"; do
+    case "${arg}" in
+        --recovery)
+            RECOVERY=1
+            ;;
+        -*)
+            echo "remote-qemu: unknown option '${arg}'" >&2
+            exit 2
+            ;;
+        *)
+            if [[ -z "${TARGET}" ]]; then
+                TARGET="${arg}"
+            else
+                echo "remote-qemu: unexpected positional arg '${arg}'" >&2
+                exit 2
+            fi
+            ;;
+    esac
+done
+TARGET="${TARGET:-qemu_aarch64}"
+REMOTE_ARGS="'${TARGET}'"
+if [[ "${RECOVERY}" == "1" ]]; then
+    REMOTE_ARGS="${REMOTE_ARGS} --recovery"
+fi
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="${REPO_ROOT}/scripts/remote.env.local"
 
@@ -37,7 +67,7 @@ BUNZO_REMOTE_QEMU_PERSIST="${BUNZO_REMOTE_QEMU_PERSIST:-0}"
 
 SESSION="bunzo-qemu"
 
-echo "remote-qemu: target=${TARGET} on ${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}:${BUNZO_REMOTE_PORT}"
+echo "remote-qemu: target=${TARGET} recovery=${RECOVERY} on ${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}:${BUNZO_REMOTE_PORT}"
 if [[ "${BUNZO_REMOTE_QEMU_PERSIST}" == "1" ]]; then
     echo "remote-qemu: persistent mode via tmux session '${SESSION}' (Ctrl-B D detaches; Ctrl-A X exits QEMU)"
 else
@@ -53,7 +83,7 @@ run_remote() {
             -o ConnectTimeout=15 \
             -p "${BUNZO_REMOTE_PORT}" \
             "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
-            "tmux new-session -A -s '${SESSION}' \"cd '${BUNZO_REMOTE_PATH}' && ./scripts/run-qemu.sh '${TARGET}'\""
+            "tmux new-session -A -s '${SESSION}' \"cd '${BUNZO_REMOTE_PATH}' && ./scripts/run-qemu.sh ${REMOTE_ARGS}\""
     else
         ssh \
             -t \
@@ -62,7 +92,7 @@ run_remote() {
             -o ConnectTimeout=15 \
             -p "${BUNZO_REMOTE_PORT}" \
             "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
-            "cd '${BUNZO_REMOTE_PATH}' && ./scripts/run-qemu.sh '${TARGET}'"
+            "cd '${BUNZO_REMOTE_PATH}' && ./scripts/run-qemu.sh ${REMOTE_ARGS}"
     fi
 }
 
@@ -74,7 +104,7 @@ if [[ "${BUNZO_REMOTE_QEMU_PERSIST}" != "1" ]]; then
         -o ConnectTimeout=15 \
         -p "${BUNZO_REMOTE_PORT}" \
         "${BUNZO_REMOTE_USER}@${BUNZO_REMOTE_HOST}" \
-        "cd '${BUNZO_REMOTE_PATH}' && ./scripts/run-qemu.sh '${TARGET}'"
+        "cd '${BUNZO_REMOTE_PATH}' && ./scripts/run-qemu.sh ${REMOTE_ARGS}"
 fi
 
 ATTEMPT=0

@@ -1,17 +1,43 @@
 #!/usr/bin/env bash
 #
-# run-qemu.sh [target]
+# run-qemu.sh [target] [--recovery]
 # Boots a built bunzo image in QEMU. Currently supports the qemu_aarch64
 # target. Requires qemu-system-aarch64 on the host.
 #
 # macOS:  brew install qemu
 # Linux:  apt install qemu-system-arm  (or your distro's equivalent)
 #
+# --recovery       boot with 'bunzo.recovery' on the kernel cmdline, which
+#                  disables bunzo-shell.service and lands at 'bunzo login:'.
+#                  Equivalent env override: BUNZO_QEMU_RECOVERY=1.
+#
 # Exit QEMU with Ctrl-A then X.
 #
 set -euo pipefail
 
-TARGET="${1:-qemu_aarch64}"
+TARGET=""
+RECOVERY="${BUNZO_QEMU_RECOVERY:-0}"
+for arg in "$@"; do
+    case "${arg}" in
+        --recovery)
+            RECOVERY=1
+            ;;
+        -*)
+            echo "run-qemu: unknown option '${arg}'" >&2
+            exit 2
+            ;;
+        *)
+            if [[ -z "${TARGET}" ]]; then
+                TARGET="${arg}"
+            else
+                echo "run-qemu: unexpected positional arg '${arg}'" >&2
+                exit 2
+            fi
+            ;;
+    esac
+done
+TARGET="${TARGET:-qemu_aarch64}"
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 IMAGES_DIR="${REPO_ROOT}/output/${TARGET}/images"
 
@@ -35,7 +61,13 @@ case "${TARGET}" in
             exit 1
         fi
 
-        echo "run-qemu: booting bunzo in QEMU (Ctrl-A then X to exit)"
+        APPEND="root=/dev/vda rw console=ttyAMA0"
+        if [[ "${RECOVERY}" == "1" ]]; then
+            APPEND="${APPEND} bunzo.recovery"
+            echo "run-qemu: booting bunzo in RECOVERY mode (bunzo.recovery on cmdline)"
+        else
+            echo "run-qemu: booting bunzo in QEMU (Ctrl-A then X to exit)"
+        fi
         exec qemu-system-aarch64 \
             -M virt \
             -cpu cortex-a53 \
@@ -43,7 +75,7 @@ case "${TARGET}" in
             -m 1024 \
             -nographic \
             -kernel "${KERNEL}" \
-            -append "root=/dev/vda rw console=ttyAMA0" \
+            -append "${APPEND}" \
             -drive file="${ROOTFS}",if=none,format=raw,id=hd0 \
             -device virtio-blk-device,drive=hd0 \
             -netdev user,id=net0 \

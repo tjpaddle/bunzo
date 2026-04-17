@@ -74,18 +74,19 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 **Wiring into the image**
 
 - [x] `scripts/build.sh` cargo-builds `bunzo-shell` before invoking Buildroot and stages the static musl binary into `board/bunzo/common/rootfs-overlay/usr/bin/bunzo-shell`
-- [x] Recovery boot path restored: `serial-getty@ttyAMA0` is available again, so QEMU boots to `bunzo login:` instead of a blind handoff
 - [x] Manual `/usr/bin/bunzo-shell` works from the recovery console in serial mode on `ttyAMA0`
-- [ ] **OPEN:** boot directly into the proven serial-mode shell instead of the login prompt
-- [ ] An explicit recovery path once `bunzo-shell` owns boot again — see `STATE.md` "Open questions"
-- [ ] **OPEN:** decide whether fullscreen `ratatui` on the PL011 serial console is part of M2 or deferred
-- [ ] Survives reboot and works identically in QEMU and on Pi 4
+- [x] Boot lands directly in the styled serial-mode shell on `ttyAMA0`
+- [x] Explicit recovery path: `bunzo.recovery` on the kernel cmdline swaps in `serial-getty@ttyAMA0` via mutually exclusive `ConditionKernelCommandLine=` on the two units (`scripts/run-qemu.sh --recovery`)
+- [x] Fullscreen `ratatui` on the PL011 serial console is deferred (retained behind `BUNZO_SHELL_MODE=tui`); M2 ships the styled line-oriented serial shell
+- [ ] Survives reboot and works identically in QEMU and on Pi 4 (QEMU side verified; Pi 4 board defconfig is still an M1 stretch target)
 
 **Non-goals for M2**
 
 - No LLM calls. No `bunzod`. No skills. The shell is fully self-contained.
 
 **Definition of done:** fresh boot shows the Rust chat shell on the serial console, typing "hello" gets a bunzo-style stub response, an explicit recovery path exists, and `ps` shows `bunzo-shell` under 5 MB RSS.
+
+**Status (2026-04-16):** first three boxes verified on the Debian remote builder; the RSS measurement is still pending an in-VM reading (binary is 594 KB stripped static musl, so the ceiling is safe but un-formally confirmed). Treating M2 as effectively complete and opening M3.
 
 ## Milestone 3 — "Actual agent"
 

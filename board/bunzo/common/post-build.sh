@@ -15,10 +15,9 @@ for f in /etc/os-release /etc/motd /etc/hostname; do
     fi
 done
 
-if [[ -f "${TARGET_DIR}/etc/systemd/system/bunzo-shell.service" ]]; then
-    rm -f "${TARGET_DIR}/etc/systemd/system/serial-getty@ttyAMA0.service"
-    rm -f "${TARGET_DIR}/etc/systemd/system/multi-user.target.wants/bunzo-shell.service"
-    echo "post-build: recovery mode enabled; serial-getty@ttyAMA0 left available, bunzo-shell not auto-started"
+if [[ ! -f "${TARGET_DIR}/etc/systemd/system/bunzo-shell.service" ]]; then
+    echo "post-build: bunzo-shell.service missing from rootfs overlay" >&2
+    exit 1
 fi
 
 if [[ ! -x "${TARGET_DIR}/usr/bin/bunzo-shell" ]]; then
@@ -26,5 +25,7 @@ if [[ ! -x "${TARGET_DIR}/usr/bin/bunzo-shell" ]]; then
     echo "post-build: run cargo build before buildroot (see scripts/build.sh)" >&2
     exit 1
 fi
+
+echo "post-build: bunzo-shell.service is enabled by [Install]; recovery via kernel cmdline 'bunzo.recovery'"
 
 echo "post-build: bunzo rootfs verified ($(grep '^PRETTY_NAME=' "${TARGET_DIR}/etc/os-release"))"

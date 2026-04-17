@@ -5,6 +5,7 @@ use std::io::{self, BufRead, Stdout, Write};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
+    style::Stylize,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use ratatui::{
@@ -91,16 +92,20 @@ fn run_serial_shell() -> io::Result<()> {
     let mut app = App::new();
     let mut line = String::new();
 
-    writeln!(stdout, "{}", app.banner)?;
-    writeln!(stdout)?;
+    // Raw VT100 erase-display + home. No raw mode, no cursor addressing —
+    // just styled stream I/O that any vt100-ish terminal (including the one
+    // on the far side of a PL011 UART) renders correctly.
+    write!(stdout, "\x1B[2J\x1B[H")?;
+    writeln!(stdout, "{}", app.banner.as_str().bold().cyan())?;
+    writeln!(stdout, "{}", "─".repeat(60).as_str().dark_grey())?;
     for (_, text) in &app.history {
-        writeln!(stdout, "bunzo {text}")?;
+        writeln!(stdout, "{} {}", "bunzo".bold().magenta(), text)?;
     }
     writeln!(stdout)?;
     stdout.flush()?;
 
     loop {
-        write!(stdout, "> ")?;
+        write!(stdout, "{} ", ">".cyan().bold())?;
         stdout.flush()?;
 
         line.clear();
@@ -117,12 +122,11 @@ fn run_serial_shell() -> io::Result<()> {
             return Ok(());
         }
 
-        writeln!(stdout, "you   {input}")?;
         app.input.clear();
         app.input.push_str(input);
         app.submit();
         if let Some((Role::Bunzo, reply)) = app.history.last() {
-            writeln!(stdout, "bunzo {reply}")?;
+            writeln!(stdout, "{} {}", "bunzo".bold().magenta(), reply)?;
         }
         writeln!(stdout)?;
         stdout.flush()?;

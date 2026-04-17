@@ -1,11 +1,11 @@
 [Unit]
 Description=bunzo chat shell (TUI stub)
 After=systemd-user-sessions.service
-Conflicts=serial-getty@ttyAMA0.service
-Before=getty.target
+ConditionKernelCommandLine=!bunzo.recovery
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sleep 3
 ExecStart=/usr/bin/bunzo-shell
 Restart=always
 RestartSec=1
@@ -21,3 +21,6 @@ Environment=TERM=linux
 Environment=COLUMNS=80
 Environment=LINES=24
 Environment=BUNZO_SHELL_MODE=serial
+
+[Install]
+WantedBy=multi-user.target
