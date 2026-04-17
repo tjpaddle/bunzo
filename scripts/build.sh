@@ -43,9 +43,9 @@ mkdir -p "${OUTPUT_DIR}"
 # from the Buildroot target name; qemu_aarch64 and rpi4 both map to
 # aarch64-unknown-linux-musl for a fully static binary.
 case "${TARGET}" in
-    qemu_aarch64|rpi4) RUST_TARGET="aarch64-unknown-linux-musl" ;;
-    pc_x86_64)         RUST_TARGET="x86_64-unknown-linux-musl" ;;
-    *)                 RUST_TARGET="" ;;
+    qemu_aarch64|rpi4|cm5_nano_a) RUST_TARGET="aarch64-unknown-linux-musl" ;;
+    pc_x86_64)                    RUST_TARGET="x86_64-unknown-linux-musl" ;;
+    *)                            RUST_TARGET="" ;;
 esac
 
 if [[ -n "${RUST_TARGET}" && -f "${REPO_ROOT}/rust/Cargo.toml" ]]; then

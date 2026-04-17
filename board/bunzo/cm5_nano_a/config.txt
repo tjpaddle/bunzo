@@ -1,0 +1,22 @@
+# bunzo — Raspberry Pi CM5 on Waveshare CM5-NANO-A.
+#
+# Consumed by the BCM2712 SPI EEPROM bootloader at power-on. Installed
+# into the FAT boot partition by rpi-firmware via
+# BR2_PACKAGE_RPI_FIRMWARE_CONFIG_FILE.
+
+# Kernel image name as produced by Buildroot (arch/arm64/boot/Image).
+kernel=Image
+
+# Explicit CM5-on-CM5IO device tree. The Waveshare CM5-NANO-A is an
+# unofficial carrier with no upstream DTS of its own; the CM5IO DTB is
+# the closest upstream match and covers CM5 module peripherals
+# (SoC, eMMC, onboard Wi-Fi/BT). Add dtoverlay= entries here if
+# Waveshare-specific peripherals (debug UART muxing, PCIe layout, etc.)
+# prevent boot.
+device_tree=bcm2712-rpi-cm5-cm5io.dtb
+
+# Assume full-resolution display; disables the 48px overscan border.
+disable_overscan=1
+
+# 64-bit mode is the only mode supported on BCM2712, so arm_64bit=1 is
+# implicit and not set here.

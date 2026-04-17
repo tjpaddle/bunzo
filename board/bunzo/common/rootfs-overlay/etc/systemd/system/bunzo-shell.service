@@ -2,6 +2,12 @@
 Description=bunzo chat shell (TUI stub)
 After=systemd-user-sessions.service
 ConditionKernelCommandLine=!bunzo.recovery
+# bunzo-shell owns the PL011 serial only where it actually exists. QEMU
+# virt exposes /dev/ttyAMA0; BCM2712 boards (Pi 5 / CM5) expose
+# /dev/ttyAMA10 instead, and their setup path is phone-led, not serial.
+# This guard keeps the unit inert on boards without ttyAMA0 until a
+# board-aware shell ownership scheme lands in M5.
+ConditionPathExists=/dev/ttyAMA0
 
 [Service]
 Type=simple

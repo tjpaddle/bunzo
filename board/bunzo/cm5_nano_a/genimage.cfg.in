@@ -1,0 +1,38 @@
+# bunzo — CM5-NANO-A disk image layout.
+#
+# Produces output/images/sdcard.img, a GPT/MBR disk image with a 32 MiB
+# FAT boot partition (kernel Image + CM5 DTBs + rpi-firmware files + our
+# config.txt / cmdline.txt) and an ext4 rootfs partition.
+#
+# The #BOOT_FILES# marker is substituted by post-image.sh, which enumerates
+# the actual DTB + rpi-firmware files present in BINARIES_DIR at image
+# time. Same idiom Buildroot's upstream raspberrypi board uses.
+#
+# The resulting sdcard.img is flashed onto the CM5 eMMC via rpiboot
+# (USB-C + BOOT button on the Waveshare CM5-NANO-A).
+
+image boot.vfat {
+	vfat {
+		files = {
+#BOOT_FILES#
+		}
+	}
+
+	size = 32M
+}
+
+image sdcard.img {
+	hdimage {
+	}
+
+	partition boot {
+		partition-type = 0xC
+		bootable = "true"
+		image = "boot.vfat"
+	}
+
+	partition rootfs {
+		partition-type = 0x83
+		image = "rootfs.ext4"
+	}
+}
