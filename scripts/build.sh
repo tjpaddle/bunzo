@@ -66,6 +66,43 @@ if [[ -n "${RUST_TARGET}" && -f "${REPO_ROOT}/rust/Cargo.toml" ]]; then
         install -m 0755 "${BIN_PATH}" "${OVERLAY_BIN_DIR}/${bin}"
     done
     echo "build: staged bunzo-shell + bunzod into overlay"
+
+    # --- WASM skills ---
+    # Each entry in rust/skills/<name>/ is a standalone Cargo crate producing
+    # a cdylib for `wasm32-unknown-unknown`. They live outside the workspace
+    # so the aarch64 linker config doesn't apply. The manifest.toml in each
+    # dir is copied next to skill.wasm in the rootfs overlay at
+    # /usr/lib/bunzo/skills/<name>/, where bunzod reads them at startup.
+    SKILLS_SRC_DIR="${REPO_ROOT}/rust/skills"
+    if [[ -d "${SKILLS_SRC_DIR}" ]]; then
+        OVERLAY_SKILLS_DIR="${BOARD_DIR}/bunzo/common/rootfs-overlay/usr/lib/bunzo/skills"
+        mkdir -p "${OVERLAY_SKILLS_DIR}"
+        for skill_dir in "${SKILLS_SRC_DIR}"/*/; do
+            [[ -f "${skill_dir}/Cargo.toml" ]] || continue
+            skill_name="$(basename "${skill_dir}")"
+            echo "build: cargo build skill '${skill_name}' for wasm32-unknown-unknown"
+            (
+                cd "${skill_dir}"
+                cargo build --release --target wasm32-unknown-unknown
+            )
+            SKILL_CARGO_BASE="${CARGO_TARGET_DIR:-${skill_dir}/target}"
+            # When CARGO_TARGET_DIR is set at the top level, cargo still uses
+            # it; derive the wasm artifact path from package name (dashes to
+            # underscores per cargo convention).
+            pkg_name="$(grep -E '^name *= *"' "${skill_dir}/Cargo.toml" | head -n1 | sed -E 's/^name *= *"([^"]+)".*/\1/')"
+            wasm_stem="$(echo "${pkg_name}" | tr '-' '_')"
+            WASM_PATH="${SKILL_CARGO_BASE}/wasm32-unknown-unknown/release/${wasm_stem}.wasm"
+            if [[ ! -f "${WASM_PATH}" ]]; then
+                echo "build: expected ${WASM_PATH} not found after building '${skill_name}'" >&2
+                exit 1
+            fi
+            SKILL_OUT_DIR="${OVERLAY_SKILLS_DIR}/${skill_name}"
+            mkdir -p "${SKILL_OUT_DIR}"
+            install -m 0644 "${WASM_PATH}" "${SKILL_OUT_DIR}/skill.wasm"
+            install -m 0644 "${skill_dir}/manifest.toml" "${SKILL_OUT_DIR}/manifest.toml"
+            echo "build: staged skill '${skill_name}' into ${SKILL_OUT_DIR}"
+        done
+    fi
 fi
 
 MAKE_ARGS=(

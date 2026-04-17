@@ -108,14 +108,14 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 
 **Goal:** the agent can do something in the world through a sandboxed skill.
 
-- [ ] Skill interface defined as a **WebAssembly module + manifest**: a `wasm32-wasi` binary exporting a narrow entry point, plus a TOML manifest declaring the capabilities the skill needs
-- [ ] `bunzod` embeds `wasmtime` and exposes a capability-scoped host API (path-whitelisted file reads, timers, HTTP to explicit hosts, etc.)
-- [ ] One real skill end-to-end, compiled to WASM: e.g. `set-reminder` or `read-local-file`
-- [ ] Policy check before skill invocation; denial is the default
-- [ ] Ledger records which skill ran, with what inputs, and the result
-- [ ] Sandboxing comes from the `wasmtime` boundary itself — no `bwrap`/`nsjail`/seccomp juggling for the skill runner. (systemd-side seccomp/audit still matters for non-skill services and is handled separately.)
+- [x] Skill interface defined as a **WebAssembly module + manifest**: a `wasm32-unknown-unknown` cdylib exporting `bunzo_alloc` / `bunzo_dealloc` / `run`, plus a TOML manifest (`name`, `description`, JSON-Schema `parameters`, `[capabilities] fs_read = [...]`). Shared ABI lives in the `bunzo-skill-abi` crate.
+- [x] `bunzod` embeds `wasmtime` and exposes a capability-scoped host API. First two hosts: `bunzo_fs_read` (path-whitelisted against the manifest; entries ending in `/` are directory prefixes, otherwise exact match; `..` segments always denied) and `bunzo_log` (skill-side stderr echo). Per-invocation memory cap 32 MiB, fuel budget 10M.
+- [x] One real skill end-to-end, compiled to WASM: **`read-local-file`**. Input `{ "path": "..." }`, returns `{ "path": "...", "content": "..." }`. Ships whitelisted read paths: `/etc/os-release`, `/etc/motd`, `/etc/hostname`, `/proc/{meminfo,uptime,loadavg}`, `/var/lib/bunzo/**`.
+- [x] Policy check before skill invocation; denial is the default. The manifest *is* the policy for M4 — anything not listed in `[capabilities]` is denied, with a DENIED log line in bunzod stderr. A user-in-the-loop policy engine is deferred.
+- [x] Ledger records which skill ran, with what inputs, and the result. Each exchange's JSONL entry now carries a `tool_calls: [{name, ok, latency_ms}]` array.
+- [x] Sandboxing comes from the `wasmtime` boundary itself — no `bwrap`/`nsjail`/seccomp juggling for the skill runner. (systemd-side seccomp/audit still matters for non-skill services and is handled separately.)
 
-**Definition of done:** user asks for a reminder, the WASM skill fires inside `bunzod`, the reminder shows up on time, the ledger records it, and the skill only touches the resources its manifest declared.
+**Definition of done:** user asks a question that requires reading a bunzo-device file (e.g. "what OS is this?"), the LLM calls `read-local-file`, the host reads the file through the capability allowlist, the content is fed back to the LLM, the LLM answers, and the ledger records it. **Code-complete 2026-04-16; awaiting on-image boot verification.**
 
 ## Milestone 5 — "Phone pairing"
 

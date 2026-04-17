@@ -7,6 +7,7 @@ description = "bunzo agent daemon"
 
 [dependencies]
 bunzo-proto = { workspace = true, features = ["tokio"] }
+bunzo-skill-abi = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "signal", "sync", "fs"] }
@@ -17,3 +18,4 @@ async-trait = "0.1"
 async-openai = "0.27"
 futures = "0.3"
 toml = "0.8"
+wasmtime = "27"

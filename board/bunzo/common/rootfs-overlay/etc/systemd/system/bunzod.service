@@ -11,9 +11,13 @@ NotifyAccess=main
 ExecStart=/usr/bin/bunzod
 Restart=on-failure
 RestartSec=2s
-# Generous safety net; a real LLM stream shouldn't land anywhere near this.
-MemoryHigh=64M
-MemoryMax=128M
+# bunzod now embeds wasmtime (for skill execution), which JIT-compiles WASM
+# modules at startup and holds them in memory for the duration of the daemon.
+# Idle RSS is a couple MB higher than the bare-LLM M3 shape; MemoryMax is
+# raised from 128M → 256M as a safety net that still catches pathological
+# growth.
+MemoryHigh=192M
+MemoryMax=256M
 
 # No [Install] section on purpose: the service is started on demand by
 # bunzod.socket the first time a client connects. Before that it idles cold.

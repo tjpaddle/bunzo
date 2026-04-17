@@ -198,8 +198,46 @@ fn round_trip(id: &str, text: &str, stdout: &mut Stdout) -> Result<(), RoundTrip
                 return Err(RoundTripError::Remote { code, text });
             }
             ServerMessage::Error { .. } => {}
+            ServerMessage::ToolActivity {
+                id: act_id,
+                name,
+                phase,
+                detail,
+            } if act_id == id => {
+                render_tool_activity(stdout, &name, &phase, &detail)
+                    .map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+            }
+            ServerMessage::ToolActivity { .. } => {}
         }
     }
+}
+
+fn render_tool_activity(
+    stdout: &mut Stdout,
+    name: &str,
+    phase: &str,
+    detail: &str,
+) -> io::Result<()> {
+    // Break out of the assistant's in-flight text so the status sits on its
+    // own line, then return to the assistant tag so subsequent chunks keep
+    // streaming where they were.
+    writeln!(stdout)?;
+    let line = match phase {
+        "invoke" => format!("→ {name} …").dark_grey().italic().to_string(),
+        "ok" => format!("✓ {name}").dark_grey().italic().to_string(),
+        "error" => {
+            let suffix = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" — {detail}")
+            };
+            format!("✗ {name}{suffix}").red().italic().to_string()
+        }
+        other => format!("· {name} ({other})").dark_grey().italic().to_string(),
+    };
+    writeln!(stdout, "{line}")?;
+    write!(stdout, "{} ", "bunzo".bold().magenta())?;
+    stdout.flush()
 }
 
 fn setup_terminal() -> io::Result<Tui> {

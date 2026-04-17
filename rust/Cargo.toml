@@ -3,7 +3,14 @@ resolver = "2"
 members = [
     "bunzo-proto",
     "bunzo-shell",
+    "bunzo-skill-abi",
     "bunzod",
+]
+# Skills are built with a different target (`wasm32-unknown-unknown`) and their
+# own minimal std/panic setup, so they live outside the default workspace. They
+# are built explicitly by `scripts/build.sh`.
+exclude = [
+    "skills",
 ]
 
 [workspace.package]
@@ -15,6 +22,7 @@ license = "MIT"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bunzo-proto = { path = "bunzo-proto" }
+bunzo-skill-abi = { path = "bunzo-skill-abi" }
 
 [profile.release]
 opt-level = "z"

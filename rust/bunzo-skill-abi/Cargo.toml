@@ -1,0 +1,17 @@
+[package]
+name = "bunzo-skill-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ABI shared by bunzod's wasmtime host and WASM skills"
+
+[dependencies]
+# Directly spec'd (not via workspace) because the crate needs no_std builds
+# for the wasm32 skill side — the `default-features` toggle is ignored when
+# the dep is pulled in through `workspace = true`, which silently pulls in
+# `std` and then collides with this crate's panic handler.
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[lib]
+crate-type = ["rlib"]

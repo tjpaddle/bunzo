@@ -40,6 +40,25 @@ for bin in bunzo-shell bunzod; do
     fi
 done
 
+# Skills directory. M4 ships with read-local-file built in; anything placed
+# under usr/lib/bunzo/skills/<name>/{manifest.toml,skill.wasm} is loaded by
+# bunzod at startup.
+SKILLS_DIR="${TARGET_DIR}/usr/lib/bunzo/skills"
+if [[ -d "${SKILLS_DIR}" ]]; then
+    while IFS= read -r -d '' skill; do
+        name="$(basename "${skill}")"
+        for f in manifest.toml skill.wasm; do
+            if [[ ! -f "${skill}/${f}" ]]; then
+                echo "post-build: skill ${name} missing ${f}" >&2
+                exit 1
+            fi
+        done
+        echo "post-build: skill ${name} ready"
+    done < <(find "${SKILLS_DIR}" -mindepth 1 -maxdepth 1 -type d -print0)
+else
+    echo "post-build: no skills directory in rootfs (skipping)"
+fi
+
 echo "post-build: bunzo-shell.service enabled via [Install]; recovery via kernel cmdline 'bunzo.recovery'"
 echo "post-build: bunzod.socket enabled via [Install]; bunzod.service is socket-activated (no [Install])"
 

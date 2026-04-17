@@ -39,6 +39,17 @@ pub enum ServerMessage {
         code: String,
         text: String,
     },
+    /// Emitted when bunzod invokes a skill on behalf of the user. `phase` is
+    /// one of `"invoke"`, `"ok"`, `"error"`. `detail` is a short human string
+    /// (skill name at minimum, optionally a reason on error). Additive since
+    /// v1; shells that predate it should tolerate unknown variants.
+    ToolActivity {
+        id: String,
+        name: String,
+        phase: String,
+        #[serde(default)]
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +189,12 @@ mod tests {
                 id: "u1".into(),
                 code: "backend_unavailable".into(),
                 text: "openai returned 500".into(),
+            },
+            ServerMessage::ToolActivity {
+                id: "u1".into(),
+                name: "read-local-file".into(),
+                phase: "invoke".into(),
+                detail: String::new(),
             },
         ] {
             let out = Envelope::new(msg);

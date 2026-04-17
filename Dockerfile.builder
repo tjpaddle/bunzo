@@ -26,6 +26,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             -y --no-modify-path --profile minimal \
             --default-toolchain stable \
             --target aarch64-unknown-linux-musl \
+            --target wasm32-unknown-unknown \
     && chmod -R a+rX /opt/rust
 
 WORKDIR /src

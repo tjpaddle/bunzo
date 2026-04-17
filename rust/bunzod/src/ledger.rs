@@ -1,9 +1,9 @@
 //! Append-only JSONL action ledger.
 //!
-//! One line per exchange — user prompt, assistant reply, backend, latency.
-//! Fsync after every write so a crash can only ever lose an in-flight
-//! exchange, never a completed one. Volume is single-user chat; fsync cost
-//! is irrelevant at this scale.
+//! One line per exchange — user prompt, assistant reply, backend, latency,
+//! plus a record of any skills that ran during the exchange. Fsync after
+//! every write so a crash can only ever lose an in-flight exchange, never a
+//! completed one.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -20,6 +20,13 @@ pub struct Ledger {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ToolRecord {
+    pub name: String,
+    pub ok: bool,
+    pub latency_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Entry<'a> {
     pub ts_ms: u128,
     pub conv_id: &'a str,
@@ -28,6 +35,7 @@ pub struct Entry<'a> {
     pub backend: &'a str,
     pub latency_ms: u128,
     pub finish_reason: &'a str,
+    pub tool_calls: &'a [ToolRecord],
 }
 
 impl Ledger {

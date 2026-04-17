@@ -1,0 +1,21 @@
+[package]
+name = "bunzo-skill-read-local-file"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "bunzo WASM skill: read a whitelisted local file and return its contents"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bunzo-skill-abi = { path = "../../bunzo-skill-abi" }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

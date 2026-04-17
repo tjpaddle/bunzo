@@ -2,12 +2,15 @@
 //!
 //! Listens on /run/bunzod.sock (or a systemd-activated socket), speaks the
 //! bunzo wire protocol v1 from `bunzo-proto`, and streams replies back to
-//! the chat shell via the configured LLM backend. Every completed exchange
-//! is appended to the action ledger.
+//! the chat shell via the configured LLM backend. The model can call skills
+//! — WASM modules loaded from `/usr/lib/bunzo/skills` at startup — and each
+//! completed exchange (including any skill invocations) is appended to the
+//! action ledger.
 
 mod backend;
 mod config;
 mod ledger;
+mod skills;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -25,8 +28,9 @@ use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use crate::backend::{Message, Role};
-use crate::ledger::{Entry, Ledger};
+use crate::backend::{BackendEvent, Message, Role};
+use crate::ledger::{Entry, Ledger, ToolRecord};
+use crate::skills::Registry;
 
 const SOCKET_PATH: &str = "/run/bunzod.sock";
 
@@ -34,6 +38,11 @@ const SOCKET_PATH: &str = "/run/bunzod.sock";
 async fn main() -> Result<()> {
     let listener = acquire_listener()?;
     let ledger = Arc::new(Ledger::new(Ledger::default_path()));
+    let registry = Registry::load_from(&skills::default_dir());
+    eprintln!(
+        "bunzod: loaded {} skills",
+        registry.tool_descriptors().len()
+    );
     eprintln!("bunzod: accepting connections");
 
     let _ = sd_notify::notify(false, &[NotifyState::Ready]);
@@ -41,8 +50,9 @@ async fn main() -> Result<()> {
     loop {
         let (stream, _addr) = listener.accept().await?;
         let ledger = Arc::clone(&ledger);
+        let registry = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, ledger).await {
+            if let Err(e) = handle_connection(stream, ledger, registry).await {
                 eprintln!("bunzod: connection ended: {e:#}");
             }
         });
@@ -67,7 +77,11 @@ fn acquire_listener() -> Result<UnixListener> {
     Ok(listener)
 }
 
-async fn handle_connection(mut stream: UnixStream, ledger: Arc<Ledger>) -> Result<()> {
+async fn handle_connection(
+    mut stream: UnixStream,
+    ledger: Arc<Ledger>,
+    registry: Registry,
+) -> Result<()> {
     let (read_half, mut write_half) = stream.split();
     let mut reader = BufReader::new(read_half);
 
@@ -93,7 +107,14 @@ async fn handle_connection(mut stream: UnixStream, ledger: Arc<Ledger>) -> Resul
 
         match frame.msg {
             ClientMessage::UserMessage { id, text } => {
-                handle_user_message(&mut write_half, &id, &text, &ledger).await?;
+                handle_user_message(
+                    &mut write_half,
+                    &id,
+                    &text,
+                    &ledger,
+                    registry.clone(),
+                )
+                .await?;
             }
             ClientMessage::Cancel { id: _ } => {
                 // In-flight request cancellation is not wired yet; the real
@@ -109,6 +130,7 @@ async fn handle_user_message<W>(
     id: &str,
     user_text: &str,
     ledger: &Ledger,
+    registry: Registry,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -130,20 +152,22 @@ where
     };
     let backend_name: &'static str = backend.name();
 
-    let (tx, mut rx) = mpsc::channel::<Result<String>>(16);
+    let (tx, mut rx) = mpsc::channel::<BackendEvent>(32);
     let messages = vec![Message {
         role: Role::User,
         text: user_text.to_string(),
     }];
     let backend_task = tokio::spawn(async move {
-        let _ = backend.stream_complete(messages, tx).await;
+        let _ = backend.stream_complete(messages, registry, tx).await;
     });
 
     let mut assistant_acc = String::new();
+    let mut tool_records: Vec<ToolRecord> = Vec::new();
     let mut saw_error = false;
-    while let Some(item) = rx.recv().await {
-        match item {
-            Ok(chunk) => {
+
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            BackendEvent::Chunk(chunk) => {
                 assistant_acc.push_str(&chunk);
                 let frame = Envelope::new(ServerMessage::AssistantChunk {
                     id: id.into(),
@@ -151,7 +175,35 @@ where
                 });
                 write_frame_async(w, &frame).await?;
             }
-            Err(e) => {
+            BackendEvent::ToolInvoke { name } => {
+                let frame = Envelope::new(ServerMessage::ToolActivity {
+                    id: id.into(),
+                    name,
+                    phase: "invoke".into(),
+                    detail: String::new(),
+                });
+                write_frame_async(w, &frame).await?;
+            }
+            BackendEvent::ToolResult {
+                name,
+                ok,
+                latency_ms,
+                detail,
+            } => {
+                let frame = Envelope::new(ServerMessage::ToolActivity {
+                    id: id.into(),
+                    name: name.clone(),
+                    phase: if ok { "ok".into() } else { "error".into() },
+                    detail,
+                });
+                write_frame_async(w, &frame).await?;
+                tool_records.push(ToolRecord {
+                    name,
+                    ok,
+                    latency_ms,
+                });
+            }
+            BackendEvent::Error(e) => {
                 let err = Envelope::new(ServerMessage::Error {
                     id: id.into(),
                     code: "backend_error".into(),
@@ -181,6 +233,7 @@ where
         backend: backend_name,
         latency_ms: started.elapsed().as_millis(),
         finish_reason,
+        tool_calls: &tool_records,
     }) {
         eprintln!("bunzod: ledger append failed: {e:#}");
     }
