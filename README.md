@@ -47,6 +47,33 @@ bunzo is built from source with Buildroot. Three supported flows:
 - [Architecture](docs/ARCHITECTURE.md) — what exists now vs what comes later
 - [Roadmap](docs/ROADMAP.md) — milestones and current focus
 
+## Backend Config
+
+The remote OpenAI backend is configured at `/etc/bunzo/bunzod.toml`. bunzo is
+currently pinned to the GPT-5.4 family only:
+
+- `gpt-5.4`
+- `gpt-5.4-mini`
+- `gpt-5.4-nano`
+
+Current recommendation for the interactive shell is `gpt-5.4-mini`. The daemon
+currently uses one configured model for all requests; per-task routing between
+`gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.4-nano` is a later followup.
+
+On images that include the latest `bunzo-shell`, if the backend is not
+configured the shell warns immediately and supports `/setup` to paste the API
+key directly on-device. `/setup` writes both `/etc/bunzo/bunzod.toml` and
+`/etc/bunzo/openai.key`, then retries the request.
+
+Example:
+
+```toml
+[backend]
+kind = "openai"
+model = "gpt-5.4-mini"
+api_key_path = "/etc/bunzo/openai.key"
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

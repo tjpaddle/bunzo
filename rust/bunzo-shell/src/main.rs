@@ -1,7 +1,9 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Stdout, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Duration;
 
 use bunzo_proto::{
@@ -28,6 +30,10 @@ const DEFAULT_LINES: u16 = 24;
 const MIN_COLUMNS: u16 = 40;
 const MIN_LINES: u16 = 10;
 const BUNZOD_SOCKET: &str = "/run/bunzod.sock";
+const BUNZOD_CONFIG_DIR: &str = "/etc/bunzo";
+const BUNZOD_CONFIG_PATH: &str = "/etc/bunzo/bunzod.toml";
+const OPENAI_KEY_PATH: &str = "/etc/bunzo/openai.key";
+const DEFAULT_REMOTE_MODEL: &str = "gpt-5.4-mini";
 
 struct App {
     banner: String,
@@ -96,6 +102,17 @@ fn run_serial_shell() -> io::Result<()> {
         "{} connected — type to talk to bunzod.",
         "bunzo".bold().magenta(),
     )?;
+    if let Some(issue) = local_setup_issue() {
+        writeln!(
+            stdout,
+            "{}",
+            format!(
+                "setup needed — {} Type /setup to paste your API key.",
+                issue
+            )
+            .yellow()
+        )?;
+    }
     writeln!(stdout)?;
     stdout.flush()?;
 
@@ -114,6 +131,20 @@ fn run_serial_shell() -> io::Result<()> {
         }
         if matches!(input, "exit" | "quit" | ":q") {
             return Ok(());
+        }
+        if matches!(input, "/setup" | ":setup") {
+            let _ = run_openai_setup(&mut stdin, &mut stdout, None)?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+            continue;
+        }
+
+        if let Some(issue) = local_setup_issue() {
+            if !run_openai_setup(&mut stdin, &mut stdout, Some(&issue))? {
+                writeln!(stdout)?;
+                stdout.flush()?;
+                continue;
+            }
         }
 
         msg_counter = msg_counter.wrapping_add(1);
@@ -136,7 +167,36 @@ fn run_serial_shell() -> io::Result<()> {
                 writeln!(stdout, "{}", format!("[protocol error: {reason}]").red())?;
             }
             Err(RoundTripError::Remote { code, text }) => {
-                writeln!(stdout, "{}", format!("[{code}] {text}").red())?;
+                if should_offer_setup(&code, &text)
+                    && run_openai_setup(&mut stdin, &mut stdout, Some(&text))?
+                {
+                    msg_counter = msg_counter.wrapping_add(1);
+                    let retry_id = format!("u{msg_counter}");
+                    write!(stdout, "{} ", "bunzo".bold().magenta())?;
+                    stdout.flush()?;
+                    match round_trip(&retry_id, input, &mut stdout) {
+                        Ok(()) => {}
+                        Err(RoundTripError::Unreachable(reason)) => {
+                            writeln!(
+                                stdout,
+                                "{}",
+                                format!("[bunzod unreachable: {reason}]").red()
+                            )?;
+                        }
+                        Err(RoundTripError::Protocol(reason)) => {
+                            writeln!(
+                                stdout,
+                                "{}",
+                                format!("[protocol error: {reason}]").red()
+                            )?;
+                        }
+                        Err(RoundTripError::Remote { code, text }) => {
+                            writeln!(stdout, "{}", format!("[{code}] {text}").red())?;
+                        }
+                    }
+                } else {
+                    writeln!(stdout, "{}", format!("[{code}] {text}").red())?;
+                }
             }
         }
         writeln!(stdout)?;
@@ -238,6 +298,139 @@ fn render_tool_activity(
     writeln!(stdout, "{line}")?;
     write!(stdout, "{} ", "bunzo".bold().magenta())?;
     stdout.flush()
+}
+
+fn local_setup_issue() -> Option<String> {
+    if !Path::new(BUNZOD_CONFIG_PATH).is_file() {
+        return Some("OpenAI backend config is missing.".into());
+    }
+    match fs::read_to_string(OPENAI_KEY_PATH) {
+        Ok(key) if !key.trim().is_empty() => None,
+        Ok(_) => Some("OpenAI API key is empty.".into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Some("OpenAI API key is missing.".into())
+        }
+        Err(e) => Some(format!("OpenAI API key is unreadable: {e}")),
+    }
+}
+
+fn should_offer_setup(code: &str, text: &str) -> bool {
+    matches!(code, "unconfigured" | "backend_init_failed")
+        || text.contains(BUNZOD_CONFIG_PATH)
+        || text.contains(OPENAI_KEY_PATH)
+        || text.contains("unsupported OpenAI model")
+}
+
+fn run_openai_setup(
+    stdin: &mut impl BufRead,
+    stdout: &mut Stdout,
+    reason: Option<&str>,
+) -> io::Result<bool> {
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "{}",
+        "bunzo setup — OpenAI API key required".bold().cyan()
+    )?;
+    if let Some(reason) = reason {
+        writeln!(stdout, "{}", reason.dark_grey())?;
+    }
+    writeln!(
+        stdout,
+        "{}",
+        format!(
+            "Paste your OpenAI API key. bunzo will save it to {} and configure {}.",
+            OPENAI_KEY_PATH, DEFAULT_REMOTE_MODEL
+        )
+        .dark_grey()
+    )?;
+    writeln!(stdout, "{}", "Leave it blank to cancel.".dark_grey())?;
+    write!(stdout, "{} ", "api key>".cyan().bold())?;
+    stdout.flush()?;
+
+    let key = read_secret_line(stdin, stdout)?;
+    if key.trim().is_empty() {
+        writeln!(stdout, "{}", "setup cancelled".dark_grey())?;
+        return Ok(false);
+    }
+
+    write_openai_setup(&key)?;
+    writeln!(
+        stdout,
+        "{}",
+        format!(
+            "saved API key and configured bunzod to use {}",
+            DEFAULT_REMOTE_MODEL
+        )
+        .green()
+    )?;
+    Ok(true)
+}
+
+fn read_secret_line(stdin: &mut impl BufRead, stdout: &mut Stdout) -> io::Result<String> {
+    let _echo_guard = StdinEchoGuard::hide().ok();
+    let mut line = String::new();
+    let bytes = stdin.read_line(&mut line)?;
+    writeln!(stdout)?;
+    stdout.flush()?;
+    if bytes == 0 {
+        return Ok(String::new());
+    }
+    Ok(line.trim().to_string())
+}
+
+fn write_openai_setup(key: &str) -> io::Result<()> {
+    fs::create_dir_all(BUNZOD_CONFIG_DIR)?;
+    fs::set_permissions(BUNZOD_CONFIG_DIR, fs::Permissions::from_mode(0o755))?;
+    write_file_with_mode(
+        BUNZOD_CONFIG_PATH,
+        &format!(
+            concat!(
+                "# Written by bunzo-shell setup.\n",
+                "[backend]\n",
+                "kind = \"openai\"\n",
+                "model = \"{}\"\n",
+                "api_key_path = \"{}\"\n",
+            ),
+            DEFAULT_REMOTE_MODEL, OPENAI_KEY_PATH
+        ),
+        0o644,
+    )?;
+    write_file_with_mode(OPENAI_KEY_PATH, &format!("{key}\n"), 0o600)?;
+    Ok(())
+}
+
+fn write_file_with_mode(path: &str, contents: &str, mode: u32) -> io::Result<()> {
+    fs::write(path, contents)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+struct StdinEchoGuard {
+    original: libc::termios,
+}
+
+impl StdinEchoGuard {
+    fn hide() -> io::Result<Self> {
+        let fd = libc::STDIN_FILENO;
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        let rc = unsafe { libc::tcgetattr(fd, &mut original) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut hidden = original;
+        hidden.c_lflag &= !libc::ECHO;
+        let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { original })
+    }
+}
+
+impl Drop for StdinEchoGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original) };
+    }
 }
 
 fn setup_terminal() -> io::Result<Tui> {
@@ -345,4 +538,40 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let input = Paragraph::new(app.input.as_str())
         .block(Block::default().borders(Borders::ALL).title(" > "));
     f.render_widget(input, chunks[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_offer_matches_config_errors() {
+        assert!(should_offer_setup("unconfigured", "reading /etc/bunzo/bunzod.toml"));
+        assert!(should_offer_setup(
+            "backend_init_failed",
+            "reading api key from /etc/bunzo/openai.key"
+        ));
+        assert!(should_offer_setup(
+            "backend_error",
+            "unsupported OpenAI model 'gpt-4o-mini'"
+        ));
+        assert!(!should_offer_setup("backend_error", "rate limited"));
+    }
+
+    #[test]
+    fn setup_writes_expected_config() {
+        let cfg = format!(
+            concat!(
+                "# Written by bunzo-shell setup.\n",
+                "[backend]\n",
+                "kind = \"openai\"\n",
+                "model = \"{}\"\n",
+                "api_key_path = \"{}\"\n",
+            ),
+            DEFAULT_REMOTE_MODEL,
+            OPENAI_KEY_PATH
+        );
+        assert!(cfg.contains("model = \"gpt-5.4-mini\""));
+        assert!(cfg.contains("api_key_path = \"/etc/bunzo/openai.key\""));
+    }
 }

@@ -29,6 +29,14 @@ use crate::config::OpenAiConfig;
 use crate::skills::Registry;
 
 const MAX_TOOL_HOPS: u32 = 3;
+const DEFAULT_SYSTEM_PROMPT: &str = concat!(
+    "You are bunzo, the assistant running on the current Linux device. ",
+    "When the user asks about device-local facts such as the OS/version, ",
+    "hostname, message of the day, uptime, load, memory usage, files, or ",
+    "bunzo ledger contents, use the available tools instead of guessing. ",
+    "If a suitable tool is unavailable or access is denied, say that plainly. ",
+    "Do not invent device-local values such as the current date or time."
+);
 
 pub struct OpenAiBackend {
     client: Client<OpenAIConfig>,
@@ -51,7 +59,10 @@ impl OpenAiBackend {
         Ok(Self {
             client: Client::with_config(oai_cfg),
             model: cfg.model,
-            system_prompt: cfg.system_prompt,
+            system_prompt: Some(
+                cfg.system_prompt
+                    .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
+            ),
         })
     }
 

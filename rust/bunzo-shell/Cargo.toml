@@ -8,4 +8,5 @@ description = "bunzo chat shell — serial / TUI front-end"
 [dependencies]
 bunzo-proto = { workspace = true }
 crossterm = "0.28"
+libc = "0.2"
 ratatui = "0.29"

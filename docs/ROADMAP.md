@@ -95,6 +95,7 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 - [x] `rust/bunzod/` Cargo crate — Rust agent daemon on `tokio` (current_thread runtime)
 - [x] Local Unix-socket API at `/run/bunzod.sock` (4-byte big-endian length prefix + JSON body, `bunzo-proto` v1; internally-tagged `ClientMessage` / `ServerMessage` unions, 1 MiB per-frame cap)
 - [x] `bunzo-shell` talks to `bunzod` over the socket; no direct LLM calls from the shell
+- [x] `bunzo-shell` handles missing backend config in-band: warns when setup is missing, supports `/setup`, accepts a pasted API key, writes `/etc/bunzo/bunzod.toml` + `/etc/bunzo/openai.key`, and retries the request without leaving the shell
 - [x] Pluggable backend behind a Rust trait (`Backend::stream_complete`), first implementation:
   - Remote: `async-openai 0.27` with `stream(true)` — key loaded from the file at `api_key_path` in `/etc/bunzo/bunzod.toml`, never via process env
   - Local: `candle` / `llama.cpp` FFI is deferred to after M3 boot verification
@@ -102,7 +103,7 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 - [ ] Skill registry scaffolding — empty, but hook points are in place for M4
 - [x] systemd unit for `bunzod` with socket activation (`Type=notify` + `listenfd`; `bunzod.service` has no `[Install]`, so `bunzod.socket` pulls it in on first connect — daemon idles cold)
 
-**Definition of done:** from the chat shell, the user asks "what time is it?", `bunzod` answers with system time via the configured backend, the ledger records the exchange, and `bunzod` idles under 10 MB RSS when no model is loaded. **Chat pipe verified on image 2026-04-17** (real gpt-4o-mini completions streamed over the socket protocol). RSS measurement still pending (needs either a working ssh drop-in or a recovery-console sample). Ledger line format verified by code; on-image inspection pending for the same reason.
+**Definition of done:** from the chat shell, the user asks "what time is it?", `bunzod` answers with system time via the configured backend, the ledger records the exchange, and `bunzod` idles under 10 MB RSS when no model is loaded. **Chat pipe verified on image 2026-04-17** (real remote completions streamed over the socket protocol). Project policy is now GPT-5.4-family only, with `gpt-5.4-mini` as the current interactive default. RSS measurement still pending (needs either a working ssh drop-in or a recovery-console sample). Ledger line format verified by code; on-image inspection pending for the same reason.
 
 ## Milestone 4 — "First skill"
 
