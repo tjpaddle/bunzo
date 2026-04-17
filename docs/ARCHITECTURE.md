@@ -9,25 +9,31 @@ This document separates **what exists now** (or is actively being built) from **
 3. **Multi-architecture by design.** The same bunzo userland runs on aarch64 (Pi 4/5 + other arm64 boards) and x86_64 (generic UEFI PCs) from day one. A new target is a new defconfig, not a rewrite.
 4. **QEMU-first dev loop.** Any change builds and boots in QEMU in seconds. Hardware flashes are for validation, not iteration.
 5. **Boring base, interesting top.** The layers below the agent runtime stay conventional (Linux kernel, standard init, standard filesystems) so we can focus novelty on the agent layer, not on reinventing the plumbing.
+6. **Screen-optional product, deterministic first boot.** The shipping UX must work with no local screen, but must also support a normal local shell/setup path on hardware that has a display and input devices. First-boot setup should be a simple, reliable provisioning flow, not an open-ended LLM conversation.
+7. **One provisioning engine, multiple surfaces.** Phone-led setup, local shell setup, and any later local UI should all drive the same provisioning state machine and write the same persisted config.
 
 ## Layers
 
 ```
 ┌───────────────────────────────────────────────────────┐
 │  User interaction                                     │
-│   - chat shell on tty1            [Later]             │
+│   - provisioning UI (phone-led)   [Later]             │
+│   - local setup shell / console   [Now: M2/M3]        │
 │   - phone client                  [Later]             │
 │   - voice I/O                     [Later]             │
 ├───────────────────────────────────────────────────────┤
 │  Agent runtime                                        │
-│   - bunzod (agent daemon)         [Later]             │
-│   - skill registry                [Later]             │
+│   - bunzod (agent daemon)         [Now: M3]           │
+│   - skill registry                [Now: M4]           │
 │   - policy engine                 [Later]             │
-│   - action ledger                 [Later]             │
+│   - action ledger                 [Now: M3/M4]        │
+│   - provisioning orchestrator     [Later]             │
 ├───────────────────────────────────────────────────────┤
 │  System services                                      │
 │   - init + service manager        [Now: M1]           │
 │   - logging / audit               [Now: M1]           │
+│   - networking / ssh              [Now: M1]           │
+│   - first-boot AP / captive UI    [Later]             │
 │   - secret / key storage          [Later]             │
 ├───────────────────────────────────────────────────────┤
 │  Userland                                             │
@@ -58,7 +64,7 @@ bunzo's own code is written in **Rust**. This is a foundational decision driven 
 
 - **Why Rust over Python:** no interpreter, no GC, no runtime baggage. A `tokio`-based service idles at 5–10 MB RSS; a tight service can sit under 5 MB. Python would add ~30 MB to the rootfs plus per-process interpreter overhead.
 - **Why Rust over Go:** Go's runtime adds a 2–5 MB floor per process plus GC overhead. Rust gives a cleaner single-static-binary story on embedded targets and lets us share buffers with C libraries (`llama.cpp` etc.) at zero cost.
-- **TUI:** `ratatui` + `crossterm`. The chat shell on `tty1` is a Rust TUI, not a Python script or a shell loop.
+- **TUI / serial shell:** `ratatui` + `crossterm` for richer terminals, plus a plain serial mode for QEMU and recovery. The shell is both a developer/recovery interface and a legitimate local setup/usage surface on desktop-class hardware. It is not the only consumer onboarding UX.
 - **Current serial-shell reality:** on the QEMU / PL011 serial console, the proven interaction mode today is plain line-oriented stdin/stdout on `ttyAMA0`. The richer `ratatui` / `crossterm` fullscreen path is still in the codebase, but it is not yet reliable enough to be the boot-critical path there.
 - **Async runtime:** `tokio` for `bunzod` and any other long-lived network-facing services. Keep it single-threaded where possible to minimize per-process overhead.
 - **Skill runtime:** WebAssembly via `wasmtime` embedded in `bunzod`. Skills compile to `wasm32-wasi` and run inside the daemon with capability-scoped host functions. This replaces the earlier plan to juggle `bwrap`/`nsjail` + seccomp for skill isolation — the `wasmtime` boundary is the sandbox.
@@ -73,17 +79,20 @@ bunzo's own code is written in **Rust**. This is a foundational decision driven 
 - **Init / service manager:** **systemd**. Decided in the M1 scaffolding batch — rejected the "busybox init first, migrate in M2" path because we would have replaced it immediately for socket activation and service supervision. The 20–40 MB cost is acceptable for an agent OS.
 - **Userland:** Buildroot-assembled minimal rootfs — coreutils, bash, openssh, networking tools, `ca-certificates`, `haveged`, `sudo`. No language runtime — bunzo's own code (M2+) is Rust, cross-compiled to static musl binaries and staged via the rootfs overlay.
 - **Identity:** `/etc/os-release`, `/etc/motd`, `/etc/hostname` — set to bunzo.
-- **Shell stub (M2 in progress):** `bunzo-shell` is in the image. Recovery boot to `serial-getty@ttyAMA0` works, and launching `/usr/bin/bunzo-shell` manually from that console works in serial mode. The remaining work is boot-time console ownership plus a deliberate recovery mechanism.
+- **Shell / local console (M2/M3):** `bunzo-shell` is in the image and can now also collect the API key in-band via `/setup`. Today it is the only implemented setup surface. Long term it remains a valid local path on devices with a display and input devices, while headless devices also get a phone-led setup path.
 - **No agent runtime yet.** M1 exists to prove the from-source build-boot loop, not to land the agent layer.
 
 ## Later
 
 - **Agent daemon (`bunzod`):** long-lived Rust service on `tokio`. Brokers LLM calls (`async-openai` or similar for remote; a `candle` or `llama.cpp` FFI binding for local inference), holds the action ledger, enforces policy, embeds `wasmtime` for skill execution, exposes a local Unix-socket API for the chat shell and other clients. Target footprint: idle RSS under 10 MB (excluding loaded model weights).
-- **Chat shell:** minimal Rust TUI (`ratatui` + `crossterm`) pinned to `tty1` on boot, replacing the default getty. Talks to `bunzod` over a local Unix socket. Ctrl-Alt-F2 stays as an escape hatch. Target footprint: idle RSS under 5 MB.
+- **Provisioning mode:** a deterministic first-boot state machine. On headless hardware, the device should advertise a temporary setup path (Wi-Fi AP + captive portal, BLE/app, Ethernet + `bunzo.local`, or similar depending on hardware). On hardware with a local screen/input path, the same setup steps should be available locally in the shell or a local setup UI. In both cases bunzo should ask for device name + connectivity + AI-provider choice, test them, and only then hand off to normal agent mode.
+- **Provisioning services:** a small `bunzo-provisiond` plus one or more frontends (`bunzo-setup-ui` for phone/browser, local shell/setup frontend for desktop-class hardware). These own Wi-Fi scans/joins, temporary AP lifecycle, captive portal/browser UX, device naming, AI-provider auth, and writing the initial config into persistent state. The LLM can assist after connectivity exists, but the setup flow itself should stay deterministic.
+- **Chat shell:** remains as a local escape hatch, developer console, and first-class local interface on devices with displays and keyboards. It talks to `bunzod` over a local Unix socket and can still handle manual setup, but it should not be the only onboarding path for headless hardware.
+  See [PROVISIONING.md](PROVISIONING.md) for the concrete state machine and persisted-config boundary.
 - **Skills:** WebAssembly modules the agent can invoke with explicit capabilities. Each ships a manifest declaring what it needs. `bunzod` loads and runs them inside the embedded `wasmtime`; capability enforcement happens at the host function boundary, so we do not need a separate sandbox runner.
 - **Policy engine:** rules the user sets (eventually in plain language) that `bunzod` enforces before invoking any skill. Denial is the default.
 - **Action ledger:** append-only log of every agent action — inputs, outputs, policy decision, timing. Reviewable via the chat shell or a phone client.
-- **Phone pairing:** phone app talks to `bunzod` over a mutually authenticated channel. QR pairing + WireGuard tunnel. No cloud round-trip.
+- **Phone control / pairing:** after provisioning, a phone app or browser client talks to `bunzod` over a mutually authenticated local channel first, with optional remote reachability later. No mandatory cloud round-trip.
 - **Model backend:** local-first (`candle` or `llama.cpp` FFI), remote as an optional fallback. Swappable behind a Rust trait.
 - **Read-only rootfs with overlayfs for state:** so agents cannot trash the base system and updates are atomic.
 - **A/B partitions + signed updates:** for safe OTA.

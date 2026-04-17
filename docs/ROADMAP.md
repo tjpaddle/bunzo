@@ -118,11 +118,40 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 
 **Definition of done:** user asks a question that requires reading a bunzo-device file (e.g. "what OS is this?"), the LLM calls `read-local-file`, the host reads the file through the capability allowlist, the content is fed back to the LLM, the LLM answers, and the ledger records it. **Tool-call pipeline verified on image 2026-04-17** — model invoked `read-local-file`, `ToolActivity` frames streamed to the shell, skill error was fed back to the model and it recovered gracefully. Final step (wasmtime actually executing the skill) was blocked by an `env` vs `bunzo` import-module mismatch; fix committed to `bunzo-skill-abi` (`#[link(wasm_import_module = "bunzo")]`), needs one more build + smoke test cycle to confirm.
 
-## Milestone 5 — "Phone pairing"
+## Milestone 5 — "Provisioning mode"
 
-**Goal:** talk to bunzo from a phone without a cloud round-trip.
+**Goal:** a non-technical user can flash bunzo onto a device, get it online, name it, and connect an AI provider whether the hardware is headless or has a local screen/keyboard.
 
-Deliberately vague for now; concrete design once Milestones 1–4 land.
+See [PROVISIONING.md](PROVISIONING.md) for the concrete state machine and service split this milestone should implement.
+
+- [ ] First-boot state machine: `unprovisioned` → `network_ready` → `provider_ready` → `ready`
+- [ ] Headless setup path on supported devices:
+  - [ ] Wi-Fi AP + captive portal as the primary v1 path
+  - [ ] Ethernet fallback via `bunzo.local/setup`
+  - [ ] Clear "factory reset / re-enter setup mode" path
+- [ ] Local setup path on supported devices:
+  - [ ] `bunzo-shell` or a local setup frontend can drive the same provisioning state machine
+  - [ ] Local setup asks for the same core fields as the phone flow, not a separate ad hoc config path
+- [ ] Phone/browser setup UI asks only:
+  - [ ] device name
+  - [ ] internet connection (Wi-Fi join if needed)
+  - [ ] AI provider choice
+  - [ ] auth method (API key first; richer login flows later)
+- [ ] Setup writes the initial persisted config (device identity, network, provider credentials)
+- [ ] bunzo verifies the connection and provider live before finishing setup
+- [ ] After deterministic setup finishes, bunzo can perform follow-up system tasks itself (timezone confirmation, optional personalization, device checks)
+
+**Definition of done:** a user can flash bunzo, power it on, and complete setup either from a phone (headless path) or locally on the device (desktop path), ending in the same reachable ready state with the same persisted config.
+
+## Milestone 6 — "Phone control"
+
+**Goal:** talk to bunzo from a phone after setup without a cloud round-trip.
+
+- [ ] Local phone client or browser UI can connect to the already-provisioned device
+- [ ] Mutual trust / pairing model exists
+- [ ] Agent replies and ledger review are accessible from the phone
+
+**Definition of done:** after first-boot provisioning, the user can pick up a phone, reach bunzo on the local network, and continue using it without touching a shell or monitor.
 
 ## Beyond
 
