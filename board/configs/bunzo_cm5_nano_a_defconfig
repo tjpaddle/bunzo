@@ -56,10 +56,10 @@ BR2_LINUX_KERNEL_DEFCONFIG="bcm2712"
 # page-size assumptions) and layer bunzo's kernel fragment on top.
 BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="board/raspberrypi/linux-4k-page-size.fragment $(BR2_EXTERNAL_BUNZO_PATH)/bunzo/common/linux.fragment"
 BR2_LINUX_KERNEL_DTS_SUPPORT=y
-# Upstream CM5 + CM5IO device trees (both silicon steppings). If the
-# pinned kernel commit eventually ships Waveshare-specific DTS entries
-# they can be added here.
-BR2_LINUX_KERNEL_INTREE_DTS_NAME="broadcom/bcm2712-rpi-cm5-cm5io broadcom/bcm2712d0-rpi-cm5-cm5io"
+# Upstream CM5-on-CM5IO device tree. The pinned rpi-6.6.y kernel commit
+# (576cc10e) only ships the base bcm2712 stepping DTS; no bcm2712d0
+# variant yet. If/when that lands we add it here.
+BR2_LINUX_KERNEL_INTREE_DTS_NAME="broadcom/bcm2712-rpi-cm5-cm5io"
 BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
 
 # --- Pi firmware package (installs DTBs + our config.txt / cmdline.txt) ---
