@@ -86,23 +86,23 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 
 **Definition of done:** fresh boot shows the Rust chat shell on the serial console, typing "hello" gets a bunzo-style stub response, an explicit recovery path exists, and `ps` shows `bunzo-shell` under 5 MB RSS.
 
-**Status (2026-04-16):** first three boxes verified on the Debian remote builder; the RSS measurement is still pending an in-VM reading (binary is 594 KB stripped static musl, so the ceiling is safe but un-formally confirmed). Treating M2 as effectively complete and opening M3.
+**Status (2026-04-16):** first three boxes verified on the Debian remote builder; the RSS measurement is still pending an in-VM reading (binary is 594 KB stripped static musl, so the ceiling is safe but un-formally confirmed). Infrastructure to take the measurement has landed alongside the M3 scaffold: `scripts/run-qemu.sh` now hostfwds `tcp::2222->:22`, `etc/ssh/sshd_config.d/bunzo-dev.conf` permits empty-password root (DEV-ONLY), and `scripts/measure-shell-rss.sh` greps `/proc/$pid/status` over SSH. Blocked only on booting the next image. Treating M2 as effectively complete and M3 as scaffolded.
 
 ## Milestone 3 — "Actual agent"
 
 **Goal:** the chat shell is backed by a real LLM via a Rust daemon.
 
-- [ ] `rust/bunzod/` Cargo crate — Rust agent daemon on `tokio`
-- [ ] Local Unix-socket API at `/run/bunzod.sock` (length-prefixed JSON request/response to start; can move to `postcard` once the shape is stable)
-- [ ] `bunzo-shell` talks to `bunzod` over the socket; no direct LLM calls from the shell
-- [ ] Pluggable backend behind a Rust trait, with two implementations:
-  - Remote: `async-openai` (or equivalent) for easy prototyping
-  - Local: `candle` or a `llama.cpp` FFI binding, added in parallel
-- [ ] Append every exchange to an action-ledger file on disk (append-only JSONL to start)
+- [x] `rust/bunzod/` Cargo crate — Rust agent daemon on `tokio` (current_thread runtime)
+- [x] Local Unix-socket API at `/run/bunzod.sock` (4-byte big-endian length prefix + JSON body, `bunzo-proto` v1; internally-tagged `ClientMessage` / `ServerMessage` unions, 1 MiB per-frame cap)
+- [x] `bunzo-shell` talks to `bunzod` over the socket; no direct LLM calls from the shell
+- [x] Pluggable backend behind a Rust trait (`Backend::stream_complete`), first implementation:
+  - Remote: `async-openai 0.27` with `stream(true)` — key loaded from the file at `api_key_path` in `/etc/bunzo/bunzod.toml`, never via process env
+  - Local: `candle` / `llama.cpp` FFI is deferred to after M3 boot verification
+- [x] Append every exchange to an action-ledger file on disk — JSONL at `/var/lib/bunzo/ledger.jsonl`, `O_APPEND` + `sync_data()` per write (`{ts_ms, conv_id, user, assistant, backend, latency_ms, finish_reason}`)
 - [ ] Skill registry scaffolding — empty, but hook points are in place for M4
-- [ ] systemd unit for `bunzod` with socket activation
+- [x] systemd unit for `bunzod` with socket activation (`Type=notify` + `listenfd`; `bunzod.service` has no `[Install]`, so `bunzod.socket` pulls it in on first connect — daemon idles cold)
 
-**Definition of done:** from the chat shell, the user asks "what time is it?", `bunzod` answers with system time via the configured backend, the ledger records the exchange, and `bunzod` idles under 10 MB RSS when no model is loaded.
+**Definition of done:** from the chat shell, the user asks "what time is it?", `bunzod` answers with system time via the configured backend, the ledger records the exchange, and `bunzod` idles under 10 MB RSS when no model is loaded. **Code-complete 2026-04-16; awaiting on-image boot verification.**
 
 ## Milestone 4 — "First skill"
 

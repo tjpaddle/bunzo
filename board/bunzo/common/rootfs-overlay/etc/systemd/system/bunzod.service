@@ -1,0 +1,19 @@
+[Unit]
+Description=bunzo agent daemon
+Documentation=https://github.com/tjpaddle/bunzo
+Requires=bunzod.socket
+After=bunzod.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/bunzod
+Restart=on-failure
+RestartSec=2s
+# Generous safety net; a real LLM stream shouldn't land anywhere near this.
+MemoryHigh=64M
+MemoryMax=128M
+
+# No [Install] section on purpose: the service is started on demand by
+# bunzod.socket the first time a client connects. Before that it idles cold.

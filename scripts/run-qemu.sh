@@ -11,6 +11,9 @@
 #                  disables bunzo-shell.service and lands at 'bunzo login:'.
 #                  Equivalent env override: BUNZO_QEMU_RECOVERY=1.
 #
+# SSH inside the running VM via the default hostfwd:
+#   ssh -p 2222 root@localhost   (empty password)
+#
 # Exit QEMU with Ctrl-A then X.
 #
 set -euo pipefail
@@ -78,7 +81,7 @@ case "${TARGET}" in
             -append "${APPEND}" \
             -drive file="${ROOTFS}",if=none,format=raw,id=hd0 \
             -device virtio-blk-device,drive=hd0 \
-            -netdev user,id=net0 \
+            -netdev user,id=net0,hostfwd=tcp::2222-:22 \
             -device virtio-net-device,netdev=net0
         ;;
     *)

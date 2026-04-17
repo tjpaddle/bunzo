@@ -45,10 +45,12 @@ venv/
 
 # --- Rust ---
 /target/
+/rust/target/
 /rust/*/target/
 
 # --- Staged Rust binaries (built by scripts/build.sh into the overlay) ---
 /board/bunzo/common/rootfs-overlay/usr/bin/bunzo-shell
+/board/bunzo/common/rootfs-overlay/usr/bin/bunzod
 
 # --- Editor / OS cruft ---
 .DS_Store

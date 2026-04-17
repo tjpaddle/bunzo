@@ -1,0 +1,19 @@
+[package]
+name = "bunzod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "bunzo agent daemon"
+
+[dependencies]
+bunzo-proto = { workspace = true, features = ["tokio"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "signal", "sync", "fs"] }
+listenfd = "1"
+sd-notify = "0.4"
+anyhow = "1"
+async-trait = "0.1"
+async-openai = "0.27"
+futures = "0.3"
+toml = "0.8"

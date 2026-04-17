@@ -1,0 +1,14 @@
+[Unit]
+Description=bunzo agent daemon socket
+Documentation=https://github.com/tjpaddle/bunzo
+PartOf=bunzod.service
+
+[Socket]
+ListenStream=/run/bunzod.sock
+SocketMode=0660
+RemoveOnStop=yes
+# Only one connection inherits the listener; bunzod itself accept()s.
+Accept=no
+
+[Install]
+WantedBy=sockets.target

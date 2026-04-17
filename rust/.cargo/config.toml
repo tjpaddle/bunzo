@@ -1,5 +1,5 @@
-# Cross-compiling bunzo-shell for aarch64 from an x86_64 host needs an
-# aarch64-aware linker; the host's /usr/bin/ld rejects aarch64 object files
+# Cross-compiling bunzo's Rust binaries for aarch64 from an x86_64 host needs
+# an aarch64-aware linker; the host's /usr/bin/ld rejects aarch64 object files
 # with "Relocations in generic ELF (EM: 183)". Point cargo at the Debian
 # cross-gcc package (installed on Linux hosts via `apt install
 # gcc-aarch64-linux-gnu`, baked into Dockerfile.builder for the macOS path).

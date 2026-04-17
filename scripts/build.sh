@@ -48,22 +48,24 @@ case "${TARGET}" in
     *)                 RUST_TARGET="" ;;
 esac
 
-if [[ -n "${RUST_TARGET}" && -f "${REPO_ROOT}/rust/bunzo-shell/Cargo.toml" ]]; then
-    echo "build: cargo build bunzo-shell for ${RUST_TARGET}"
+if [[ -n "${RUST_TARGET}" && -f "${REPO_ROOT}/rust/Cargo.toml" ]]; then
+    echo "build: cargo build bunzo userland for ${RUST_TARGET}"
     (
-        cd "${REPO_ROOT}/rust/bunzo-shell"
-        cargo build --release --target "${RUST_TARGET}"
+        cd "${REPO_ROOT}/rust"
+        cargo build --release --target "${RUST_TARGET}" -p bunzo-shell -p bunzod
     )
-    CARGO_BIN_BASE="${CARGO_TARGET_DIR:-${REPO_ROOT}/rust/bunzo-shell/target}"
-    SHELL_BIN="${CARGO_BIN_BASE}/${RUST_TARGET}/release/bunzo-shell"
-    if [[ ! -x "${SHELL_BIN}" ]]; then
-        echo "build: cargo build succeeded but ${SHELL_BIN} is missing" >&2
-        exit 1
-    fi
+    CARGO_BIN_BASE="${CARGO_TARGET_DIR:-${REPO_ROOT}/rust/target}"
     OVERLAY_BIN_DIR="${BOARD_DIR}/bunzo/common/rootfs-overlay/usr/bin"
     mkdir -p "${OVERLAY_BIN_DIR}"
-    install -m 0755 "${SHELL_BIN}" "${OVERLAY_BIN_DIR}/bunzo-shell"
-    echo "build: staged bunzo-shell into overlay"
+    for bin in bunzo-shell bunzod; do
+        BIN_PATH="${CARGO_BIN_BASE}/${RUST_TARGET}/release/${bin}"
+        if [[ ! -x "${BIN_PATH}" ]]; then
+            echo "build: cargo build succeeded but ${BIN_PATH} is missing" >&2
+            exit 1
+        fi
+        install -m 0755 "${BIN_PATH}" "${OVERLAY_BIN_DIR}/${bin}"
+    done
+    echo "build: staged bunzo-shell + bunzod into overlay"
 fi
 
 MAKE_ARGS=(

@@ -1,7 +1,12 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Stdout, Write};
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
+use bunzo_proto::{
+    read_frame, write_frame, ClientMessage, Envelope, ServerFrame, ServerMessage,
+};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -22,6 +27,7 @@ const DEFAULT_COLUMNS: u16 = 80;
 const DEFAULT_LINES: u16 = 24;
 const MIN_COLUMNS: u16 = 40;
 const MIN_LINES: u16 = 10;
+const BUNZOD_SOCKET: &str = "/run/bunzod.sock";
 
 struct App {
     banner: String,
@@ -40,21 +46,10 @@ impl App {
             banner: read_banner(),
             history: vec![(
                 Role::Bunzo,
-                "hi, I'm bunzo. this is an M2 stub — type something and hit enter.".into(),
+                "hi, I'm bunzo. type something and hit enter.".into(),
             )],
             input: String::new(),
         }
-    }
-
-    fn submit(&mut self) {
-        let msg = std::mem::take(&mut self.input);
-        let msg = msg.trim().to_string();
-        if msg.is_empty() {
-            return;
-        }
-        let reply = format!("(stub) I heard: {msg}");
-        self.history.push((Role::User, msg));
-        self.history.push((Role::Bunzo, reply));
     }
 }
 
@@ -89,18 +84,18 @@ fn run_serial_shell() -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
     let mut stdout = io::stdout();
-    let mut app = App::new();
+    let banner = read_banner();
     let mut line = String::new();
+    let mut msg_counter: u64 = 0;
 
-    // Raw VT100 erase-display + home. No raw mode, no cursor addressing —
-    // just styled stream I/O that any vt100-ish terminal (including the one
-    // on the far side of a PL011 UART) renders correctly.
     write!(stdout, "\x1B[2J\x1B[H")?;
-    writeln!(stdout, "{}", app.banner.as_str().bold().cyan())?;
+    writeln!(stdout, "{}", banner.as_str().bold().cyan())?;
     writeln!(stdout, "{}", "─".repeat(60).as_str().dark_grey())?;
-    for (_, text) in &app.history {
-        writeln!(stdout, "{} {}", "bunzo".bold().magenta(), text)?;
-    }
+    writeln!(
+        stdout,
+        "{} connected — type to talk to bunzod.",
+        "bunzo".bold().magenta(),
+    )?;
     writeln!(stdout)?;
     stdout.flush()?;
 
@@ -113,7 +108,6 @@ fn run_serial_shell() -> io::Result<()> {
         if bytes == 0 {
             return Ok(());
         }
-
         let input = line.trim();
         if input.is_empty() {
             continue;
@@ -122,14 +116,89 @@ fn run_serial_shell() -> io::Result<()> {
             return Ok(());
         }
 
-        app.input.clear();
-        app.input.push_str(input);
-        app.submit();
-        if let Some((Role::Bunzo, reply)) = app.history.last() {
-            writeln!(stdout, "{} {}", "bunzo".bold().magenta(), reply)?;
+        msg_counter = msg_counter.wrapping_add(1);
+        let id = format!("u{msg_counter}");
+
+        // Print the reply tag before the stream so chunks land right after it.
+        write!(stdout, "{} ", "bunzo".bold().magenta())?;
+        stdout.flush()?;
+
+        match round_trip(&id, input, &mut stdout) {
+            Ok(()) => {}
+            Err(RoundTripError::Unreachable(reason)) => {
+                writeln!(
+                    stdout,
+                    "{}",
+                    format!("[bunzod unreachable: {reason}]").red()
+                )?;
+            }
+            Err(RoundTripError::Protocol(reason)) => {
+                writeln!(stdout, "{}", format!("[protocol error: {reason}]").red())?;
+            }
+            Err(RoundTripError::Remote { code, text }) => {
+                writeln!(stdout, "{}", format!("[{code}] {text}").red())?;
+            }
         }
         writeln!(stdout)?;
         stdout.flush()?;
+    }
+}
+
+enum RoundTripError {
+    Unreachable(String),
+    Protocol(String),
+    Remote { code: String, text: String },
+}
+
+fn round_trip(id: &str, text: &str, stdout: &mut Stdout) -> Result<(), RoundTripError> {
+    let mut stream =
+        UnixStream::connect(BUNZOD_SOCKET).map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    // A misbehaving daemon shouldn't hang the shell forever. Generous per-op
+    // timeout; still tight enough that a hung daemon gets caught quickly.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::UserMessage {
+        id: id.into(),
+        text: text.into(),
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection mid-stream".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::AssistantChunk {
+                id: chunk_id,
+                text,
+            } if chunk_id == id => {
+                write!(stdout, "{text}").map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+                stdout.flush().map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+            }
+            ServerMessage::AssistantChunk { .. } => {
+                // Out-of-turn chunk: ignore rather than fail.
+            }
+            ServerMessage::AssistantEnd { id: end_id, .. } if end_id == id => {
+                return Ok(());
+            }
+            ServerMessage::AssistantEnd { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+        }
     }
 }
 
@@ -166,7 +235,18 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
             }
             match key.code {
                 KeyCode::Esc => return Ok(()),
-                KeyCode::Enter => app.submit(),
+                KeyCode::Enter => {
+                    // TUI path is behind BUNZO_SHELL_MODE=tui and deferred to a
+                    // later milestone; keep the echo stub here so the code
+                    // path still compiles. Real wiring happens in serial mode.
+                    let msg = std::mem::take(&mut app.input);
+                    let msg = msg.trim().to_string();
+                    if !msg.is_empty() {
+                        app.history.push((Role::User, msg.clone()));
+                        app.history
+                            .push((Role::Bunzo, format!("(tui stub) {msg}")));
+                    }
+                }
                 KeyCode::Backspace => {
                     app.input.pop();
                 }
