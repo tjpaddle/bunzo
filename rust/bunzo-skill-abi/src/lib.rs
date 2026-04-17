@@ -93,6 +93,7 @@ pub extern "C" fn bunzo_dealloc(ptr: u32, len: u32) {
 /// Host imports available to skills. Only callable from `wasm32` targets.
 #[cfg(target_arch = "wasm32")]
 pub mod host {
+    #[link(wasm_import_module = "bunzo")]
     extern "C" {
         pub fn bunzo_fs_read(path_ptr: u32, path_len: u32) -> u64;
         pub fn bunzo_log(ptr: u32, len: u32);

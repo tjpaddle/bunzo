@@ -102,7 +102,7 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 - [ ] Skill registry scaffolding — empty, but hook points are in place for M4
 - [x] systemd unit for `bunzod` with socket activation (`Type=notify` + `listenfd`; `bunzod.service` has no `[Install]`, so `bunzod.socket` pulls it in on first connect — daemon idles cold)
 
-**Definition of done:** from the chat shell, the user asks "what time is it?", `bunzod` answers with system time via the configured backend, the ledger records the exchange, and `bunzod` idles under 10 MB RSS when no model is loaded. **Code-complete 2026-04-16; awaiting on-image boot verification.**
+**Definition of done:** from the chat shell, the user asks "what time is it?", `bunzod` answers with system time via the configured backend, the ledger records the exchange, and `bunzod` idles under 10 MB RSS when no model is loaded. **Chat pipe verified on image 2026-04-17** (real gpt-4o-mini completions streamed over the socket protocol). RSS measurement still pending (needs either a working ssh drop-in or a recovery-console sample). Ledger line format verified by code; on-image inspection pending for the same reason.
 
 ## Milestone 4 — "First skill"
 
@@ -115,7 +115,7 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 - [x] Ledger records which skill ran, with what inputs, and the result. Each exchange's JSONL entry now carries a `tool_calls: [{name, ok, latency_ms}]` array.
 - [x] Sandboxing comes from the `wasmtime` boundary itself — no `bwrap`/`nsjail`/seccomp juggling for the skill runner. (systemd-side seccomp/audit still matters for non-skill services and is handled separately.)
 
-**Definition of done:** user asks a question that requires reading a bunzo-device file (e.g. "what OS is this?"), the LLM calls `read-local-file`, the host reads the file through the capability allowlist, the content is fed back to the LLM, the LLM answers, and the ledger records it. **Code-complete 2026-04-16; awaiting on-image boot verification.**
+**Definition of done:** user asks a question that requires reading a bunzo-device file (e.g. "what OS is this?"), the LLM calls `read-local-file`, the host reads the file through the capability allowlist, the content is fed back to the LLM, the LLM answers, and the ledger records it. **Tool-call pipeline verified on image 2026-04-17** — model invoked `read-local-file`, `ToolActivity` frames streamed to the shell, skill error was fed back to the model and it recovered gracefully. Final step (wasmtime actually executing the skill) was blocked by an `env` vs `bunzo` import-module mismatch; fix committed to `bunzo-skill-abi` (`#[link(wasm_import_module = "bunzo")]`), needs one more build + smoke test cycle to confirm.
 
 ## Milestone 5 — "Phone pairing"
 
