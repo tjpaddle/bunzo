@@ -27,6 +27,17 @@ if [[ ! -f "${TARGET_DIR}/usr/lib/tmpfiles.d/bunzo.conf" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${TARGET_DIR}/etc/ssh/sshd_config" ]]; then
+    echo "post-build: base sshd_config missing from rootfs overlay" >&2
+    exit 1
+fi
+
+if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$)' \
+    "${TARGET_DIR}/etc/ssh/sshd_config"; then
+    echo "post-build: sshd_config does not load /etc/ssh/sshd_config.d/*.conf" >&2
+    exit 1
+fi
+
 if [[ ! -f "${TARGET_DIR}/etc/ssh/sshd_config.d/bunzo-dev.conf" ]]; then
     echo "post-build: ssh dev drop-in missing from rootfs overlay" >&2
     exit 1

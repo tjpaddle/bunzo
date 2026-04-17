@@ -1,0 +1,12 @@
+# bunzo replaces Buildroot's stock sshd_config because the stock file does not
+# load /etc/ssh/sshd_config.d/*.conf. Keep the base file intentionally small
+# and let OpenSSH defaults handle everything we are not actively overriding.
+
+Include /etc/ssh/sshd_config.d/*.conf
+
+# The current dev/recovery loop still relies on password auth. The dev-only
+# root and empty-password overrides live in bunzo-dev.conf, not here.
+PasswordAuthentication yes
+
+# Modern scp defaults to the SFTP subsystem, so declare it explicitly.
+Subsystem sftp /usr/libexec/sftp-server
