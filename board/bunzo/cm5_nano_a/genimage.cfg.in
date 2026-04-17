@@ -4,9 +4,11 @@
 # FAT boot partition (kernel Image + CM5 DTBs + rpi-firmware files + our
 # config.txt / cmdline.txt) and an ext4 rootfs partition.
 #
-# The #BOOT_FILES# marker is substituted by post-image.sh, which enumerates
-# the actual DTB + rpi-firmware files present in BINARIES_DIR at image
-# time. Same idiom Buildroot's upstream raspberrypi board uses.
+# The boot-files placeholder below is substituted by post-image.sh, which
+# enumerates the actual DTB + rpi-firmware files present in BINARIES_DIR
+# at image time. Same idiom Buildroot's upstream raspberrypi board uses.
+# (Do not mention the literal placeholder token in comments — sed would
+# substitute both occurrences and corrupt the generated config.)
 #
 # The resulting sdcard.img is flashed onto the CM5 eMMC via rpiboot
 # (USB-C + BOOT button on the Waveshare CM5-NANO-A).
