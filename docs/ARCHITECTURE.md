@@ -54,7 +54,8 @@ This document separates **what exists now** (or is actively being built) from **
 
 - **Framework:** Buildroot. We do not vendor it. `scripts/bootstrap.sh` clones a pinned release tag into `./buildroot/` (gitignored).
 - **Layout:** `BR2_EXTERNAL` pattern. Our configurations live under `board/` in this repo; Buildroot is invoked with `BR2_EXTERNAL=$(pwd)/board` so our tree is the source of truth for kernel config, rootfs overlay, defconfigs, and custom packages.
-- **Builds run inside Docker** so the workflow is macOS-friendly. The `Dockerfile.builder` image has all Buildroot build dependencies; `scripts/build-docker.sh` mounts the repo into the container and runs `scripts/build.sh` inside. Heavy write paths (`output/`, `dl/`) go through Docker named volumes, not the macOS virtiofs bind mount, because virtiofs takes SIGBUS under Buildroot's mmap-heavy writes.
+- **Primary dev build flow is remote native Linux.** The expected iteration loop is edit locally on the Mac, then run `scripts/remote-build.sh` against the Debian builder and `scripts/remote-qemu.sh` to boot the image there over SSH. This avoids Docker Desktop's VM/virtiofs overhead entirely.
+- **Docker on macOS remains a fallback, not the main loop.** The `Dockerfile.builder` image still exists so the repo can build from macOS without a remote host, but that path is slower and should be treated as backup capacity. When used, heavy write paths (`output/`, `dl/`) go through Docker named volumes, not the macOS virtiofs bind mount, because virtiofs takes SIGBUS under Buildroot's mmap-heavy writes.
 - **Output per target:** kernel image + rootfs + bootable artifact (`.img` for SD/USB, raw files for QEMU). Targets:
   - `bunzo_qemu_aarch64` — QEMU arm64 virt machine, for fast dev iteration
   - `bunzo_rpi4` — real Pi 4 / Pi 5 boot
@@ -72,7 +73,7 @@ bunzo's own code is written in **Rust**. This is a foundational decision driven 
 - **Skill runtime:** WebAssembly via `wasmtime` embedded in `bunzod`. Skills compile to `wasm32-unknown-unknown` and run inside the daemon with capability-scoped host functions. This replaces the earlier plan to juggle `bwrap`/`nsjail` + seccomp for skill isolation — the `wasmtime` boundary is the sandbox.
 - **Not written in Rust:** the kernel, libc, systemd, coreutils, openssh, and everything else Buildroot assembles for us. We pick and configure those but write none of their code.
 
-**Build workflow for Rust code:** Rust binaries are cross-compiled inside the `bunzo-builder` Docker image (which gains `rustup` + the target's musl triple in M2) and dropped into the rootfs via `board/bunzo/common/rootfs-overlay/usr/bin/`. Later, once we have more than a couple of binaries, we promote them to proper Buildroot packages using `cargo-package` infrastructure.
+**Build workflow for Rust code:** In the active workflow, Rust binaries are cross-compiled on the remote Linux builder by `scripts/build.sh` and dropped into the rootfs via `board/bunzo/common/rootfs-overlay/usr/bin/`. The `bunzo-builder` Docker image remains as a fallback for macOS-only builds. Later, once we have more than a couple of binaries, we promote them to proper Buildroot packages using `cargo-package` infrastructure.
 
 ## Now (current repo)
 

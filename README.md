@@ -13,7 +13,11 @@ jobs.
 
 ## Building
 
-bunzo is built from source with Buildroot. Three supported flows:
+bunzo is built from source with Buildroot. For this repo's active day-to-day
+development loop, the expected path is: edit locally, rebuild on the remote
+Linux builder, and boot QEMU on that same remote host over SSH. The macOS
+Docker wrapper remains available as a fallback, but it is not the default
+iteration path.
 
 - **Linux (native, fastest).** Host deps from Buildroot's manual, then:
   ```
@@ -21,12 +25,7 @@ bunzo is built from source with Buildroot. Three supported flows:
   ./scripts/build.sh qemu_aarch64   # ~5–15 min on a modern box
   ./scripts/run-qemu.sh qemu_aarch64
   ```
-- **macOS (Docker wrapper).** Works but slower because of Docker Desktop's VM + virtiofs. Buildroot's heavy I/O is routed onto Docker named volumes to avoid virtiofs SIGBUS:
-  ```
-  ./scripts/build-docker.sh qemu_aarch64
-  ./scripts/run-qemu.sh qemu_aarch64
-  ```
-- **macOS driving a remote Linux builder (recommended for iteration).** Edit locally, let a helper script push to GitHub, pull on the remote, and build there. Boot the resulting image in QEMU over SSH. One-time setup:
+- **macOS driving a remote Linux builder (default and recommended).** Edit locally, let a helper script push to GitHub, pull on the remote, and build there. Boot the resulting image in QEMU over SSH. One-time setup:
   ```
   cp scripts/remote.env.example scripts/remote.env.local
   $EDITOR scripts/remote.env.local         # host alias/port/user/path
@@ -43,6 +42,11 @@ bunzo is built from source with Buildroot. Three supported flows:
   BUNZO_REMOTE_QEMU_PERSIST=1 ./scripts/remote-qemu.sh qemu_aarch64
   ```
   `scripts/remote.env.local` is gitignored so host details stay off GitHub.
+- **macOS (Docker wrapper, fallback only).** Supported, but slower because of Docker Desktop's VM + virtiofs. Keep this for emergencies or when the remote builder is unavailable:
+  ```
+  ./scripts/build-docker.sh qemu_aarch64
+  ./scripts/run-qemu.sh qemu_aarch64
+  ```
 
 ## Documentation
 
