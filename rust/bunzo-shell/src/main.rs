@@ -182,22 +182,7 @@ fn run_serial_shell() -> io::Result<()> {
 
         let requested_conversation = shell_state.active_conversation.as_deref();
         match round_trip(&id, requested_conversation, input, &mut stdout) {
-            Ok(outcome) => {
-                if shell_state.active_conversation.is_some() {
-                    shell_state.active_conversation = Some(outcome.conversation_id);
-                } else if outcome.created_conversation {
-                    writeln!(
-                        stdout,
-                        "{}",
-                        format!(
-                            "[saved as {} — use /conversations {} to resume]",
-                            short_id(&outcome.conversation_id),
-                            short_id(&outcome.conversation_id)
-                        )
-                        .dark_grey()
-                    )?;
-                }
-            }
+            Ok(outcome) => apply_round_trip_outcome(&mut shell_state, outcome, &mut stdout)?,
             Err(RoundTripError::Unreachable(reason)) => {
                 writeln!(
                     stdout,
@@ -219,20 +204,7 @@ fn run_serial_shell() -> io::Result<()> {
                     let requested_conversation = shell_state.active_conversation.as_deref();
                     match round_trip(&retry_id, requested_conversation, input, &mut stdout) {
                         Ok(outcome) => {
-                            if shell_state.active_conversation.is_some() {
-                                shell_state.active_conversation = Some(outcome.conversation_id);
-                            } else if outcome.created_conversation {
-                                writeln!(
-                                    stdout,
-                                    "{}",
-                                    format!(
-                                        "[saved as {} — use /conversations {} to resume]",
-                                        short_id(&outcome.conversation_id),
-                                        short_id(&outcome.conversation_id)
-                                    )
-                                    .dark_grey()
-                                )?;
-                            }
+                            apply_round_trip_outcome(&mut shell_state, outcome, &mut stdout)?
                         }
                         Err(RoundTripError::Unreachable(reason)) => {
                             writeln!(
@@ -262,6 +234,32 @@ enum RoundTripError {
     Unreachable(String),
     Protocol(String),
     Remote { code: String, text: String },
+}
+
+fn apply_round_trip_outcome<W: Write>(
+    shell_state: &mut ShellState,
+    outcome: RoundTripOutcome,
+    stdout: &mut W,
+) -> io::Result<()> {
+    let was_tracking = shell_state.active_conversation.is_some();
+    let conversation_id = outcome.conversation_id;
+    let created_conversation = outcome.created_conversation;
+
+    shell_state.active_conversation = Some(conversation_id.clone());
+
+    if !was_tracking && created_conversation {
+        writeln!(
+            stdout,
+            "{}",
+            format!(
+                "[saved as {} — use /conversations new for a fresh thread]",
+                short_id(&conversation_id)
+            )
+            .dark_grey()
+        )?;
+    }
+
+    Ok(())
 }
 
 fn round_trip(
@@ -956,5 +954,21 @@ mod tests {
         );
         assert!(cfg.contains("model = \"gpt-5.4-mini\""));
         assert!(cfg.contains("api_key_path = \"/etc/bunzo/openai.key\""));
+    }
+
+    #[test]
+    fn first_successful_prompt_becomes_active_conversation() {
+        let mut shell_state = ShellState::default();
+        let mut buf = Vec::new();
+
+        let outcome = RoundTripOutcome {
+            conversation_id: "c1".into(),
+            created_conversation: true,
+        };
+        apply_round_trip_outcome(&mut shell_state, outcome, &mut buf).unwrap();
+
+        assert_eq!(shell_state.active_conversation.as_deref(), Some("c1"));
+        let rendered = String::from_utf8(buf).unwrap();
+        assert!(rendered.contains("/conversations new"));
     }
 }
