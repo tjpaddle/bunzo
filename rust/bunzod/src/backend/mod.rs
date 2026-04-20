@@ -16,9 +16,6 @@ pub mod openai;
 #[derive(Debug, Clone)]
 pub enum Role {
     User,
-    // Multi-turn history lands after M4; the variant is reserved so the
-    // backend signature doesn't churn when it's wired up.
-    #[allow(dead_code)]
     Assistant,
 }
 

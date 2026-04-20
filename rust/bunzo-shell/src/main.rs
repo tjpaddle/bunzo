@@ -7,7 +7,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use bunzo_proto::{
-    read_frame, write_frame, ClientMessage, Envelope, ServerFrame, ServerMessage,
+    read_frame, write_frame, ClientMessage, ConversationSummary, Envelope, ServerFrame,
+    ServerMessage, TaskSummary,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -34,6 +35,8 @@ const BUNZOD_CONFIG_DIR: &str = "/etc/bunzo";
 const BUNZOD_CONFIG_PATH: &str = "/etc/bunzo/bunzod.toml";
 const OPENAI_KEY_PATH: &str = "/etc/bunzo/openai.key";
 const DEFAULT_REMOTE_MODEL: &str = "gpt-5.4-mini";
+const RECENT_CONVERSATION_LIMIT: u32 = 12;
+const RECENT_TASK_LIMIT: u32 = 16;
 
 struct App {
     banner: String,
@@ -44,6 +47,16 @@ struct App {
 enum Role {
     User,
     Bunzo,
+}
+
+#[derive(Default)]
+struct ShellState {
+    active_conversation: Option<String>,
+}
+
+struct RoundTripOutcome {
+    conversation_id: String,
+    created_conversation: bool,
 }
 
 impl App {
@@ -93,6 +106,7 @@ fn run_serial_shell() -> io::Result<()> {
     let banner = read_banner();
     let mut line = String::new();
     let mut msg_counter: u64 = 0;
+    let mut shell_state = ShellState::default();
 
     write!(stdout, "\x1B[2J\x1B[H")?;
     writeln!(stdout, "{}", banner.as_str().bold().cyan())?;
@@ -138,6 +152,18 @@ fn run_serial_shell() -> io::Result<()> {
             stdout.flush()?;
             continue;
         }
+        if let Some(args) = command_args(input, &["/conversations", "/conv"]) {
+            handle_conversations_command(args, &mut shell_state, &mut msg_counter, &mut stdout)?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+            continue;
+        }
+        if let Some(args) = command_args(input, &["/tasks"]) {
+            handle_tasks_command(args, &mut msg_counter, &mut stdout)?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+            continue;
+        }
 
         if let Some(issue) = local_setup_issue() {
             if !run_openai_setup(&mut stdin, &mut stdout, Some(&issue))? {
@@ -154,8 +180,24 @@ fn run_serial_shell() -> io::Result<()> {
         write!(stdout, "{} ", "bunzo".bold().magenta())?;
         stdout.flush()?;
 
-        match round_trip(&id, input, &mut stdout) {
-            Ok(()) => {}
+        let requested_conversation = shell_state.active_conversation.as_deref();
+        match round_trip(&id, requested_conversation, input, &mut stdout) {
+            Ok(outcome) => {
+                if shell_state.active_conversation.is_some() {
+                    shell_state.active_conversation = Some(outcome.conversation_id);
+                } else if outcome.created_conversation {
+                    writeln!(
+                        stdout,
+                        "{}",
+                        format!(
+                            "[saved as {} — use /conversations {} to resume]",
+                            short_id(&outcome.conversation_id),
+                            short_id(&outcome.conversation_id)
+                        )
+                        .dark_grey()
+                    )?;
+                }
+            }
             Err(RoundTripError::Unreachable(reason)) => {
                 writeln!(
                     stdout,
@@ -174,8 +216,24 @@ fn run_serial_shell() -> io::Result<()> {
                     let retry_id = format!("u{msg_counter}");
                     write!(stdout, "{} ", "bunzo".bold().magenta())?;
                     stdout.flush()?;
-                    match round_trip(&retry_id, input, &mut stdout) {
-                        Ok(()) => {}
+                    let requested_conversation = shell_state.active_conversation.as_deref();
+                    match round_trip(&retry_id, requested_conversation, input, &mut stdout) {
+                        Ok(outcome) => {
+                            if shell_state.active_conversation.is_some() {
+                                shell_state.active_conversation = Some(outcome.conversation_id);
+                            } else if outcome.created_conversation {
+                                writeln!(
+                                    stdout,
+                                    "{}",
+                                    format!(
+                                        "[saved as {} — use /conversations {} to resume]",
+                                        short_id(&outcome.conversation_id),
+                                        short_id(&outcome.conversation_id)
+                                    )
+                                    .dark_grey()
+                                )?;
+                            }
+                        }
                         Err(RoundTripError::Unreachable(reason)) => {
                             writeln!(
                                 stdout,
@@ -184,11 +242,7 @@ fn run_serial_shell() -> io::Result<()> {
                             )?;
                         }
                         Err(RoundTripError::Protocol(reason)) => {
-                            writeln!(
-                                stdout,
-                                "{}",
-                                format!("[protocol error: {reason}]").red()
-                            )?;
+                            writeln!(stdout, "{}", format!("[protocol error: {reason}]").red())?;
                         }
                         Err(RoundTripError::Remote { code, text }) => {
                             writeln!(stdout, "{}", format!("[{code}] {text}").red())?;
@@ -210,9 +264,14 @@ enum RoundTripError {
     Remote { code: String, text: String },
 }
 
-fn round_trip(id: &str, text: &str, stdout: &mut Stdout) -> Result<(), RoundTripError> {
-    let mut stream =
-        UnixStream::connect(BUNZOD_SOCKET).map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+fn round_trip(
+    id: &str,
+    conversation_id: Option<&str>,
+    text: &str,
+    stdout: &mut Stdout,
+) -> Result<RoundTripOutcome, RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
     // A misbehaving daemon shouldn't hang the shell forever. Generous per-op
     // timeout; still tight enough that a hung daemon gets caught quickly.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
@@ -221,8 +280,11 @@ fn round_trip(id: &str, text: &str, stdout: &mut Stdout) -> Result<(), RoundTrip
     let req = Envelope::new(ClientMessage::UserMessage {
         id: id.into(),
         text: text.into(),
+        conversation_id: conversation_id.map(str::to_string),
     });
     write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    let mut outcome: Option<RoundTripOutcome> = None;
 
     loop {
         let frame: ServerFrame = match read_frame(&mut stream) {
@@ -236,18 +298,33 @@ fn round_trip(id: &str, text: &str, stdout: &mut Stdout) -> Result<(), RoundTrip
         };
 
         match frame.msg {
-            ServerMessage::AssistantChunk {
-                id: chunk_id,
-                text,
-            } if chunk_id == id => {
+            ServerMessage::RequestContext {
+                id: ctx_id,
+                conversation_id,
+                created_conversation,
+                ..
+            } if ctx_id == id => {
+                outcome = Some(RoundTripOutcome {
+                    conversation_id,
+                    created_conversation,
+                });
+            }
+            ServerMessage::RequestContext { .. } => {}
+            ServerMessage::AssistantChunk { id: chunk_id, text } if chunk_id == id => {
                 write!(stdout, "{text}").map_err(|e| RoundTripError::Protocol(e.to_string()))?;
-                stdout.flush().map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+                stdout
+                    .flush()
+                    .map_err(|e| RoundTripError::Protocol(e.to_string()))?;
             }
             ServerMessage::AssistantChunk { .. } => {
                 // Out-of-turn chunk: ignore rather than fail.
             }
             ServerMessage::AssistantEnd { id: end_id, .. } if end_id == id => {
-                return Ok(());
+                return outcome.ok_or_else(|| {
+                    RoundTripError::Protocol(
+                        "bunzod ended the request without request context".into(),
+                    )
+                });
             }
             ServerMessage::AssistantEnd { .. } => {}
             ServerMessage::Error {
@@ -268,6 +345,8 @@ fn round_trip(id: &str, text: &str, stdout: &mut Stdout) -> Result<(), RoundTrip
                     .map_err(|e| RoundTripError::Protocol(e.to_string()))?;
             }
             ServerMessage::ToolActivity { .. } => {}
+            ServerMessage::ConversationList { .. } => {}
+            ServerMessage::TaskList { .. } => {}
         }
     }
 }
@@ -293,11 +372,316 @@ fn render_tool_activity(
             };
             format!("✗ {name}{suffix}").red().italic().to_string()
         }
-        other => format!("· {name} ({other})").dark_grey().italic().to_string(),
+        other => format!("· {name} ({other})")
+            .dark_grey()
+            .italic()
+            .to_string(),
     };
     writeln!(stdout, "{line}")?;
     write!(stdout, "{} ", "bunzo".bold().magenta())?;
     stdout.flush()
+}
+
+fn handle_conversations_command(
+    args: &str,
+    shell_state: &mut ShellState,
+    msg_counter: &mut u64,
+    stdout: &mut Stdout,
+) -> io::Result<()> {
+    let arg = args.trim();
+    if arg.is_empty() {
+        match request_recent_conversations(next_control_id(msg_counter), RECENT_CONVERSATION_LIMIT)
+        {
+            Ok(recent) => {
+                render_recent_conversations(
+                    stdout,
+                    &recent,
+                    shell_state.active_conversation.as_deref(),
+                )?;
+            }
+            Err(err) => {
+                writeln!(stdout, "{}", round_trip_error_text(err).red())?;
+            }
+        }
+        return Ok(());
+    }
+
+    if arg == "new" {
+        shell_state.active_conversation = None;
+        writeln!(
+            stdout,
+            "{}",
+            "future prompts will start fresh conversations".dark_grey()
+        )?;
+        return Ok(());
+    }
+
+    let recent =
+        match request_recent_conversations(next_control_id(msg_counter), RECENT_CONVERSATION_LIMIT)
+        {
+            Ok(recent) => recent,
+            Err(err) => {
+                writeln!(stdout, "{}", round_trip_error_text(err).red())?;
+                return Ok(());
+            }
+        };
+    match resolve_recent_conversation(&recent, arg) {
+        Ok(conversation) => {
+            shell_state.active_conversation = Some(conversation.conversation_id.clone());
+            writeln!(
+                stdout,
+                "{}",
+                format!(
+                    "resuming {} [{}]",
+                    short_id(&conversation.conversation_id),
+                    conversation.last_task_status
+                )
+                .green()
+            )?;
+            if !conversation.last_user_text.is_empty() {
+                writeln!(
+                    stdout,
+                    "{}",
+                    format!("last prompt: {}", conversation.last_user_text).dark_grey()
+                )?;
+            }
+        }
+        Err(message) => {
+            writeln!(stdout, "{}", message.red())?;
+        }
+    }
+    Ok(())
+}
+
+fn render_recent_conversations(
+    stdout: &mut Stdout,
+    conversations: &[ConversationSummary],
+    active_conversation: Option<&str>,
+) -> io::Result<()> {
+    if conversations.is_empty() {
+        writeln!(stdout, "{}", "no saved conversations yet".dark_grey())?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "{}", "recent conversations".bold().cyan())?;
+    for conversation in conversations {
+        let marker = if active_conversation == Some(conversation.conversation_id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        let preview = if conversation.last_user_text.is_empty() {
+            "(no prompt recorded)"
+        } else {
+            &conversation.last_user_text
+        };
+        writeln!(
+            stdout,
+            "{} {} [{}] {}",
+            marker,
+            short_id(&conversation.conversation_id),
+            conversation.last_task_status,
+            preview
+        )?;
+    }
+    writeln!(
+        stdout,
+        "{}",
+        "Use /conversations <id-prefix> to resume, or /conversations new for a fresh thread."
+            .dark_grey()
+    )?;
+    Ok(())
+}
+
+fn request_recent_conversations(
+    id: String,
+    limit: u32,
+) -> Result<Vec<ConversationSummary>, RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::ListConversations {
+        id: id.clone(),
+        limit,
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::ConversationList {
+                id: list_id,
+                conversations,
+            } if list_id == id => return Ok(conversations),
+            ServerMessage::ConversationList { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            ServerMessage::TaskList { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+fn handle_tasks_command(args: &str, msg_counter: &mut u64, stdout: &mut Stdout) -> io::Result<()> {
+    if !args.trim().is_empty() {
+        writeln!(stdout, "{}", "usage: /tasks".dark_grey())?;
+        return Ok(());
+    }
+
+    match request_recent_tasks(next_control_id(msg_counter), RECENT_TASK_LIMIT) {
+        Ok(tasks) => render_recent_tasks(stdout, &tasks)?,
+        Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+    }
+    Ok(())
+}
+
+fn render_recent_tasks(stdout: &mut Stdout, tasks: &[TaskSummary]) -> io::Result<()> {
+    if tasks.is_empty() {
+        writeln!(stdout, "{}", "no saved tasks yet".dark_grey())?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "{}", "recent tasks".bold().cyan())?;
+    for task in tasks {
+        let summary = if task.summary.is_empty() {
+            "(no summary)"
+        } else {
+            &task.summary
+        };
+        let status = if task.task_status == task.run_status {
+            task.task_status.as_str().to_string()
+        } else {
+            format!("{}/{}", task.task_status, task.run_status)
+        };
+        writeln!(
+            stdout,
+            "{} [{}] conv:{} {}",
+            short_id(&task.task_id),
+            status,
+            short_id(&task.conversation_id),
+            summary
+        )?;
+        if let Some(reason) = task.state_reason_text.as_deref() {
+            if !reason.is_empty() {
+                writeln!(stdout, "{}", format!("  reason: {reason}").dark_grey())?;
+            }
+        }
+        if task.snapshot_kind.is_some() {
+            writeln!(stdout, "{}", "  resumable snapshot saved".dark_grey())?;
+        }
+    }
+    Ok(())
+}
+
+fn request_recent_tasks(id: String, limit: u32) -> Result<Vec<TaskSummary>, RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::ListTasks {
+        id: id.clone(),
+        limit,
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::TaskList { id: list_id, tasks } if list_id == id => return Ok(tasks),
+            ServerMessage::TaskList { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            ServerMessage::ConversationList { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+fn resolve_recent_conversation<'a>(
+    conversations: &'a [ConversationSummary],
+    prefix: &str,
+) -> Result<&'a ConversationSummary, String> {
+    let mut matches = conversations
+        .iter()
+        .filter(|conversation| conversation.conversation_id.starts_with(prefix));
+    let first = matches
+        .next()
+        .ok_or_else(|| format!("no recent conversation matches '{prefix}'"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "conversation prefix '{prefix}' is ambiguous in the recent list"
+        ));
+    }
+    Ok(first)
+}
+
+fn next_control_id(msg_counter: &mut u64) -> String {
+    *msg_counter = msg_counter.wrapping_add(1);
+    format!("ctl{}", *msg_counter)
+}
+
+fn command_args<'a>(input: &'a str, commands: &[&str]) -> Option<&'a str> {
+    for command in commands {
+        if input == *command {
+            return Some("");
+        }
+        if let Some(rest) = input.strip_prefix(command) {
+            if rest.starts_with(' ') || rest.starts_with('\t') {
+                return Some(rest);
+            }
+        }
+    }
+    None
+}
+
+fn short_id(id: &str) -> &str {
+    let end = id
+        .char_indices()
+        .nth(12)
+        .map(|(idx, _)| idx)
+        .unwrap_or(id.len());
+    &id[..end]
+}
+
+fn round_trip_error_text(err: RoundTripError) -> String {
+    match err {
+        RoundTripError::Unreachable(reason) => format!("bunzod unreachable: {reason}"),
+        RoundTripError::Protocol(reason) => format!("protocol error: {reason}"),
+        RoundTripError::Remote { code, text } => format!("[{code}] {text}"),
+    }
 }
 
 fn local_setup_issue() -> Option<String> {
@@ -307,9 +691,7 @@ fn local_setup_issue() -> Option<String> {
     match fs::read_to_string(OPENAI_KEY_PATH) {
         Ok(key) if !key.trim().is_empty() => None,
         Ok(_) => Some("OpenAI API key is empty.".into()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Some("OpenAI API key is missing.".into())
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Some("OpenAI API key is missing.".into()),
         Err(e) => Some(format!("OpenAI API key is unreadable: {e}")),
     }
 }
@@ -474,8 +856,7 @@ fn run(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
                     let msg = msg.trim().to_string();
                     if !msg.is_empty() {
                         app.history.push((Role::User, msg.clone()));
-                        app.history
-                            .push((Role::Bunzo, format!("(tui stub) {msg}")));
+                        app.history.push((Role::Bunzo, format!("(tui stub) {msg}")));
                     }
                 }
                 KeyCode::Backspace => {
@@ -546,7 +927,10 @@ mod tests {
 
     #[test]
     fn setup_offer_matches_config_errors() {
-        assert!(should_offer_setup("unconfigured", "reading /etc/bunzo/bunzod.toml"));
+        assert!(should_offer_setup(
+            "unconfigured",
+            "reading /etc/bunzo/bunzod.toml"
+        ));
         assert!(should_offer_setup(
             "backend_init_failed",
             "reading api key from /etc/bunzo/openai.key"
@@ -568,8 +952,7 @@ mod tests {
                 "model = \"{}\"\n",
                 "api_key_path = \"{}\"\n",
             ),
-            DEFAULT_REMOTE_MODEL,
-            OPENAI_KEY_PATH
+            DEFAULT_REMOTE_MODEL, OPENAI_KEY_PATH
         );
         assert!(cfg.contains("model = \"gpt-5.4-mini\""));
         assert!(cfg.contains("api_key_path = \"/etc/bunzo/openai.key\""));

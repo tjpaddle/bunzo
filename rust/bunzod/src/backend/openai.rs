@@ -116,9 +116,12 @@ impl Backend for OpenAiBackend {
                         .build()?
                         .into(),
                 ),
-                Role::Assistant => {
-                    // Multi-turn history wiring lands after M4.
-                }
+                Role::Assistant => oai_msgs.push(
+                    ChatCompletionRequestAssistantMessageArgs::default()
+                        .content(m.text)
+                        .build()?
+                        .into(),
+                ),
             }
         }
 
@@ -150,10 +153,7 @@ impl Backend for OpenAiBackend {
                         for choice in resp.choices {
                             if let Some(content) = choice.delta.content {
                                 if !content.is_empty()
-                                    && tx
-                                        .send(BackendEvent::Chunk(content))
-                                        .await
-                                        .is_err()
+                                    && tx.send(BackendEvent::Chunk(content)).await.is_err()
                                 {
                                     return Ok(());
                                 }
@@ -224,10 +224,9 @@ impl Backend for OpenAiBackend {
                 let registry = registry.clone();
                 let name = call.name.clone();
                 let args_json = call.arguments.clone();
-                let join = tokio::task::spawn_blocking(move || {
-                    registry.invoke_sync(&name, &args_json)
-                })
-                .await;
+                let join =
+                    tokio::task::spawn_blocking(move || registry.invoke_sync(&name, &args_json))
+                        .await;
 
                 let (tool_output, ok, detail): (String, bool, String) = match join {
                     Ok(Ok(out)) => (out, true, String::new()),

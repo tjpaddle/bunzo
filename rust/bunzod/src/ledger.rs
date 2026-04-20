@@ -30,6 +30,10 @@ pub struct ToolRecord {
 pub struct Entry<'a> {
     pub ts_ms: u128,
     pub conv_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_run_id: Option<&'a str>,
     pub user: &'a str,
     pub assistant: &'a str,
     pub backend: &'a str,

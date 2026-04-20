@@ -109,16 +109,10 @@ pub fn fs_read(path: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
         return Err("host denied or failed fs read");
     }
     let (ptr, len) = unpack(packed);
-    let bytes = unsafe {
-        core::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec()
-    };
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec() };
     // The host allocated this buffer in our memory via bunzo_alloc; free it.
     unsafe {
-        let _ = alloc::vec::Vec::from_raw_parts(
-            ptr as *mut u8,
-            len as usize,
-            len as usize,
-        );
+        let _ = alloc::vec::Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize);
     }
     Ok(bytes)
 }
@@ -138,9 +132,8 @@ macro_rules! bunzo_skill {
         #[cfg(target_arch = "wasm32")]
         #[no_mangle]
         pub extern "C" fn run(input_ptr: u32, input_len: u32) -> u64 {
-            let input_bytes = unsafe {
-                core::slice::from_raw_parts(input_ptr as *const u8, input_len as usize)
-            };
+            let input_bytes =
+                unsafe { core::slice::from_raw_parts(input_ptr as *const u8, input_len as usize) };
             let input = match serde_json::from_slice(input_bytes) {
                 Ok(v) => v,
                 Err(_) => return $crate::ERR,

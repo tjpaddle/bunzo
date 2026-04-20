@@ -49,6 +49,17 @@ case "${TARGET}" in
 esac
 
 if [[ -n "${RUST_TARGET}" && -f "${REPO_ROOT}/rust/Cargo.toml" ]]; then
+    # libsqlite3-sys's bundled SQLite enables large-file support by default,
+    # which calls glibc-style open64/stat64 symbols that are not provided by
+    # the static musl cross-link path we use for bunzo. Disabling LFS keeps the
+    # runtime store portable in the image build; bunzo's state DB is nowhere
+    # near the 2 GiB+ file sizes where that tradeoff would matter.
+    SQLITE_CFLAG_VAR="CFLAGS_${RUST_TARGET//-/_}"
+    if [[ -n "${!SQLITE_CFLAG_VAR:-}" ]]; then
+        export "${SQLITE_CFLAG_VAR}=${!SQLITE_CFLAG_VAR} -DSQLITE_DISABLE_LFS"
+    else
+        export "${SQLITE_CFLAG_VAR}=-DSQLITE_DISABLE_LFS"
+    fi
     echo "build: cargo build bunzo userland for ${RUST_TARGET}"
     (
         cd "${REPO_ROOT}/rust"

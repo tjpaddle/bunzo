@@ -63,8 +63,8 @@ pub fn load_dir(dir: &Path) -> Result<(Manifest, PathBuf)> {
     let manifest_path = dir.join("manifest.toml");
     let raw = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("reading {}", manifest_path.display()))?;
-    let manifest: Manifest = toml::from_str(&raw)
-        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let manifest: Manifest =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", manifest_path.display()))?;
 
     let wasm_path = dir.join("skill.wasm");
     if !wasm_path.exists() {

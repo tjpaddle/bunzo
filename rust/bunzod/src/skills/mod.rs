@@ -93,10 +93,7 @@ impl Registry {
                     skills.push(s);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "bunzod: skipping {}: {e:#}",
-                        path.display()
-                    );
+                    eprintln!("bunzod: skipping {}: {e:#}", path.display());
                 }
             }
         }

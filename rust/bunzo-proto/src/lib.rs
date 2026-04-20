@@ -17,15 +17,62 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_FRAME_BYTES: u32 = 1 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationSummary {
+    pub conversation_id: String,
+    pub updated_at_ms: u64,
+    pub message_count: u32,
+    pub last_task_status: String,
+    pub last_user_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub task_id: String,
+    pub conversation_id: String,
+    pub task_run_id: String,
+    pub updated_at_ms: u64,
+    pub task_status: String,
+    pub run_status: String,
+    pub summary: String,
+    pub state_reason_code: Option<String>,
+    pub state_reason_text: Option<String>,
+    pub snapshot_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientMessage {
-    UserMessage { id: String, text: String },
-    Cancel { id: String },
+    UserMessage {
+        id: String,
+        text: String,
+        #[serde(default)]
+        conversation_id: Option<String>,
+    },
+    Cancel {
+        id: String,
+    },
+    ListConversations {
+        id: String,
+        #[serde(default = "default_list_limit")]
+        limit: u32,
+    },
+    ListTasks {
+        id: String,
+        #[serde(default = "default_list_limit")]
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ServerMessage {
+    RequestContext {
+        id: String,
+        conversation_id: String,
+        task_id: String,
+        task_run_id: String,
+        created_conversation: bool,
+    },
     AssistantChunk {
         id: String,
         text: String,
@@ -50,6 +97,18 @@ pub enum ServerMessage {
         #[serde(default)]
         detail: String,
     },
+    ConversationList {
+        id: String,
+        conversations: Vec<ConversationSummary>,
+    },
+    TaskList {
+        id: String,
+        tasks: Vec<TaskSummary>,
+    },
+}
+
+fn default_list_limit() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +218,7 @@ mod tests {
         let out = Envelope::new(ClientMessage::UserMessage {
             id: "u1".into(),
             text: "hello".into(),
+            conversation_id: None,
         });
         let mut buf = Vec::new();
         write_frame(&mut buf, &out).unwrap();
@@ -166,7 +226,7 @@ mod tests {
         let back: ClientFrame = read_frame(&mut cur).unwrap();
         assert_eq!(back.v, PROTOCOL_VERSION);
         match back.msg {
-            ClientMessage::UserMessage { id, text } => {
+            ClientMessage::UserMessage { id, text, .. } => {
                 assert_eq!(id, "u1");
                 assert_eq!(text, "hello");
             }
@@ -177,6 +237,13 @@ mod tests {
     #[test]
     fn roundtrip_server_frames() {
         for msg in [
+            ServerMessage::RequestContext {
+                id: "u1".into(),
+                conversation_id: "c1".into(),
+                task_id: "t1".into(),
+                task_run_id: "tr1".into(),
+                created_conversation: true,
+            },
             ServerMessage::AssistantChunk {
                 id: "u1".into(),
                 text: "part ".into(),
@@ -196,6 +263,31 @@ mod tests {
                 phase: "invoke".into(),
                 detail: String::new(),
             },
+            ServerMessage::ConversationList {
+                id: "u1".into(),
+                conversations: vec![ConversationSummary {
+                    conversation_id: "c1".into(),
+                    updated_at_ms: 1,
+                    message_count: 2,
+                    last_task_status: "completed".into(),
+                    last_user_text: "hello".into(),
+                }],
+            },
+            ServerMessage::TaskList {
+                id: "u1".into(),
+                tasks: vec![TaskSummary {
+                    task_id: "t1".into(),
+                    conversation_id: "c1".into(),
+                    task_run_id: "tr1".into(),
+                    updated_at_ms: 1,
+                    task_status: "waiting".into(),
+                    run_status: "waiting".into(),
+                    summary: "hello".into(),
+                    state_reason_code: Some("unconfigured".into()),
+                    state_reason_text: Some("missing API key".into()),
+                    snapshot_kind: Some("shell_request_waiting_v1".into()),
+                }],
+            },
         ] {
             let out = Envelope::new(msg);
             let mut buf = Vec::new();
@@ -213,6 +305,7 @@ mod tests {
             &Envelope::new(ClientMessage::UserMessage {
                 id: "x".into(),
                 text: "y".into(),
+                conversation_id: None,
             }),
         )
         .unwrap();

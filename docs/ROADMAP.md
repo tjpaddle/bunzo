@@ -100,7 +100,7 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
   - Remote: `async-openai 0.27` with `stream(true)` — key loaded from the file at `api_key_path` in `/etc/bunzo/bunzod.toml`, never via process env
   - Local: `candle` / `llama.cpp` FFI is deferred to after M3 boot verification
 - [x] Append every exchange to an action-ledger file on disk — JSONL at `/var/lib/bunzo/ledger.jsonl`, `O_APPEND` + `sync_data()` per write (`{ts_ms, conv_id, user, assistant, backend, latency_ms, finish_reason}`)
-- [ ] Skill registry scaffolding — empty, but hook points are in place for M4
+- [x] Skill registry scaffolding landed and is now populated by M4 skills
 - [x] systemd unit for `bunzod` with socket activation (`Type=notify` + `listenfd`; `bunzod.service` has no `[Install]`, so `bunzod.socket` pulls it in on first connect — daemon idles cold)
 
 **Definition of done:** from the chat shell, the user asks "what time is it?", `bunzod` answers with system time via the configured backend, the ledger records the exchange, and `bunzod` idles under 10 MB RSS when no model is loaded. **Chat pipe verified on image 2026-04-17** (real remote completions streamed over the socket protocol). Project policy is now GPT-5.4-family only, with `gpt-5.4-mini` as the current interactive default. RSS measurement still pending (needs either a working ssh drop-in or a recovery-console sample). Ledger line format verified by code; on-image inspection pending for the same reason.
@@ -118,13 +118,70 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 
 **Definition of done:** user asks a question that requires reading a bunzo-device file (e.g. "what OS is this?"), the LLM calls `read-local-file`, the host reads the file through the capability allowlist, the content is fed back to the LLM, the LLM answers, and the ledger records it. **Tool-call pipeline verified on image 2026-04-17** — model invoked `read-local-file`, `ToolActivity` frames streamed to the shell, skill error was fed back to the model and it recovered gracefully. Final step (wasmtime actually executing the skill) was blocked by an `env` vs `bunzo` import-module mismatch; fix committed to `bunzo-skill-abi` (`#[link(wasm_import_module = "bunzo")]`), needs one more build + smoke test cycle to confirm.
 
-## Milestone 5 — "Provisioning mode"
+## Next phase — runtime foundations
+
+After M4, bunzo should stop widening the surface area and start hardening the
+runtime. The next four milestones are intentionally ordered:
+
+1. durable context/task state
+2. policy
+3. provisioning as a real service
+4. proactive scheduling
+
+See [FOUNDATIONS.md](FOUNDATIONS.md) for the cross-cutting plan and the
+dependency rationale.
+
+## Milestone 5 — "Context and task store"
+
+**Goal:** replace "current request + JSONL audit" with durable runtime state
+that can resume after reboot, power loss, or reconnect.
+
+- [ ] Introduce a canonical bunzo-owned runtime state store under
+  `/var/lib/bunzo/state/`
+- [ ] Persist conversations and message history as first-class runtime objects
+- [ ] Persist tasks and task-run state (`queued`, `running`, `waiting`,
+  `completed`, `failed`)
+- [ ] Store resumable context snapshots instead of reconstructing state from the
+  shell or from logs
+- [ ] Record tool activity as structured task events, not only as audit text
+- [ ] Keep the JSONL ledger as an append-only audit/export sink
+- [ ] Add shell commands to list and resume recent conversations/tasks
+
+**Definition of done:** a conversation survives reboot, the user can resume it
+without replaying raw ledger lines, and `bunzod` can answer "what tasks exist
+and what state are they in?" from durable state.
+
+## Milestone 6 — "Policy engine"
+
+**Goal:** replace manifest-only gating with a user-centric policy layer that
+decides whether bunzo may perform an action in the context of a task.
+
+- [ ] Introduce policy concepts: subject, action, resource, decision, scope
+- [ ] Keep manifest capabilities as the hard ceiling for skill behavior
+- [ ] Add a policy evaluator in front of skill invocation
+- [ ] Persist grants and denials as runtime state
+- [ ] Support at least `allow`, `deny`, and `require approval`
+- [ ] Surface policy decisions and denials in the shell and audit trail
+- [ ] Apply the same evaluator to future scheduler-triggered work
+
+**Definition of done:** every tool action is checked against both manifest
+capability and runtime policy, decisions are durable/reviewable, and bunzo can
+distinguish "explicitly allowed" from "denied by default".
+
+## Milestone 7 — "Provisioning engine"
 
 **Goal:** a non-technical user can flash bunzo onto a device, get it online, name it, and connect an AI provider whether the hardware is headless or has a local screen/keyboard.
 
 See [PROVISIONING.md](PROVISIONING.md) for the concrete state machine and service split this milestone should implement.
 
-- [ ] First-boot state machine: `unprovisioned` → `network_ready` → `provider_ready` → `ready`
+- [ ] Introduce `bunzo-provisiond` as the owner of the provisioning state
+  machine
+- [ ] Persist setup state and config under `/var/lib/bunzo/config/`
+- [ ] Persist secrets under `/var/lib/bunzo/secrets/`
+- [ ] Render runtime-facing files (`/etc/bunzo/bunzod.toml`, hostname, network
+  config) from canonical state
+- [ ] Make `/setup` call the provisioning API instead of writing files directly
+- [ ] First-boot state machine: `unprovisioned` → `naming` → `connectivity` → `provider` → `validating` → `ready`
 - [ ] Headless setup path on supported devices:
   - [ ] Wi-Fi AP + captive portal as the primary v1 path
   - [ ] Ethernet fallback via `bunzo.local/setup`
@@ -141,9 +198,28 @@ See [PROVISIONING.md](PROVISIONING.md) for the concrete state machine and servic
 - [ ] bunzo verifies the connection and provider live before finishing setup
 - [ ] After deterministic setup finishes, bunzo can perform follow-up system tasks itself (timezone confirmation, optional personalization, device checks)
 
-**Definition of done:** a user can flash bunzo, power it on, and complete setup either from a phone (headless path) or locally on the device (desktop path), ending in the same reachable ready state with the same persisted config.
+**Definition of done:** `/setup` is just one frontend to `bunzo-provisiond`, a
+user can complete setup either from a phone (headless path) or locally on the
+device (desktop path), and both surfaces end in the same persisted config.
 
-## Milestone 6 — "Phone control"
+## Milestone 8 — "Scheduler"
+
+**Goal:** bunzo can run proactive routines through the same task, policy, and
+audit path as interactive requests.
+
+- [ ] Introduce a durable job store
+- [ ] Support time-based recurring triggers
+- [ ] Claim due jobs safely and record job-run history
+- [ ] Create normal task runs for scheduler-fired work
+- [ ] Run scheduler-triggered work through the same policy engine
+- [ ] Persist retries/backoff and failure state
+- [ ] Expose job status and recent runs in the shell
+
+**Definition of done:** bunzo can run a routine such as "check X every
+morning", each run is recorded as a normal task, and scheduled actions are
+resumable, auditable, and policy-bounded.
+
+## Milestone 9 — "Phone control"
 
 **Goal:** talk to bunzo from a phone after setup without a cloud round-trip.
 
@@ -161,3 +237,5 @@ See [PROVISIONING.md](PROVISIONING.md) for the concrete state machine and servic
 - More boards (additional SBCs, more x86_64 variants)
 - Policy-engine DSL in plain language
 - Audit UI for reviewing historical agent actions
+- Multi-agent / delegation work, but only after the state/policy/scheduler
+  foundations are real

@@ -43,8 +43,8 @@ impl SkillHost {
     }
 
     pub fn compile(&self, wasm_path: &PathBuf) -> Result<Module> {
-        let bytes = std::fs::read(wasm_path)
-            .with_context(|| format!("reading {}", wasm_path.display()))?;
+        let bytes =
+            std::fs::read(wasm_path).with_context(|| format!("reading {}", wasm_path.display()))?;
         Module::new(&self.engine, &bytes)
             .with_context(|| format!("compiling {}", wasm_path.display()))
     }
@@ -120,10 +120,7 @@ impl SkillHost {
     }
 }
 
-fn guest_alloc(
-    instance: &Instance,
-    store: &mut Store<StoreState>,
-) -> Result<TypedFunc<u32, u32>> {
+fn guest_alloc(instance: &Instance, store: &mut Store<StoreState>) -> Result<TypedFunc<u32, u32>> {
     instance
         .get_typed_func::<u32, u32>(store, "bunzo_alloc")
         .context("skill missing `bunzo_alloc` export")
@@ -189,10 +186,7 @@ fn host_fs_read(mut caller: Caller<'_, StoreState>, path_ptr: u32, path_len: u32
         Ok(p) => p,
         Err(_) => return 0,
     };
-    if memory
-        .write(&mut caller, out_ptr as usize, &bytes)
-        .is_err()
-    {
+    if memory.write(&mut caller, out_ptr as usize, &bytes).is_err() {
         return 0;
     }
     ((out_ptr as u64) << 32) | (bytes.len() as u64)

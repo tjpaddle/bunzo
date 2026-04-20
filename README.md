@@ -7,6 +7,9 @@ bunzo is an operating system built around the idea that AI agents should be a fi
 ## Status
 
 Early prototype. QEMU boot, `bunzod`, and the first skill all work in principle, and `bunzo-shell` can now collect an OpenAI API key in-band via `/setup`. The current product direction is **screen-optional**: on headless hardware the user should be able to provision bunzo from a phone, while on desktop-class hardware with a display and keyboard the local shell should remain a normal first-class setup and usage path. See [docs/ROADMAP.md](docs/ROADMAP.md) for milestones.
+The next planned platform phase is: durable context/task state, a real policy
+engine, a provisioning service behind `/setup`, and a scheduler for proactive
+jobs.
 
 ## Building
 
@@ -46,6 +49,7 @@ bunzo is built from source with Buildroot. Three supported flows:
 - [Vision](docs/VISION.md) — where the project is heading
 - [Architecture](docs/ARCHITECTURE.md) — what exists now vs what comes later
 - [Roadmap](docs/ROADMAP.md) — milestones and current focus
+- [Foundations Plan](docs/FOUNDATIONS.md) — next platform phase after M4
 - [Provisioning](docs/PROVISIONING.md) — first-boot and reconfiguration spec
 
 ## Backend Config

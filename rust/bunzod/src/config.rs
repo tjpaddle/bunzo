@@ -10,11 +10,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/bunzo/bunzod.toml";
-pub const ALLOWED_OPENAI_MODELS: &[&str] = &[
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.4-nano",
-];
+pub const ALLOWED_OPENAI_MODELS: &[&str] = &["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"];
 pub const RECOMMENDED_OPENAI_MODEL: &str = "gpt-5.4-mini";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,10 +56,9 @@ pub fn config_path() -> PathBuf {
 
 pub fn load() -> Result<BunzodConfig> {
     let path = config_path();
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let cfg: BunzodConfig = toml::from_str(&raw)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let cfg: BunzodConfig =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     match &cfg.backend {
         BackendConfig::Openai(oai) => oai
             .validate()

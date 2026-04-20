@@ -71,8 +71,9 @@ Recommended v1 flow:
 4. The same persisted config is written.
 5. bunzo exits provisioning mode and starts normal agent mode.
 
-The current `/setup` shell command is the seed of this path, but long term it
-should call the provisioning engine rather than writing config files directly.
+The current `/setup` shell command is the seed of this path, but the planned
+implementation is explicit: it should call `bunzo-provisiond`, not write config
+files directly.
 
 ## Provisioning engine
 
@@ -95,6 +96,24 @@ Frontends:
 2. `bunzo-setup-ui` phone/browser frontend
 
 Both frontends should drive the same backend API and same state machine.
+
+## Dependency on the runtime foundations
+
+Provisioning should not be built as a parallel ad hoc system. It depends on the
+same foundation layer as the rest of the runtime:
+
+1. **Context/task store**
+   Provisioning state should survive reboot and resume cleanly.
+2. **Policy engine**
+   Writes to persistent config, secrets, and network state should still flow
+   through explicit system-owned authority, even though the UX is deterministic.
+3. **Renderer / activator boundary**
+   `/etc` should remain a rendered runtime surface, not the canonical config
+   store.
+
+In practice this means `/setup` should evolve from today's direct file-writing
+shortcut into a client of `bunzo-provisiond`, backed by the same persisted
+state model used by the phone/browser path.
 
 ## State machine
 
