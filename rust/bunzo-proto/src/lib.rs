@@ -97,6 +97,16 @@ pub enum ServerMessage {
         #[serde(default)]
         detail: String,
     },
+    PolicyDecision {
+        id: String,
+        subject: String,
+        action: String,
+        resource: String,
+        decision: String,
+        grant_scope: String,
+        #[serde(default)]
+        detail: String,
+    },
     ConversationList {
         id: String,
         conversations: Vec<ConversationSummary>,
@@ -262,6 +272,15 @@ mod tests {
                 name: "read-local-file".into(),
                 phase: "invoke".into(),
                 detail: String::new(),
+            },
+            ServerMessage::PolicyDecision {
+                id: "u1".into(),
+                subject: "shell_request".into(),
+                action: "invoke_skill".into(),
+                resource: "read-local-file".into(),
+                decision: "require_approval".into(),
+                grant_scope: "task".into(),
+                detail: "approval required before invoking read-local-file".into(),
             },
             ServerMessage::ConversationList {
                 id: "u1".into(),

@@ -9,6 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+use crate::policy::{PolicyEvaluation, ToolPolicyContext};
 use crate::skills::Registry;
 
 pub mod openai;
@@ -29,6 +30,8 @@ pub struct Message {
 pub enum BackendEvent {
     /// Next chunk of user-facing assistant text.
     Chunk(String),
+    /// Runtime policy evaluated a proposed tool action.
+    PolicyDecision { evaluation: PolicyEvaluation },
     /// Backend is about to invoke a skill.
     ToolInvoke { name: String },
     /// Skill invocation finished.
@@ -51,6 +54,7 @@ pub trait Backend: Send + Sync {
         &self,
         messages: Vec<Message>,
         registry: Registry,
+        policy: ToolPolicyContext,
         tx: mpsc::Sender<BackendEvent>,
     ) -> Result<()>;
 

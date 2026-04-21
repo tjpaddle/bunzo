@@ -343,6 +343,26 @@ fn round_trip(
                     .map_err(|e| RoundTripError::Protocol(e.to_string()))?;
             }
             ServerMessage::ToolActivity { .. } => {}
+            ServerMessage::PolicyDecision {
+                id: policy_id,
+                action,
+                resource,
+                decision,
+                grant_scope,
+                detail,
+                ..
+            } if policy_id == id => {
+                render_policy_decision(
+                    stdout,
+                    &action,
+                    &resource,
+                    &decision,
+                    &grant_scope,
+                    &detail,
+                )
+                .map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+            }
+            ServerMessage::PolicyDecision { .. } => {}
             ServerMessage::ConversationList { .. } => {}
             ServerMessage::TaskList { .. } => {}
         }
@@ -371,6 +391,41 @@ fn render_tool_activity(
             format!("✗ {name}{suffix}").red().italic().to_string()
         }
         other => format!("· {name} ({other})")
+            .dark_grey()
+            .italic()
+            .to_string(),
+    };
+    writeln!(stdout, "{line}")?;
+    write!(stdout, "{} ", "bunzo".bold().magenta())?;
+    stdout.flush()
+}
+
+fn render_policy_decision(
+    stdout: &mut Stdout,
+    action: &str,
+    resource: &str,
+    decision: &str,
+    grant_scope: &str,
+    detail: &str,
+) -> io::Result<()> {
+    writeln!(stdout)?;
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    };
+    let line = match decision {
+        "deny" => format!("policy denied {action} {resource} [{grant_scope}]{suffix}")
+            .red()
+            .italic()
+            .to_string(),
+        "require_approval" => {
+            format!("approval needed for {action} {resource} [{grant_scope}]{suffix}")
+                .yellow()
+                .italic()
+                .to_string()
+        }
+        _ => format!("policy {decision} {action} {resource} [{grant_scope}]")
             .dark_grey()
             .italic()
             .to_string(),

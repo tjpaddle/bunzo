@@ -10,6 +10,7 @@
 mod backend;
 mod config;
 mod ledger;
+mod policy;
 mod skills;
 mod store;
 
@@ -29,6 +30,7 @@ use tokio::sync::mpsc;
 
 use crate::backend::BackendEvent;
 use crate::ledger::{Entry, Ledger, ToolRecord};
+use crate::policy::{Decision as PolicyDecision, ToolPolicyContext};
 use crate::skills::Registry;
 use crate::store::{PrepareRequestError, RuntimeStore};
 
@@ -193,7 +195,7 @@ where
         Ok(c) => c,
         Err(e) => {
             let text = format!("{e:#}");
-            persist_request_waiting(store, &request, "unconfigured", &text);
+            persist_request_waiting(store, &request, "unconfigured", &text, None);
             return finish_with_error(w, id, "unconfigured", &text, "waiting").await;
         }
     };
@@ -202,7 +204,7 @@ where
         Ok(b) => b,
         Err(e) => {
             let text = format!("{e:#}");
-            persist_request_waiting(store, &request, "backend_init_failed", &text);
+            persist_request_waiting(store, &request, "backend_init_failed", &text, None);
             return finish_with_error(w, id, "backend_init_failed", &text, "waiting").await;
         }
     };
@@ -213,14 +215,19 @@ where
 
     let (tx, mut rx) = mpsc::channel::<BackendEvent>(32);
     let messages = request.history.clone();
-    let backend_task =
-        tokio::spawn(async move { backend.stream_complete(messages, registry, tx).await });
+    let policy = ToolPolicyContext::new(store.clone(), request.clone());
+    let backend_task = tokio::spawn(async move {
+        backend
+            .stream_complete(messages, registry, policy, tx)
+            .await
+    });
 
     let mut assistant_acc = String::new();
     let mut tool_records: Vec<ToolRecord> = Vec::new();
     let mut saw_error = false;
     let mut error_code: Option<&'static str> = None;
     let mut error_text: Option<String> = None;
+    let mut waiting_policy = None;
 
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -231,6 +238,21 @@ where
                     text: chunk,
                 });
                 write_frame_async(w, &frame).await?;
+            }
+            BackendEvent::PolicyDecision { evaluation } => {
+                let frame = Envelope::new(ServerMessage::PolicyDecision {
+                    id: id.into(),
+                    subject: evaluation.subject.clone(),
+                    action: evaluation.action.clone(),
+                    resource: evaluation.resource.clone(),
+                    decision: evaluation.decision.as_str().into(),
+                    grant_scope: evaluation.grant_scope.as_str().into(),
+                    detail: evaluation.detail.clone(),
+                });
+                write_frame_async(w, &frame).await?;
+                if evaluation.decision == PolicyDecision::RequireApproval {
+                    waiting_policy = Some(evaluation);
+                }
             }
             BackendEvent::ToolInvoke { name } => {
                 let frame = Envelope::new(ServerMessage::ToolActivity {
@@ -308,6 +330,22 @@ where
             error_text = Some(text);
         }
         _ => {}
+    }
+
+    if let Some(policy) = waiting_policy {
+        let end = Envelope::new(ServerMessage::AssistantEnd {
+            id: id.into(),
+            finish_reason: "waiting".into(),
+        });
+        write_frame_async(w, &end).await?;
+        persist_request_waiting(
+            store,
+            &request,
+            "policy_approval_required",
+            &policy.detail,
+            Some(&assistant_acc),
+        );
+        return Ok(());
     }
 
     let finish_reason = if saw_error { "error" } else { "stop" };
@@ -448,8 +486,11 @@ fn persist_request_waiting(
     request: &store::PreparedRequest,
     reason_code: &str,
     reason_text: &str,
+    assistant_partial_text: Option<&str>,
 ) {
-    if let Err(e) = store.wait_shell_request(request, reason_code, reason_text) {
+    if let Err(e) =
+        store.wait_shell_request(request, reason_code, reason_text, assistant_partial_text)
+    {
         eprintln!("bunzod: runtime-store waiting transition failed: {e:#}");
     }
 }

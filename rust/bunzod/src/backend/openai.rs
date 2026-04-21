@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 
 use super::{Backend, BackendEvent, Message, Role};
 use crate::config::OpenAiConfig;
+use crate::policy::{Decision as PolicyDecision, ToolPolicyContext};
 use crate::skills::Registry;
 
 const MAX_TOOL_HOPS: u32 = 3;
@@ -95,6 +96,7 @@ impl Backend for OpenAiBackend {
         &self,
         messages: Vec<Message>,
         registry: Registry,
+        policy: ToolPolicyContext,
         tx: mpsc::Sender<BackendEvent>,
     ) -> Result<()> {
         let mut oai_msgs: Vec<ChatCompletionRequestMessage> = Vec::new();
@@ -210,6 +212,40 @@ impl Backend for OpenAiBackend {
             oai_msgs.push(assistant_msg.into());
 
             for call in &pending_tool_calls {
+                let evaluation = match policy.evaluate_skill_invocation(&call.name) {
+                    Ok(evaluation) => evaluation,
+                    Err(e) => {
+                        let _ = tx.send(BackendEvent::Error(e)).await;
+                        return Ok(());
+                    }
+                };
+                if evaluation.decision != PolicyDecision::Allow
+                    && tx
+                        .send(BackendEvent::PolicyDecision {
+                            evaluation: evaluation.clone(),
+                        })
+                        .await
+                        .is_err()
+                {
+                    return Ok(());
+                }
+
+                if evaluation.decision == PolicyDecision::RequireApproval {
+                    return Ok(());
+                }
+
+                if evaluation.decision == PolicyDecision::Deny {
+                    let tool_msg = ChatCompletionRequestToolMessageArgs::default()
+                        .content(format!(
+                            "{{\"error\":\"{}\"}}",
+                            escape_json(&evaluation.detail)
+                        ))
+                        .tool_call_id(call.id.clone())
+                        .build()?;
+                    oai_msgs.push(tool_msg.into());
+                    continue;
+                }
+
                 if tx
                     .send(BackendEvent::ToolInvoke {
                         name: call.name.clone(),

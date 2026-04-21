@@ -15,6 +15,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::backend::{Message, Role};
+use crate::policy::{
+    Decision as PolicyDecision, GrantScope, NewRuntimePolicy, PolicyEvaluation, PolicySource,
+};
 
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/bunzo/state";
 pub const DEFAULT_DB_NAME: &str = "runtime.sqlite3";
@@ -329,6 +332,7 @@ impl RuntimeStore {
         request: &PreparedRequest,
         reason_code: &str,
         reason_text: &str,
+        assistant_partial_text: Option<&str>,
     ) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction().context("starting waiting transaction")?;
@@ -350,6 +354,8 @@ impl RuntimeStore {
                 "history_message_count": request.history.len(),
                 "reason_code": reason_code,
                 "reason_text": reason_text,
+                "assistant_partial_text": assistant_partial_text
+                    .filter(|text| !text.is_empty()),
             }),
             now,
         )?;
@@ -637,6 +643,80 @@ impl RuntimeStore {
         Ok(out)
     }
 
+    pub fn insert_runtime_policy(&self, policy: NewRuntimePolicy) -> Result<String> {
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction()
+            .context("starting runtime policy transaction")?;
+        let now = now_ms_i64();
+        let policy_id = new_id();
+
+        tx.execute(
+            concat!(
+                "INSERT INTO runtime_policies (",
+                "id, subject, action, resource, decision, grant_scope, ",
+                "conversation_id, task_id, task_run_id, note_text, created_at_ms, updated_at_ms",
+                ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+            ),
+            params![
+                policy_id,
+                policy.subject,
+                policy.action,
+                policy.resource,
+                policy.decision.as_str(),
+                policy.grant_scope.as_str(),
+                policy.conversation_id,
+                policy.task_id,
+                policy.task_run_id,
+                policy.note_text,
+                now,
+                now
+            ],
+        )
+        .context("inserting runtime policy")?;
+
+        tx.commit()
+            .context("committing runtime policy transaction")?;
+        Ok(policy_id)
+    }
+
+    pub fn evaluate_policy(
+        &self,
+        request: &PreparedRequest,
+        subject: &str,
+        action: &str,
+        resource: &str,
+    ) -> Result<PolicyEvaluation> {
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction()
+            .context("starting runtime policy evaluation transaction")?;
+        let evaluation = select_policy_evaluation(&tx, request, subject, action, resource)?;
+
+        insert_event(
+            &tx,
+            &request.conversation_id,
+            Some(&request.task_id),
+            Some(&request.task_run_id),
+            "policy.decision",
+            json!({
+                "policy_id": evaluation.policy_id.clone(),
+                "source": evaluation.source.as_str(),
+                "subject": evaluation.subject.clone(),
+                "action": evaluation.action.clone(),
+                "resource": evaluation.resource.clone(),
+                "decision": evaluation.decision.as_str(),
+                "grant_scope": evaluation.grant_scope.as_str(),
+                "detail": evaluation.detail.clone(),
+            }),
+            now_ms_i64(),
+        )?;
+
+        tx.commit()
+            .context("committing runtime policy evaluation transaction")?;
+        Ok(evaluation)
+    }
+
     fn record_event(
         &self,
         conversation_id: &str,
@@ -749,6 +829,27 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         ");",
         "CREATE INDEX IF NOT EXISTS idx_task_snapshots_task_created ",
         "  ON task_snapshots(task_id, created_at_ms);",
+        "CREATE TABLE IF NOT EXISTS runtime_policies (",
+        "  id TEXT PRIMARY KEY,",
+        "  subject TEXT NOT NULL,",
+        "  action TEXT NOT NULL,",
+        "  resource TEXT NOT NULL,",
+        "  decision TEXT NOT NULL,",
+        "  grant_scope TEXT NOT NULL,",
+        "  conversation_id TEXT,",
+        "  task_id TEXT,",
+        "  task_run_id TEXT,",
+        "  note_text TEXT,",
+        "  created_at_ms INTEGER NOT NULL,",
+        "  updated_at_ms INTEGER NOT NULL,",
+        "  FOREIGN KEY(conversation_id) REFERENCES conversations(id),",
+        "  FOREIGN KEY(task_id) REFERENCES tasks(id),",
+        "  FOREIGN KEY(task_run_id) REFERENCES task_runs(id)",
+        ");",
+        "CREATE INDEX IF NOT EXISTS idx_runtime_policies_match ",
+        "  ON runtime_policies(subject, action, resource, grant_scope, updated_at_ms DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_runtime_policies_task ",
+        "  ON runtime_policies(task_id, task_run_id, conversation_id);",
         "CREATE TABLE IF NOT EXISTS events (",
         "  id TEXT PRIMARY KEY,",
         "  conversation_id TEXT NOT NULL,",
@@ -795,6 +896,116 @@ fn ensure_column_exists(
     ))
     .with_context(|| format!("adding column {table}.{column}"))?;
     Ok(())
+}
+
+fn select_policy_evaluation(
+    tx: &Transaction<'_>,
+    request: &PreparedRequest,
+    subject: &str,
+    action: &str,
+    resource: &str,
+) -> Result<PolicyEvaluation> {
+    let matched = tx
+        .query_row(
+            concat!(
+                "SELECT id, decision, grant_scope, note_text ",
+                "FROM runtime_policies ",
+                "WHERE (subject = ?1 OR subject = '*') ",
+                "  AND (action = ?2 OR action = '*') ",
+                "  AND (resource = ?3 OR resource = '*') ",
+                "  AND (",
+                "    (grant_scope = 'once' AND task_run_id = ?4) OR ",
+                "    (grant_scope = 'task' AND task_id = ?5) OR ",
+                "    (grant_scope = 'session' AND conversation_id = ?6) OR ",
+                "    (grant_scope = 'persistent' ",
+                "       AND conversation_id IS NULL ",
+                "       AND task_id IS NULL ",
+                "       AND task_run_id IS NULL)",
+                "  ) ",
+                "ORDER BY ",
+                "  CASE grant_scope ",
+                "    WHEN 'once' THEN 4 ",
+                "    WHEN 'task' THEN 3 ",
+                "    WHEN 'session' THEN 2 ",
+                "    WHEN 'persistent' THEN 1 ",
+                "    ELSE 0 END DESC, ",
+                "  CASE WHEN resource = ?3 THEN 2 WHEN resource = '*' THEN 1 ELSE 0 END DESC, ",
+                "  CASE WHEN action = ?2 THEN 2 WHEN action = '*' THEN 1 ELSE 0 END DESC, ",
+                "  CASE WHEN subject = ?1 THEN 2 WHEN subject = '*' THEN 1 ELSE 0 END DESC, ",
+                "  updated_at_ms DESC, rowid DESC ",
+                "LIMIT 1"
+            ),
+            params![
+                subject,
+                action,
+                resource,
+                &request.task_run_id,
+                &request.task_id,
+                &request.conversation_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .context("querying runtime policy")?;
+
+    if let Some((policy_id, decision, grant_scope, note_text)) = matched {
+        let decision = PolicyDecision::from_str(&decision)
+            .ok_or_else(|| anyhow::anyhow!("unknown runtime policy decision: {decision}"))?;
+        let grant_scope = GrantScope::from_str(&grant_scope)
+            .ok_or_else(|| anyhow::anyhow!("unknown runtime policy scope: {grant_scope}"))?;
+        return Ok(PolicyEvaluation {
+            policy_id: Some(policy_id),
+            source: PolicySource::Rule,
+            subject: subject.to_string(),
+            action: action.to_string(),
+            resource: resource.to_string(),
+            decision,
+            grant_scope,
+            detail: note_text
+                .unwrap_or_else(|| default_policy_detail(decision, grant_scope, action, resource)),
+        });
+    }
+
+    Ok(PolicyEvaluation {
+        policy_id: None,
+        source: PolicySource::Default,
+        subject: subject.to_string(),
+        action: action.to_string(),
+        resource: resource.to_string(),
+        decision: PolicyDecision::Allow,
+        grant_scope: GrantScope::Once,
+        detail: default_policy_detail(PolicyDecision::Allow, GrantScope::Once, action, resource),
+    })
+}
+
+fn default_policy_detail(
+    decision: PolicyDecision,
+    grant_scope: GrantScope,
+    action: &str,
+    resource: &str,
+) -> String {
+    match decision {
+        PolicyDecision::Allow => {
+            format!("allowed by the current default runtime policy for this {action} on {resource}")
+        }
+        PolicyDecision::Deny => {
+            format!(
+                "runtime policy denied {action} on {resource} [{}]",
+                grant_scope.as_str()
+            )
+        }
+        PolicyDecision::RequireApproval => format!(
+            "approval required before bunzo may {action} on {resource} [{}]",
+            grant_scope.as_str()
+        ),
+    }
 }
 
 fn resolve_conversation_id(
@@ -1020,6 +1231,7 @@ mod tests {
                 &request,
                 "unconfigured",
                 "OpenAI backend config is missing.",
+                None,
             )
             .expect("waiting request");
 
@@ -1062,5 +1274,87 @@ mod tests {
         assert_eq!(completed[0].task_status, "completed");
         assert_eq!(completed[0].run_status, "completed");
         assert!(completed[0].state_reason_code.is_none());
+    }
+
+    #[test]
+    fn runtime_policy_defaults_to_once_allow_without_matching_rule() {
+        let (_dir, store) = temp_store();
+        let request = store
+            .prepare_shell_request("u1", None, "what OS is this?")
+            .expect("request");
+
+        let evaluation = store
+            .evaluate_policy(&request, "shell_request", "invoke_skill", "read-local-file")
+            .expect("policy evaluation");
+
+        assert_eq!(evaluation.source, PolicySource::Default);
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert_eq!(evaluation.grant_scope, GrantScope::Once);
+    }
+
+    #[test]
+    fn runtime_policy_prefers_task_scoped_rule_and_records_task_event() {
+        let (_dir, store) = temp_store();
+        let request = store
+            .prepare_shell_request("u1", None, "what OS is this?")
+            .expect("request");
+
+        store
+            .insert_runtime_policy(NewRuntimePolicy {
+                subject: "shell_request".into(),
+                action: "invoke_skill".into(),
+                resource: "read-local-file".into(),
+                decision: PolicyDecision::Allow,
+                grant_scope: GrantScope::Persistent,
+                conversation_id: None,
+                task_id: None,
+                task_run_id: None,
+                note_text: Some("persistent allow".into()),
+            })
+            .expect("persistent policy");
+        let deny_id = store
+            .insert_runtime_policy(NewRuntimePolicy {
+                subject: "shell_request".into(),
+                action: "invoke_skill".into(),
+                resource: "read-local-file".into(),
+                decision: PolicyDecision::Deny,
+                grant_scope: GrantScope::Task,
+                conversation_id: Some(request.conversation_id.clone()),
+                task_id: Some(request.task_id.clone()),
+                task_run_id: None,
+                note_text: Some("task-scoped deny".into()),
+            })
+            .expect("task policy");
+
+        let evaluation = store
+            .evaluate_policy(&request, "shell_request", "invoke_skill", "read-local-file")
+            .expect("policy evaluation");
+        assert_eq!(evaluation.policy_id.as_deref(), Some(deny_id.as_str()));
+        assert_eq!(evaluation.source, PolicySource::Rule);
+        assert_eq!(evaluation.decision, PolicyDecision::Deny);
+        assert_eq!(evaluation.grant_scope, GrantScope::Task);
+        assert_eq!(evaluation.detail, "task-scoped deny");
+
+        let conn = store.connect().expect("connect");
+        let (task_id, task_run_id, payload_json): (String, String, String) = conn
+            .query_row(
+                concat!(
+                    "SELECT task_id, task_run_id, payload_json FROM events ",
+                    "WHERE kind = 'policy.decision' ",
+                    "ORDER BY created_at_ms DESC, rowid DESC LIMIT 1"
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("policy decision event");
+        assert_eq!(task_id, request.task_id);
+        assert_eq!(task_run_id, request.task_run_id);
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_json).expect("event payload json");
+        assert_eq!(payload["policy_id"], deny_id);
+        assert_eq!(payload["decision"], "deny");
+        assert_eq!(payload["grant_scope"], "task");
+        assert_eq!(payload["resource"], "read-local-file");
     }
 }
