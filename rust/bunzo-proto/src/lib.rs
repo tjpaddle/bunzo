@@ -40,6 +40,21 @@ pub struct TaskSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicySummary {
+    pub policy_id: String,
+    pub subject: String,
+    pub action: String,
+    pub resource: String,
+    pub decision: String,
+    pub grant_scope: String,
+    pub conversation_id: Option<String>,
+    pub task_id: Option<String>,
+    pub task_run_id: Option<String>,
+    pub note_text: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientMessage {
     UserMessage {
@@ -60,6 +75,27 @@ pub enum ClientMessage {
         id: String,
         #[serde(default = "default_list_limit")]
         limit: u32,
+    },
+    ListPolicies {
+        id: String,
+        #[serde(default = "default_list_limit")]
+        limit: u32,
+    },
+    UpsertPolicy {
+        id: String,
+        subject: String,
+        action: String,
+        resource: String,
+        decision: String,
+        grant_scope: String,
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        note_text: Option<String>,
+    },
+    DeletePolicy {
+        id: String,
+        policy_id: String,
     },
 }
 
@@ -114,6 +150,19 @@ pub enum ServerMessage {
     TaskList {
         id: String,
         tasks: Vec<TaskSummary>,
+    },
+    PolicyList {
+        id: String,
+        policies: Vec<PolicySummary>,
+    },
+    PolicyMutationResult {
+        id: String,
+        policy: PolicySummary,
+        created: bool,
+    },
+    PolicyDeleteResult {
+        id: String,
+        policy_id: String,
     },
 }
 
@@ -307,12 +356,79 @@ mod tests {
                     snapshot_kind: Some("shell_request_waiting_v1".into()),
                 }],
             },
+            ServerMessage::PolicyList {
+                id: "u1".into(),
+                policies: vec![PolicySummary {
+                    policy_id: "p1".into(),
+                    subject: "shell_request".into(),
+                    action: "invoke_skill".into(),
+                    resource: "read-local-file".into(),
+                    decision: "deny".into(),
+                    grant_scope: "persistent".into(),
+                    conversation_id: None,
+                    task_id: None,
+                    task_run_id: None,
+                    note_text: Some("manual smoke".into()),
+                    updated_at_ms: 1,
+                }],
+            },
+            ServerMessage::PolicyMutationResult {
+                id: "u1".into(),
+                policy: PolicySummary {
+                    policy_id: "p1".into(),
+                    subject: "shell_request".into(),
+                    action: "invoke_skill".into(),
+                    resource: "read-local-file".into(),
+                    decision: "deny".into(),
+                    grant_scope: "persistent".into(),
+                    conversation_id: None,
+                    task_id: None,
+                    task_run_id: None,
+                    note_text: Some("manual smoke".into()),
+                    updated_at_ms: 1,
+                },
+                created: true,
+            },
+            ServerMessage::PolicyDeleteResult {
+                id: "u1".into(),
+                policy_id: "p1".into(),
+            },
         ] {
             let out = Envelope::new(msg);
             let mut buf = Vec::new();
             write_frame(&mut buf, &out).unwrap();
             let mut cur = Cursor::new(buf);
             let _back: ServerFrame = read_frame(&mut cur).unwrap();
+        }
+    }
+
+    #[test]
+    fn roundtrip_policy_client_frames() {
+        for msg in [
+            ClientMessage::ListPolicies {
+                id: "ctl1".into(),
+                limit: 10,
+            },
+            ClientMessage::UpsertPolicy {
+                id: "ctl2".into(),
+                subject: "shell_request".into(),
+                action: "invoke_skill".into(),
+                resource: "read-local-file".into(),
+                decision: "deny".into(),
+                grant_scope: "persistent".into(),
+                target: None,
+                note_text: Some("manual smoke".into()),
+            },
+            ClientMessage::DeletePolicy {
+                id: "ctl3".into(),
+                policy_id: "p1".into(),
+            },
+        ] {
+            let out = Envelope::new(msg);
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &out).unwrap();
+            let mut cur = Cursor::new(buf);
+            let _back: ClientFrame = read_frame(&mut cur).unwrap();
         }
     }
 

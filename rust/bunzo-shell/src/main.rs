@@ -7,8 +7,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use bunzo_proto::{
-    read_frame, write_frame, ClientMessage, ConversationSummary, Envelope, ServerFrame,
-    ServerMessage, TaskSummary,
+    read_frame, write_frame, ClientMessage, ConversationSummary, Envelope, PolicySummary,
+    ServerFrame, ServerMessage, TaskSummary,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -37,6 +37,7 @@ const OPENAI_KEY_PATH: &str = "/etc/bunzo/openai.key";
 const DEFAULT_REMOTE_MODEL: &str = "gpt-5.4-mini";
 const RECENT_CONVERSATION_LIMIT: u32 = 12;
 const RECENT_TASK_LIMIT: u32 = 16;
+const RECENT_POLICY_LIMIT: u32 = 24;
 
 struct App {
     banner: String,
@@ -160,6 +161,12 @@ fn run_serial_shell() -> io::Result<()> {
         }
         if let Some(args) = command_args(input, &["/tasks"]) {
             handle_tasks_command(args, &mut msg_counter, &mut stdout)?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+            continue;
+        }
+        if let Some(args) = command_args(input, &["/policy", "/policies"]) {
+            handle_policy_command(args, &shell_state, &mut msg_counter, &mut stdout)?;
             writeln!(stdout)?;
             stdout.flush()?;
             continue;
@@ -365,6 +372,9 @@ fn round_trip(
             ServerMessage::PolicyDecision { .. } => {}
             ServerMessage::ConversationList { .. } => {}
             ServerMessage::TaskList { .. } => {}
+            ServerMessage::PolicyList { .. } => {}
+            ServerMessage::PolicyMutationResult { .. } => {}
+            ServerMessage::PolicyDeleteResult { .. } => {}
         }
     }
 }
@@ -631,6 +641,13 @@ fn render_recent_tasks(stdout: &mut Stdout, tasks: &[TaskSummary]) -> io::Result
             short_id(&task.conversation_id),
             summary
         )?;
+        if !task.task_run_id.is_empty() {
+            writeln!(
+                stdout,
+                "{}",
+                format!("  run: {}", short_id(&task.task_run_id)).dark_grey()
+            )?;
+        }
         if let Some(reason) = task.state_reason_text.as_deref() {
             if !reason.is_empty() {
                 writeln!(stdout, "{}", format!("  reason: {reason}").dark_grey())?;
@@ -678,6 +695,309 @@ fn request_recent_tasks(id: String, limit: u32) -> Result<Vec<TaskSummary>, Roun
             }
             ServerMessage::Error { .. } => {}
             ServerMessage::ConversationList { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+fn handle_policy_command(
+    args: &str,
+    shell_state: &ShellState,
+    msg_counter: &mut u64,
+    stdout: &mut Stdout,
+) -> io::Result<()> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed == "list" {
+        match request_runtime_policies(next_control_id(msg_counter), RECENT_POLICY_LIMIT) {
+            Ok(policies) => render_runtime_policies(stdout, &policies)?,
+            Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+        }
+        return Ok(());
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let subcommand = parts.next().unwrap_or_default();
+    match subcommand {
+        "delete" | "rm" => {
+            let Some(policy_id) = parts.next() else {
+                writeln!(stdout, "{}", policy_usage().dark_grey())?;
+                return Ok(());
+            };
+            if parts.next().is_some() {
+                writeln!(stdout, "{}", policy_usage().dark_grey())?;
+                return Ok(());
+            }
+            match request_delete_policy(next_control_id(msg_counter), policy_id.to_string()) {
+                Ok(deleted_policy_id) => writeln!(
+                    stdout,
+                    "{}",
+                    format!("deleted policy {}", short_id(&deleted_policy_id)).green()
+                )?,
+                Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+            }
+        }
+        "allow" | "deny" | "require-approval" => {
+            let Some(resource) = parts.next() else {
+                writeln!(stdout, "{}", policy_usage().dark_grey())?;
+                return Ok(());
+            };
+            let Some(scope) = parts.next() else {
+                writeln!(stdout, "{}", policy_usage().dark_grey())?;
+                return Ok(());
+            };
+            let mut target = if scope == "persistent" {
+                None
+            } else {
+                parts.next().map(str::to_string)
+            };
+            if scope == "session" && target.is_none() {
+                target = shell_state.active_conversation.clone();
+            }
+            if matches!(scope, "session" | "task" | "once") && target.is_none() {
+                writeln!(stdout, "{}", policy_usage().dark_grey())?;
+                return Ok(());
+            }
+            let note_text = {
+                let rest = parts.collect::<Vec<_>>().join(" ");
+                if rest.is_empty() {
+                    Some(format!(
+                        "set by bunzo-shell to {} for {}",
+                        subcommand, resource
+                    ))
+                } else {
+                    Some(rest)
+                }
+            };
+            let decision = if subcommand == "require-approval" {
+                "require_approval"
+            } else {
+                subcommand
+            };
+            match request_upsert_policy(
+                next_control_id(msg_counter),
+                "shell_request".into(),
+                "invoke_skill".into(),
+                resource.to_string(),
+                decision.to_string(),
+                scope.to_string(),
+                target,
+                note_text,
+            ) {
+                Ok((policy, created)) => render_policy_mutation(stdout, &policy, created)?,
+                Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+            }
+        }
+        _ => {
+            writeln!(stdout, "{}", policy_usage().dark_grey())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn render_runtime_policies(stdout: &mut Stdout, policies: &[PolicySummary]) -> io::Result<()> {
+    if policies.is_empty() {
+        writeln!(stdout, "{}", "no runtime policies yet".dark_grey())?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "{}", "runtime policies".bold().cyan())?;
+    for policy in policies {
+        writeln!(
+            stdout,
+            "{} [{}/{}] {} {} {}",
+            short_id(&policy.policy_id),
+            policy.decision,
+            policy.grant_scope,
+            policy.subject,
+            policy.action,
+            policy.resource
+        )?;
+        if let Some(note_text) = policy.note_text.as_deref() {
+            if !note_text.is_empty() {
+                writeln!(stdout, "{}", format!("  note: {note_text}").dark_grey())?;
+            }
+        }
+        let mut targets = Vec::new();
+        if let Some(conversation_id) = policy.conversation_id.as_deref() {
+            targets.push(format!("conv:{}", short_id(conversation_id)));
+        }
+        if let Some(task_id) = policy.task_id.as_deref() {
+            targets.push(format!("task:{}", short_id(task_id)));
+        }
+        if let Some(task_run_id) = policy.task_run_id.as_deref() {
+            targets.push(format!("run:{}", short_id(task_run_id)));
+        }
+        if !targets.is_empty() {
+            writeln!(stdout, "{}", format!("  {}", targets.join(" ")).dark_grey())?;
+        }
+    }
+    writeln!(stdout, "{}", policy_usage().dark_grey())?;
+    Ok(())
+}
+
+fn render_policy_mutation(
+    stdout: &mut Stdout,
+    policy: &PolicySummary,
+    created: bool,
+) -> io::Result<()> {
+    let verb = if created { "created" } else { "updated" };
+    writeln!(
+        stdout,
+        "{}",
+        format!(
+            "{} policy {} [{}/{}] {}",
+            verb,
+            short_id(&policy.policy_id),
+            policy.decision,
+            policy.grant_scope,
+            policy.resource
+        )
+        .green()
+    )
+}
+
+fn policy_usage() -> &'static str {
+    "usage: /policy list | /policy <allow|deny|require-approval> <resource> <persistent|session|task|once> [target-id-prefix] [note...] | /policy delete <policy-id-prefix>"
+}
+
+fn request_runtime_policies(id: String, limit: u32) -> Result<Vec<PolicySummary>, RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::ListPolicies {
+        id: id.clone(),
+        limit,
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::PolicyList {
+                id: list_id,
+                policies,
+            } if list_id == id => return Ok(policies),
+            ServerMessage::PolicyList { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+fn request_upsert_policy(
+    id: String,
+    subject: String,
+    action: String,
+    resource: String,
+    decision: String,
+    grant_scope: String,
+    target: Option<String>,
+    note_text: Option<String>,
+) -> Result<(PolicySummary, bool), RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::UpsertPolicy {
+        id: id.clone(),
+        subject,
+        action,
+        resource,
+        decision,
+        grant_scope,
+        target,
+        note_text,
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::PolicyMutationResult {
+                id: result_id,
+                policy,
+                created,
+            } if result_id == id => return Ok((policy, created)),
+            ServerMessage::PolicyMutationResult { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+fn request_delete_policy(id: String, policy_id: String) -> Result<String, RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::DeletePolicy {
+        id: id.clone(),
+        policy_id,
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::PolicyDeleteResult {
+                id: result_id,
+                policy_id,
+            } if result_id == id => return Ok(policy_id),
+            ServerMessage::PolicyDeleteResult { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
             _ => {}
         }
     }

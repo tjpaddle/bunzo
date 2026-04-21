@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bunzo_proto::{ConversationSummary, TaskSummary};
+use bunzo_proto::{ConversationSummary, PolicySummary, TaskSummary};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::json;
 use uuid::Uuid;
@@ -84,6 +84,27 @@ impl fmt::Display for PrepareRequestError {
 }
 
 impl std::error::Error for PrepareRequestError {}
+
+#[derive(Debug)]
+pub enum LookupError {
+    NotFound { kind: &'static str, value: String },
+    Ambiguous { kind: &'static str, value: String },
+    Store(anyhow::Error),
+}
+
+impl fmt::Display for LookupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound { kind, value } => write!(f, "{kind} '{value}' was not found"),
+            Self::Ambiguous { kind, value } => {
+                write!(f, "{kind} prefix '{value}' matches multiple records")
+            }
+            Self::Store(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for LookupError {}
 
 impl RuntimeStore {
     pub fn new<P: Into<PathBuf>>(path: P) -> Self {
@@ -643,6 +664,173 @@ impl RuntimeStore {
         Ok(out)
     }
 
+    pub fn list_runtime_policies(&self, limit: u32) -> Result<Vec<PolicySummary>> {
+        let conn = self.connect()?;
+        let capped_limit = i64::from(limit.clamp(1, 100));
+        let mut stmt = conn.prepare(concat!(
+            "SELECT id, subject, action, resource, decision, grant_scope, ",
+            "conversation_id, task_id, task_run_id, note_text, updated_at_ms ",
+            "FROM runtime_policies ",
+            "ORDER BY updated_at_ms DESC, rowid DESC ",
+            "LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(params![capped_limit], |row| {
+            let updated_at_ms: i64 = row.get(10)?;
+            Ok(PolicySummary {
+                policy_id: row.get(0)?,
+                subject: row.get(1)?,
+                action: row.get(2)?,
+                resource: row.get(3)?,
+                decision: row.get(4)?,
+                grant_scope: row.get(5)?,
+                conversation_id: row.get(6)?,
+                task_id: row.get(7)?,
+                task_run_id: row.get(8)?,
+                note_text: row.get(9)?,
+                updated_at_ms: updated_at_ms.max(0) as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_runtime_policy(&self, policy: NewRuntimePolicy) -> Result<(PolicySummary, bool)> {
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction()
+            .context("starting runtime policy upsert transaction")?;
+        let now = now_ms_i64();
+        let NewRuntimePolicy {
+            subject,
+            action,
+            resource,
+            decision,
+            grant_scope,
+            conversation_id,
+            task_id,
+            task_run_id,
+            note_text,
+        } = policy;
+
+        let existing_id: Option<String> = tx
+            .query_row(
+                concat!(
+                    "SELECT id FROM runtime_policies ",
+                    "WHERE subject = ?1 AND action = ?2 AND resource = ?3 AND grant_scope = ?4 ",
+                    "  AND COALESCE(conversation_id, '') = COALESCE(?5, '') ",
+                    "  AND COALESCE(task_id, '') = COALESCE(?6, '') ",
+                    "  AND COALESCE(task_run_id, '') = COALESCE(?7, '') ",
+                    "ORDER BY updated_at_ms DESC, rowid DESC LIMIT 1"
+                ),
+                params![
+                    &subject,
+                    &action,
+                    &resource,
+                    grant_scope.as_str(),
+                    &conversation_id,
+                    &task_id,
+                    &task_run_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let (policy_id, created) = if let Some(policy_id) = existing_id {
+            tx.execute(
+                concat!(
+                    "UPDATE runtime_policies SET ",
+                    "decision = ?2, note_text = ?3, updated_at_ms = ?4 ",
+                    "WHERE id = ?1"
+                ),
+                params![policy_id, decision.as_str(), &note_text, now],
+            )
+            .context("updating runtime policy")?;
+            (policy_id, false)
+        } else {
+            let policy_id = new_id();
+            tx.execute(
+                concat!(
+                    "INSERT INTO runtime_policies (",
+                    "id, subject, action, resource, decision, grant_scope, ",
+                    "conversation_id, task_id, task_run_id, note_text, created_at_ms, updated_at_ms",
+                    ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+                ),
+                params![
+                    policy_id,
+                    subject,
+                    action,
+                    resource,
+                    decision.as_str(),
+                    grant_scope.as_str(),
+                    conversation_id,
+                    task_id,
+                    task_run_id,
+                    note_text,
+                    now,
+                    now
+                ],
+            )
+            .context("inserting runtime policy")?;
+            (policy_id, true)
+        };
+
+        let summary = load_policy_summary(&tx, &policy_id)?.context("loading runtime policy")?;
+        tx.commit()
+            .context("committing runtime policy upsert transaction")?;
+        Ok((summary, created))
+    }
+
+    pub fn delete_runtime_policy(
+        &self,
+        requested_policy_id: &str,
+    ) -> std::result::Result<String, LookupError> {
+        let conn = self.connect().map_err(LookupError::Store)?;
+        let policy_id = resolve_prefixed_id(
+            &conn,
+            "runtime_policies",
+            "updated_at_ms",
+            requested_policy_id,
+            "policy",
+        )?;
+        conn.execute(
+            "DELETE FROM runtime_policies WHERE id = ?1",
+            params![policy_id],
+        )
+        .map_err(anyhow::Error::from)
+        .map_err(LookupError::Store)?;
+        Ok(policy_id)
+    }
+
+    pub fn resolve_conversation_ref(
+        &self,
+        requested: &str,
+    ) -> std::result::Result<String, LookupError> {
+        let conn = self.connect().map_err(LookupError::Store)?;
+        resolve_prefixed_id(
+            &conn,
+            "conversations",
+            "updated_at_ms",
+            requested,
+            "conversation",
+        )
+    }
+
+    pub fn resolve_task_ref(&self, requested: &str) -> std::result::Result<String, LookupError> {
+        let conn = self.connect().map_err(LookupError::Store)?;
+        resolve_prefixed_id(&conn, "tasks", "updated_at_ms", requested, "task")
+    }
+
+    pub fn resolve_task_run_ref(
+        &self,
+        requested: &str,
+    ) -> std::result::Result<String, LookupError> {
+        let conn = self.connect().map_err(LookupError::Store)?;
+        resolve_prefixed_id(&conn, "task_runs", "started_at_ms", requested, "task run")
+    }
+
     pub fn insert_runtime_policy(&self, policy: NewRuntimePolicy) -> Result<String> {
         let mut conn = self.connect()?;
         let tx = conn
@@ -898,6 +1086,86 @@ fn ensure_column_exists(
     Ok(())
 }
 
+fn load_policy_summary(tx: &Transaction<'_>, policy_id: &str) -> Result<Option<PolicySummary>> {
+    tx.query_row(
+        concat!(
+            "SELECT id, subject, action, resource, decision, grant_scope, ",
+            "conversation_id, task_id, task_run_id, note_text, updated_at_ms ",
+            "FROM runtime_policies WHERE id = ?1"
+        ),
+        params![policy_id],
+        |row| {
+            let updated_at_ms: i64 = row.get(10)?;
+            Ok(PolicySummary {
+                policy_id: row.get(0)?,
+                subject: row.get(1)?,
+                action: row.get(2)?,
+                resource: row.get(3)?,
+                decision: row.get(4)?,
+                grant_scope: row.get(5)?,
+                conversation_id: row.get(6)?,
+                task_id: row.get(7)?,
+                task_run_id: row.get(8)?,
+                note_text: row.get(9)?,
+                updated_at_ms: updated_at_ms.max(0) as u64,
+            })
+        },
+    )
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
+fn resolve_prefixed_id(
+    conn: &Connection,
+    table: &str,
+    order_column: &str,
+    requested: &str,
+    kind: &'static str,
+) -> std::result::Result<String, LookupError> {
+    if let Some(exact) = conn
+        .query_row(
+            &format!("SELECT id FROM {table} WHERE id = ?1"),
+            params![requested],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(anyhow::Error::from)
+        .map_err(LookupError::Store)?
+    {
+        return Ok(exact);
+    }
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT id FROM {table} WHERE id LIKE ?1 || '%' ORDER BY {order_column} DESC, rowid DESC LIMIT 2"
+        ))
+        .map_err(anyhow::Error::from)
+        .map_err(LookupError::Store)?;
+    let rows = stmt
+        .query_map(params![requested], |row| row.get::<_, String>(0))
+        .map_err(anyhow::Error::from)
+        .map_err(LookupError::Store)?;
+    let mut matches = Vec::new();
+    for row in rows {
+        matches.push(
+            row.map_err(anyhow::Error::from)
+                .map_err(LookupError::Store)?,
+        );
+    }
+
+    match matches.len() {
+        0 => Err(LookupError::NotFound {
+            kind,
+            value: requested.to_string(),
+        }),
+        1 => Ok(matches.pop().unwrap()),
+        _ => Err(LookupError::Ambiguous {
+            kind,
+            value: requested.to_string(),
+        }),
+    }
+}
+
 fn select_policy_evaluation(
     tx: &Transaction<'_>,
     request: &PreparedRequest,
@@ -1012,44 +1280,21 @@ fn resolve_conversation_id(
     tx: &Transaction<'_>,
     requested: &str,
 ) -> std::result::Result<String, PrepareRequestError> {
-    if let Some(exact) = tx
-        .query_row(
-            "SELECT id FROM conversations WHERE id = ?1",
-            params![requested],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(anyhow::Error::from)
-        .map_err(PrepareRequestError::Store)?
-    {
-        return Ok(exact);
-    }
-
-    let mut stmt = tx
-        .prepare(
-            "SELECT id FROM conversations WHERE id LIKE ?1 || '%' ORDER BY updated_at_ms DESC LIMIT 2",
-        )
-        .map_err(anyhow::Error::from)
-        .map_err(PrepareRequestError::Store)?;
-    let rows = stmt
-        .query_map(params![requested], |row| row.get::<_, String>(0))
-        .map_err(anyhow::Error::from)
-        .map_err(PrepareRequestError::Store)?;
-    let mut matches = Vec::new();
-    for row in rows {
-        matches.push(
-            row.map_err(anyhow::Error::from)
-                .map_err(PrepareRequestError::Store)?,
-        );
-    }
-    match matches.len() {
-        0 => Err(PrepareRequestError::ConversationNotFound(
-            requested.to_string(),
-        )),
-        1 => Ok(matches.pop().unwrap()),
-        _ => Err(PrepareRequestError::ConversationAmbiguous(
-            requested.to_string(),
-        )),
+    match resolve_prefixed_id(
+        tx,
+        "conversations",
+        "updated_at_ms",
+        requested,
+        "conversation",
+    ) {
+        Ok(id) => Ok(id),
+        Err(LookupError::NotFound { value, .. }) => {
+            Err(PrepareRequestError::ConversationNotFound(value))
+        }
+        Err(LookupError::Ambiguous { value, .. }) => {
+            Err(PrepareRequestError::ConversationAmbiguous(value))
+        }
+        Err(LookupError::Store(err)) => Err(PrepareRequestError::Store(err)),
     }
 }
 
@@ -1356,5 +1601,58 @@ mod tests {
         assert_eq!(payload["decision"], "deny");
         assert_eq!(payload["grant_scope"], "task");
         assert_eq!(payload["resource"], "read-local-file");
+    }
+
+    #[test]
+    fn upsert_list_and_delete_runtime_policy_roundtrip() {
+        let (_dir, store) = temp_store();
+
+        let (created, was_created) = store
+            .upsert_runtime_policy(NewRuntimePolicy {
+                subject: "shell_request".into(),
+                action: "invoke_skill".into(),
+                resource: "read-local-file".into(),
+                decision: PolicyDecision::Deny,
+                grant_scope: GrantScope::Persistent,
+                conversation_id: None,
+                task_id: None,
+                task_run_id: None,
+                note_text: Some("initial".into()),
+            })
+            .expect("create policy");
+        assert!(was_created);
+        assert_eq!(created.decision, "deny");
+        assert_eq!(created.note_text.as_deref(), Some("initial"));
+
+        let (updated, was_created) = store
+            .upsert_runtime_policy(NewRuntimePolicy {
+                subject: "shell_request".into(),
+                action: "invoke_skill".into(),
+                resource: "read-local-file".into(),
+                decision: PolicyDecision::RequireApproval,
+                grant_scope: GrantScope::Persistent,
+                conversation_id: None,
+                task_id: None,
+                task_run_id: None,
+                note_text: Some("updated".into()),
+            })
+            .expect("update policy");
+        assert!(!was_created);
+        assert_eq!(updated.policy_id, created.policy_id);
+        assert_eq!(updated.decision, "require_approval");
+
+        let listed = store.list_runtime_policies(10).expect("list policies");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].policy_id, created.policy_id);
+        assert_eq!(listed[0].decision, "require_approval");
+
+        let deleted = store
+            .delete_runtime_policy(&created.policy_id[..8])
+            .expect("delete policy");
+        assert_eq!(deleted, created.policy_id);
+        assert!(store
+            .list_runtime_policies(10)
+            .expect("list empty")
+            .is_empty());
     }
 }

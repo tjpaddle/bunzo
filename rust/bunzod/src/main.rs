@@ -30,9 +30,9 @@ use tokio::sync::mpsc;
 
 use crate::backend::BackendEvent;
 use crate::ledger::{Entry, Ledger, ToolRecord};
-use crate::policy::{Decision as PolicyDecision, ToolPolicyContext};
+use crate::policy::{Decision as PolicyDecision, GrantScope, NewRuntimePolicy, ToolPolicyContext};
 use crate::skills::Registry;
-use crate::store::{PrepareRequestError, RuntimeStore};
+use crate::store::{LookupError, PrepareRequestError, RuntimeStore};
 
 const SOCKET_PATH: &str = "/run/bunzod.sock";
 
@@ -132,6 +132,36 @@ async fn handle_connection(
             }
             ClientMessage::ListTasks { id, limit } => {
                 handle_list_tasks(&mut write_half, &id, limit, &store).await?;
+            }
+            ClientMessage::ListPolicies { id, limit } => {
+                handle_list_policies(&mut write_half, &id, limit, &store).await?;
+            }
+            ClientMessage::UpsertPolicy {
+                id,
+                subject,
+                action,
+                resource,
+                decision,
+                grant_scope,
+                target,
+                note_text,
+            } => {
+                handle_upsert_policy(
+                    &mut write_half,
+                    &id,
+                    &subject,
+                    &action,
+                    &resource,
+                    &decision,
+                    &grant_scope,
+                    target.as_deref(),
+                    note_text.as_deref(),
+                    &store,
+                )
+                .await?;
+            }
+            ClientMessage::DeletePolicy { id, policy_id } => {
+                handle_delete_policy(&mut write_half, &id, &policy_id, &store).await?;
             }
             ClientMessage::Cancel { id: _ } => {
                 // In-flight request cancellation is not wired yet; the real
@@ -434,6 +464,215 @@ where
         }
     }
     Ok(())
+}
+
+async fn handle_list_policies<W>(
+    w: &mut W,
+    id: &str,
+    limit: u32,
+    store: &RuntimeStore,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match store.list_runtime_policies(limit) {
+        Ok(policies) => {
+            let frame = Envelope::new(ServerMessage::PolicyList {
+                id: id.into(),
+                policies,
+            });
+            write_frame_async(w, &frame).await?;
+        }
+        Err(e) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "runtime_store_error".into(),
+                text: format!("{e:#}"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_upsert_policy<W>(
+    w: &mut W,
+    id: &str,
+    subject: &str,
+    action: &str,
+    resource: &str,
+    decision: &str,
+    grant_scope: &str,
+    target: Option<&str>,
+    note_text: Option<&str>,
+    store: &RuntimeStore,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let decision = match PolicyDecision::from_str(decision) {
+        Some(decision) => decision,
+        None => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "invalid_policy_decision".into(),
+                text: format!("unsupported policy decision '{decision}'"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+    };
+    let grant_scope = match GrantScope::from_str(grant_scope) {
+        Some(scope) => scope,
+        None => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "invalid_policy_scope".into(),
+                text: format!("unsupported policy scope '{grant_scope}'"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+    };
+
+    let (conversation_id, task_id, task_run_id) =
+        match resolve_policy_target(store, grant_scope, target) {
+            Ok(targets) => targets,
+            Err(LookupError::NotFound { kind, value }) => {
+                let err = Envelope::new(ServerMessage::Error {
+                    id: id.into(),
+                    code: "policy_target_not_found".into(),
+                    text: format!("{kind} '{value}' was not found"),
+                });
+                write_frame_async(w, &err).await?;
+                return Ok(());
+            }
+            Err(LookupError::Ambiguous { kind, value }) => {
+                let err = Envelope::new(ServerMessage::Error {
+                    id: id.into(),
+                    code: "policy_target_ambiguous".into(),
+                    text: format!("{kind} prefix '{value}' matches multiple records"),
+                });
+                write_frame_async(w, &err).await?;
+                return Ok(());
+            }
+            Err(LookupError::Store(e)) => {
+                let err = Envelope::new(ServerMessage::Error {
+                    id: id.into(),
+                    code: "runtime_store_error".into(),
+                    text: format!("{e:#}"),
+                });
+                write_frame_async(w, &err).await?;
+                return Ok(());
+            }
+        };
+
+    match store.upsert_runtime_policy(NewRuntimePolicy {
+        subject: subject.to_string(),
+        action: action.to_string(),
+        resource: resource.to_string(),
+        decision,
+        grant_scope,
+        conversation_id,
+        task_id,
+        task_run_id,
+        note_text: note_text.map(str::to_string),
+    }) {
+        Ok((policy, created)) => {
+            let frame = Envelope::new(ServerMessage::PolicyMutationResult {
+                id: id.into(),
+                policy,
+                created,
+            });
+            write_frame_async(w, &frame).await?;
+        }
+        Err(e) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "runtime_store_error".into(),
+                text: format!("{e:#}"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_delete_policy<W>(
+    w: &mut W,
+    id: &str,
+    policy_id: &str,
+    store: &RuntimeStore,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match store.delete_runtime_policy(policy_id) {
+        Ok(policy_id) => {
+            let frame = Envelope::new(ServerMessage::PolicyDeleteResult {
+                id: id.into(),
+                policy_id,
+            });
+            write_frame_async(w, &frame).await?;
+        }
+        Err(LookupError::NotFound { kind, value }) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "policy_not_found".into(),
+                text: format!("{kind} '{value}' was not found"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+        Err(LookupError::Ambiguous { kind, value }) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "policy_ambiguous".into(),
+                text: format!("{kind} prefix '{value}' matches multiple records"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+        Err(LookupError::Store(e)) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "runtime_store_error".into(),
+                text: format!("{e:#}"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_policy_target(
+    store: &RuntimeStore,
+    grant_scope: GrantScope,
+    target: Option<&str>,
+) -> std::result::Result<(Option<String>, Option<String>, Option<String>), LookupError> {
+    let target = target.map(str::trim).filter(|target| !target.is_empty());
+    match grant_scope {
+        GrantScope::Persistent => Ok((None, None, None)),
+        GrantScope::Session => {
+            let target = target.ok_or_else(|| LookupError::NotFound {
+                kind: "conversation",
+                value: "target required for session scope".into(),
+            })?;
+            Ok((Some(store.resolve_conversation_ref(target)?), None, None))
+        }
+        GrantScope::Task => {
+            let target = target.ok_or_else(|| LookupError::NotFound {
+                kind: "task",
+                value: "target required for task scope".into(),
+            })?;
+            Ok((None, Some(store.resolve_task_ref(target)?), None))
+        }
+        GrantScope::Once => {
+            let target = target.ok_or_else(|| LookupError::NotFound {
+                kind: "task run",
+                value: "target required for once scope".into(),
+            })?;
+            Ok((None, None, Some(store.resolve_task_run_ref(target)?)))
+        }
+    }
 }
 
 async fn finish_with_error<W>(
