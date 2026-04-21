@@ -1,100 +1,92 @@
 # bunzo
 
-An experimental agentic Linux distribution.
+An experimental agentic Linux distribution built from source with Buildroot.
 
-bunzo is an operating system built around the idea that AI agents should be a first-class citizen of the OS, not an app running on top of one. The long-term aim is a flashable image that runs on dedicated consumer-friendly devices, centered on a minimal chat-first interface, with room for proactive, policy-bounded action taken on the user's behalf.
+bunzo treats the agent runtime as part of the OS, not an app on top of one.
+The current development target is a QEMU-bootable image with a local shell,
+durable runtime state, runtime policy, and proactive jobs that stay inside the
+same task/policy/audit model as interactive work.
 
-## Status
+## Current state
 
-Early prototype, but the runtime foundations are no longer hypothetical. M5 is
-operationally closed in QEMU, the interactive shell path of M6 is operationally
-closed there too, and the first M8 scheduler slice is now live on-image:
-runtime policy lives in the SQLite state store, tool use is approval-first by
-default, `bunzo-shell` ships `/policy`, `/approve`, `/approvals`,
-`/conversations`, `/tasks`, and `/jobs`, and scheduler-fired work now creates
-normal `scheduled_job` task runs through the same runtime/task/policy path as
-interactive requests. The current product direction is still
-**screen-optional**: on headless hardware the user should be able to provision
-bunzo from a phone, while on desktop-class hardware with a display and keyboard
-the local shell should remain a normal first-class setup and usage path. See
-[docs/ROADMAP.md](docs/ROADMAP.md) for milestones.
+- M1 through M6 are operationally closed in the QEMU development loop.
+- M8 scheduler slice 1 is live: `bunzo-schedulerd` exists, `/jobs` exists, and
+  scheduled work creates normal `scheduled_job` task runs through the same
+  runtime path as shell requests.
+- The next major milestone is M7 provisioning: replace `/setup` file writes
+  with a real `bunzo-provisiond` service and durable config ownership.
 
-The next platform work is: move `/setup` behind a real provisioning service,
-harden the new scheduler with richer schedules plus retry/backoff policy, and
-continue replaying the runtime path on real hardware once the provisioning
-surface exists.
+## Recommended doc load order
 
-## Building
+For a new coding thread, do not load every markdown file by default.
 
-bunzo is built from source with Buildroot. For this repo's active day-to-day
-development loop, the expected path is: edit locally, rebuild on the remote
-Linux builder, and boot QEMU on that same remote host over SSH. The macOS
-Docker wrapper remains available as a fallback, but it is not the default
-iteration path.
+1. `STATE.md` first
+2. `docs/ROADMAP.md` only for milestone status or open work
+3. `docs/ARCHITECTURE.md` only for runtime/service boundaries
+4. `docs/PROVISIONING.md` only for M7 work
+5. `docs/VISION.md` only for product-direction questions
 
-- **Linux (native, fastest).** Host deps from Buildroot's manual, then:
-  ```
-  ./scripts/bootstrap.sh            # clone buildroot (once)
-  ./scripts/build.sh qemu_aarch64   # ~5–15 min on a modern box
-  ./scripts/run-qemu.sh qemu_aarch64
-  ```
-- **macOS driving a remote Linux builder (default and recommended).** Edit locally, let a helper script push to GitHub, pull on the remote, and build there. Boot the resulting image in QEMU over SSH. One-time setup:
-  ```
-  cp scripts/remote.env.example scripts/remote.env.local
-  $EDITOR scripts/remote.env.local         # host alias/port/user/path
-  ssh-copy-id -p 2299 filextract@filextract-server
-  ```
-  Then:
-  ```
-  ./scripts/remote-build.sh qemu_aarch64   # push + remote pull + remote build
-  ./scripts/remote-qemu.sh  qemu_aarch64   # boot on remote, serial over ssh
-  ```
-  `remote-build.sh` builds the branch state that has been committed and pushed to `origin`; it does not include uncommitted local edits unless you sync them to the remote separately.
-  If you want the old persistent QEMU session that survives SSH drops, run:
-  ```
-  BUNZO_REMOTE_QEMU_PERSIST=1 ./scripts/remote-qemu.sh qemu_aarch64
-  ```
-  `scripts/remote.env.local` is gitignored so host details stay off GitHub.
-- **macOS (Docker wrapper, fallback only).** Supported, but slower because of Docker Desktop's VM + virtiofs. Keep this for emergencies or when the remote builder is unavailable:
-  ```
-  ./scripts/build-docker.sh qemu_aarch64
-  ./scripts/run-qemu.sh qemu_aarch64
-  ```
+## Build
 
-## Documentation
+The default workflow is: edit locally, build on the remote Linux host, boot
+QEMU on that same host.
 
-- [Vision](docs/VISION.md) — where the project is heading
-- [Architecture](docs/ARCHITECTURE.md) — what exists now vs what comes later
-- [Roadmap](docs/ROADMAP.md) — milestones and current focus
-- [Foundations Plan](docs/FOUNDATIONS.md) — next platform phase after M4
-- [Provisioning](docs/PROVISIONING.md) — first-boot and reconfiguration spec
+### Remote Linux builder (default)
 
-## Backend Config
+One-time setup:
 
-The remote OpenAI backend is configured at `/etc/bunzo/bunzod.toml`. bunzo is
-currently pinned to the GPT-5.4 family only:
-
-- `gpt-5.4`
-- `gpt-5.4-mini`
-- `gpt-5.4-nano`
-
-Current recommendation for the interactive shell is `gpt-5.4-mini`. The daemon
-currently uses one configured model for all requests; per-task routing between
-`gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.4-nano` is a later followup.
-
-On images that include the latest `bunzo-shell`, if the backend is not
-configured the shell warns immediately and supports `/setup` to paste the API
-key directly on-device. `/setup` writes both `/etc/bunzo/bunzod.toml` and
-`/etc/bunzo/openai.key`, then retries the request.
-
-Example:
-
-```toml
-[backend]
-kind = "openai"
-model = "gpt-5.4-mini"
-api_key_path = "/etc/bunzo/openai.key"
+```sh
+cp scripts/remote.env.example scripts/remote.env.local
+$EDITOR scripts/remote.env.local
+ssh-copy-id -p 2299 filextract@filextract-server
 ```
+
+Then:
+
+```sh
+./scripts/remote-build.sh qemu_aarch64
+./scripts/remote-qemu.sh qemu_aarch64
+```
+
+Important: `remote-build.sh` only sees pushed Git state. For uncommitted local
+changes, sync the tree to the remote host first or commit/push before building.
+
+### Native Linux build
+
+```sh
+./scripts/bootstrap.sh
+./scripts/build.sh qemu_aarch64
+./scripts/run-qemu.sh qemu_aarch64
+```
+
+### macOS Docker fallback
+
+Use this only when the remote builder is unavailable:
+
+```sh
+./scripts/build-docker.sh qemu_aarch64
+./scripts/run-qemu.sh qemu_aarch64
+```
+
+## Runtime notes
+
+- Canonical runtime state lives at `/var/lib/bunzo/state/runtime.sqlite3`.
+- The JSONL ledger at `/var/lib/bunzo/ledger.jsonl` is an audit sink, not the
+  canonical runtime store.
+- `bunzo-shell` currently supports `/setup`, `/conversations`, `/tasks`,
+  `/policy`, `/approve`, `/approvals`, and `/jobs`.
+- The OpenAI backend is currently limited to the GPT-5.4 family, with
+  `gpt-5.4-mini` as the current interactive default.
+
+## Docs
+
+- [STATE.md](STATE.md) — compact working state for new threads
+- [docs/ROADMAP.md](docs/ROADMAP.md) — milestone status and open work
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — current runtime/service shape
+- [docs/PROVISIONING.md](docs/PROVISIONING.md) — M7 target design
+- [docs/VISION.md](docs/VISION.md) — long-term product direction
+- [docs/FOUNDATIONS.md](docs/FOUNDATIONS.md) — why the project order is state
+  → policy → provisioning → scheduler
 
 ## License
 

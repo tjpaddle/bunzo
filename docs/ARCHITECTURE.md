@@ -1,133 +1,128 @@
 # bunzo — architecture
 
-This document separates **what exists now** (or is actively being built) from **what the project aims for later**. It is meant to stay honest: if something is not built yet, it lives under "Later".
+Load this file when you need the current runtime/service shape. It is meant to
+answer "what exists now, what owns what, and what is still missing?"
 
-## Principles
+## Core shape
 
-1. **Built from source, not layered on a base distro.** bunzo is assembled from upstream Linux kernel source plus a userland we compile ourselves. There is no "underlying OS" that we inherit. Every byte on the target was chosen and built by bunzo.
-2. **Agent-native from the base up.** Kernel config, init system, and filesystem layout are chosen with the agent layer in mind — cgroups v2, namespaces, seccomp, audit, eventually a read-only rootfs with overlayfs for state.
-3. **Multi-architecture by design.** The same bunzo userland runs on aarch64 (Pi 4/5 + other arm64 boards) and x86_64 (generic UEFI PCs) from day one. A new target is a new defconfig, not a rewrite.
-4. **QEMU-first dev loop.** Any change builds and boots in QEMU in seconds. Hardware flashes are for validation, not iteration.
-5. **Boring base, interesting top.** The layers below the agent runtime stay conventional (Linux kernel, standard init, standard filesystems) so we can focus novelty on the agent layer, not on reinventing the plumbing.
-6. **Screen-optional product, deterministic first boot.** The shipping UX must work with no local screen, but must also support a normal local shell/setup path on hardware that has a display and input devices. First-boot setup should be a simple, reliable provisioning flow, not an open-ended LLM conversation.
-7. **One provisioning engine, multiple surfaces.** Phone-led setup, local shell setup, and any later local UI should all drive the same provisioning state machine and write the same persisted config.
+- **Build system:** Buildroot with a `BR2_EXTERNAL` tree under `board/`
+- **Primary target:** `qemu_aarch64`
+- **Default dev loop:** edit locally, build on the remote Linux host, boot QEMU
+  there over SSH
+- **Init system:** systemd
+- **bunzo-written code:** Rust
+- **Skill runtime:** WebAssembly in `wasmtime`
+- **Canonical runtime state:** SQLite under `/var/lib/bunzo/state/`
 
-## Layers
+## Runtime services
 
-```
-┌───────────────────────────────────────────────────────┐
-│  User interaction                                     │
-│   - provisioning UI (phone-led)   [Later]             │
-│   - local setup shell / console   [Now: M2/M3/M6/M8]  │
-│   - phone client                  [Later]             │
-│   - voice I/O                     [Later]             │
-├───────────────────────────────────────────────────────┤
-│  Agent runtime                                        │
-│   - bunzod (agent daemon)         [Now: M3]           │
-│   - skill registry                [Now: M4]           │
-│   - context / task store          [Now: M5]           │
-│   - policy engine                 [Now: M6]           │
-│   - action ledger                 [Now: audit sink]   │
-│   - provisioning API / state      [Next: M7]          │
-│   - scheduler / jobs              [Now: M8 slice 1]    │
-├───────────────────────────────────────────────────────┤
-│  System services                                      │
-│   - init + service manager        [Now: M1]           │
-│   - logging / audit               [Now: M1]           │
-│   - networking / ssh              [Now: M1]           │
-│   - first-boot AP / captive UI    [Next: M7]          │
-│   - secret / key storage          [Later]             │
-├───────────────────────────────────────────────────────┤
-│  Userland                                             │
-│   - libc, coreutils, shell        [Now: M1]           │
-│   - network stack, openssh        [Now: M1]           │
-├───────────────────────────────────────────────────────┤
-│  Kernel                                               │
-│   - Linux (upstream, our config)  [Now: M1]           │
-├───────────────────────────────────────────────────────┤
-│  Firmware / bootloader                                │
-│   - U-Boot / Pi firmware / UEFI   [Now: M1]           │
-└───────────────────────────────────────────────────────┘
-```
+### `bunzo-shell`
 
-## Build system
+The local shell and current local control surface.
 
-- **Framework:** Buildroot. We do not vendor it. `scripts/bootstrap.sh` clones a pinned release tag into `./buildroot/` (gitignored).
-- **Layout:** `BR2_EXTERNAL` pattern. Our configurations live under `board/` in this repo; Buildroot is invoked with `BR2_EXTERNAL=$(pwd)/board` so our tree is the source of truth for kernel config, rootfs overlay, defconfigs, and custom packages.
-- **Primary dev build flow is remote native Linux.** The expected iteration loop is edit locally on the Mac, then run `scripts/remote-build.sh` against the Debian builder and `scripts/remote-qemu.sh` to boot the image there over SSH. This avoids Docker Desktop's VM/virtiofs overhead entirely.
-- **Docker on macOS remains a fallback, not the main loop.** The `Dockerfile.builder` image still exists so the repo can build from macOS without a remote host, but that path is slower and should be treated as backup capacity. When used, heavy write paths (`output/`, `dl/`) go through Docker named volumes, not the macOS virtiofs bind mount, because virtiofs takes SIGBUS under Buildroot's mmap-heavy writes.
-- **Output per target:** kernel image + rootfs + bootable artifact (`.img` for SD/USB, raw files for QEMU). Targets:
-  - `bunzo_qemu_aarch64` — QEMU arm64 virt machine, for fast dev iteration
-  - `bunzo_rpi4` — real Pi 4 / Pi 5 boot
-  - `bunzo_pc_x86_64` — generic x86_64 UEFI PC (USB-flashable)
+Current commands include:
 
-## Languages
+- `/setup`
+- `/conversations`
+- `/tasks`
+- `/policy`
+- `/approve`
+- `/approvals`
+- `/jobs`
 
-bunzo's own code is written in **Rust**. This is a foundational decision driven by the project's "extremely minimal RAM" constraint and the desire to keep the baseline footprint low on small boards.
+Today it is still both a developer console and the temporary local setup path.
 
-- **Why Rust over Python:** no interpreter, no GC, no runtime baggage. A `tokio`-based service idles at 5–10 MB RSS; a tight service can sit under 5 MB. Python would add ~30 MB to the rootfs plus per-process interpreter overhead.
-- **Why Rust over Go:** Go's runtime adds a 2–5 MB floor per process plus GC overhead. Rust gives a cleaner single-static-binary story on embedded targets and lets us share buffers with C libraries (`llama.cpp` etc.) at zero cost.
-- **TUI / serial shell:** `ratatui` + `crossterm` for richer terminals, plus a plain serial mode for QEMU and recovery. The shell is both a developer/recovery interface and a legitimate local setup/usage surface on desktop-class hardware. It is not the only consumer onboarding UX.
-- **Current serial-shell reality:** on the QEMU / PL011 serial console, the proven interaction mode today is plain line-oriented stdin/stdout on `ttyAMA0`. The richer `ratatui` / `crossterm` fullscreen path is still in the codebase, but it is not yet reliable enough to be the boot-critical path there.
-- **Async runtime:** `tokio` for `bunzod` and any other long-lived network-facing services. Keep it single-threaded where possible to minimize per-process overhead.
-- **Skill runtime:** WebAssembly via `wasmtime` embedded in `bunzod`. Skills compile to `wasm32-unknown-unknown` and run inside the daemon with capability-scoped host functions. This replaces the earlier plan to juggle `bwrap`/`nsjail` + seccomp for skill isolation — the `wasmtime` boundary is the sandbox.
-- **Not written in Rust:** the kernel, libc, systemd, coreutils, openssh, and everything else Buildroot assembles for us. We pick and configure those but write none of their code.
+### `bunzod`
 
-**Build workflow for Rust code:** In the active workflow, Rust binaries are cross-compiled on the remote Linux builder by `scripts/build.sh` and dropped into the rootfs via `board/bunzo/common/rootfs-overlay/usr/bin/`. The `bunzo-builder` Docker image remains as a fallback for macOS-only builds. Later, once we have more than a couple of binaries, we promote them to proper Buildroot packages using `cargo-package` infrastructure.
+The main agent runtime daemon.
 
-## Now (current repo)
+Responsibilities:
 
-- **Kernel:** Linux, latest LTS, built from kernel.org source via Buildroot. Configured with a small bunzo-specific fragment layered on top of Buildroot's per-target defaults: cgroups v2, namespaces, seccomp-BPF, audit, overlayfs, hardware RNG.
-- **libc:** glibc. (For maximum compatibility with the C ecosystem Buildroot pulls in and with future `llama.cpp`/`candle` bindings. musl would fight us on some of those. Rust binaries are still cross-compiled to the `*-linux-musl` triple so they are statically linked and self-contained regardless of the system libc.)
-- **Init / service manager:** **systemd**. Decided in the M1 scaffolding batch — rejected the "busybox init first, migrate in M2" path because we would have replaced it immediately for socket activation and service supervision. The 20–40 MB cost is acceptable for an agent OS.
-- **Userland:** Buildroot-assembled minimal rootfs — coreutils, bash, openssh, networking tools, `ca-certificates`, `haveged`, `sudo`. No language runtime — bunzo's own code (M2+) is Rust, cross-compiled to static musl binaries and staged via the rootfs overlay.
-- **Identity:** `/etc/os-release`, `/etc/motd`, `/etc/hostname` — set to bunzo.
-- **Shell / local console:** `bunzo-shell` is in the image and currently provides the implemented local setup and control surface. It supports `/setup`, `/conversations`, `/tasks`, `/policy`, `/approve`, `/approvals`, and `/jobs`; provisioning still writes config files directly for now and remains a stopgap before `bunzo-provisiond`.
-- **Agent runtime:** `bunzod` is present today as a socket-activated Rust daemon behind a local Unix-socket API. It streams model replies, invokes skills, persists conversations/tasks/task-runs/events into the runtime store, and evaluates runtime policy before skill use.
-- **Runtime store:** canonical durable runtime state now lives under `/var/lib/bunzo/state/runtime.sqlite3`. Conversations, messages, tasks, task runs, snapshots, runtime policies, and task events are persisted there and survive QEMU reboot.
-- **Action ledger:** append-only JSONL audit at `/var/lib/bunzo/ledger.jsonl`. This is now explicitly an audit/export sink, not the canonical runtime store.
-- **Skills and policy:** one real skill exists today (`read-local-file`), compiled to WASM and executed inside `wasmtime` with manifest-scoped capabilities. The manifest remains the hard capability ceiling, and a runtime policy layer now sits in front of skill invocation with durable `allow`, `deny`, and `require_approval` decisions, a shell authoring surface, in-product approval resolution, and an approval-first default for unmatched shell tool use.
-- **Scheduler / jobs:** a first live scheduler slice now exists as `bunzo-schedulerd` plus shell `/jobs`. Recurring interval jobs are stored durably, claimed under lease, and each firing creates a normal `scheduled_job` task/task-run pair through the shared runtime path instead of a separate execution pipeline.
+- local Unix-socket API
+- model interaction
+- tool/skill execution
+- conversation/task/task-run/event persistence
+- runtime policy evaluation in front of tool use
+- waiting/resume flow for approval-gated work
 
-## Current platform phase
+`bunzod` is still the main runtime entry point, but it is no longer treated as
+a stateless request broker. The real source of truth is the runtime store.
 
-After M4, bunzo moved into the runtime foundation layer described in
-[FOUNDATIONS.md](FOUNDATIONS.md). M5 is operationally closed in QEMU, and the
-interactive shell path of M6 is now operationally closed there too. The first
-M8 scheduler slice is also live and QEMU-verified.
+### `bunzo-schedulerd`
 
-- **Context / task store (M5):** durable conversations, tasks, snapshots, and
-  runtime events above the JSONL ledger. Closed for the QEMU dev loop.
-- **Policy engine (M6):** user-centric, task-aware allow/deny/approval
-  decisions that sit in front of tool use and proactive execution. Durable
-  policy rules plus `/policy` authoring are now in place; `/approve` and
-  `/approvals` cover waiting-task resolution in the shell; and unmatched shell
-  tool actions now default to `require_approval` / `once`. That same model now
-  also covers the first scheduler-created task-run path in M8.
-- **Provisioning engine (M7):** `bunzo-provisiond`, persisted config under
-  `/var/lib/bunzo`, config rendering into `/etc`, and `/setup` as a real
-  frontend instead of a file-writing shortcut.
-- **Scheduler (M8):** first slice landed: recurring interval jobs, durable
-  job/job-run state, `/jobs` in the shell, and scheduler-fired work flowing
-  through the same state and policy layers as interactive work. Richer trigger
-  shapes plus retry/backoff policy remain open follow-up work.
+The scheduler/job service introduced in M8 slice 1.
 
-## Later
+Responsibilities:
 
-- **Agent daemon (`bunzod`):** remains the main local runtime entry point, but should evolve from "stateless request broker with audit log" into "task-aware runtime over a durable state store". Local-first (`candle` or `llama.cpp` FFI) backends still sit behind the same Rust trait.
-- **Chat shell:** remains as a local escape hatch, developer console, and first-class local interface on devices with displays and keyboards. It talks to `bunzod` over a local Unix socket and can still handle manual setup, but it should not be the only onboarding path for headless hardware.
-  See [PROVISIONING.md](PROVISIONING.md) for the concrete state machine and persisted-config boundary.
-- **Skills:** WebAssembly modules the agent can invoke with explicit capabilities. Each ships a manifest declaring what it needs. `bunzod` loads and runs them inside the embedded `wasmtime`; capability enforcement happens at the host function boundary, so we do not need a separate sandbox runner.
-- **Phone control / pairing:** after provisioning, a phone app or browser client talks to `bunzod` over a mutually authenticated local channel first, with optional remote reachability later. No mandatory cloud round-trip.
-- **Read-only rootfs with overlayfs for state:** so agents cannot trash the base system and updates are atomic.
-- **A/B partitions + signed updates:** for safe OTA.
+- read durable jobs from the shared runtime store
+- claim due work under lease
+- create normal `scheduled_job` task runs
+- execute them through the same prepared-request/runtime path as shell work
 
-## Deferred decisions
+Important constraint: scheduler work must keep sharing the main runtime/task/
+policy path. There should not be a second scheduler-only execution pipeline.
 
-Called out so we do not paint ourselves into a corner, but we are not solving them yet.
+### `bunzo-provisiond` (next)
 
-- **Update mechanism:** manual re-flash for now. Later: OTA with signed A/B images.
-- **Secrets storage:** filesystem mode 600 for now. Later: TPM-backed where hardware allows.
-- **Multi-user:** single user for now. Later: local identity backend.
-- **Telemetry:** none for now. Later: opt-in, local-first, never blocking.
-- **Architectures beyond aarch64 + x86_64:** armv7, i386, RISC-V — revisit once the project has traction and a real user asks for them.
+Not built yet. This should become the owner of first-boot and reconfiguration
+state so `/setup` stops writing `/etc/bunzo/*` directly.
+
+## Key data paths
+
+- Runtime state:
+  `/var/lib/bunzo/state/runtime.sqlite3`
+- Audit sink:
+  `/var/lib/bunzo/ledger.jsonl`
+- Current runtime config:
+  `/etc/bunzo/bunzod.toml`
+- Current backend secret:
+  `/etc/bunzo/openai.key`
+
+Today `/etc/bunzo/*` is still directly written by the shell. The architectural
+target is for provisioning-owned state under `/var/lib/bunzo/` to become the
+source of truth and `/etc` to become rendered runtime output.
+
+## Current runtime model
+
+### Interactive path
+
+`bunzo-shell` request → `bunzod` → runtime store/task creation → policy
+evaluation → skill/model execution → task events/state updates
+
+### Scheduler path
+
+`bunzo-schedulerd` claim due job → prepare `scheduled_job` request → same
+runtime/task/policy path as interactive work
+
+### Policy model
+
+- Skill manifest = hard capability ceiling
+- Runtime policy = durable allow/deny/require-approval layer
+- Default unmatched tool use = `require_approval` / `once`
+
+## Product surfaces
+
+### Exists now
+
+- local shell on the device
+- local runtime store and audit trail
+- proactive interval jobs via `/jobs`
+
+### Next
+
+- real provisioning engine with local and headless frontends
+- scheduler hardening beyond interval-only slice 1
+
+### Later
+
+- phone/browser control after provisioning
+- read-only rootfs + durable writable state
+- OTA/update machinery
+
+## Stable project decisions
+
+- bunzo is built from source, not layered on another distro
+- the product is screen-optional, not phone-only
+- frontends should stay thin and call services
+- provisioning and scheduling should be deterministic services first,
+  LLM-assisted second
