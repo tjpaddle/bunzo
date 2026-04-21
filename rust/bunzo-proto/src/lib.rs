@@ -30,6 +30,8 @@ pub struct TaskSummary {
     pub task_id: String,
     pub conversation_id: String,
     pub task_run_id: String,
+    #[serde(default = "default_task_kind")]
+    pub task_kind: String,
     pub updated_at_ms: u64,
     pub task_status: String,
     pub run_status: String,
@@ -51,6 +53,21 @@ pub struct PolicySummary {
     pub task_id: Option<String>,
     pub task_run_id: Option<String>,
     pub note_text: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledJobSummary {
+    pub job_id: String,
+    pub name: String,
+    pub prompt_preview: String,
+    pub interval_seconds: u64,
+    pub enabled: bool,
+    pub next_run_at_ms: u64,
+    pub conversation_id: Option<String>,
+    pub last_run_status: Option<String>,
+    pub last_task_id: Option<String>,
+    pub last_task_run_id: Option<String>,
     pub updated_at_ms: u64,
 }
 
@@ -81,6 +98,11 @@ pub enum ClientMessage {
         #[serde(default = "default_list_limit")]
         limit: u32,
     },
+    ListScheduledJobs {
+        id: String,
+        #[serde(default = "default_list_limit")]
+        limit: u32,
+    },
     UpsertPolicy {
         id: String,
         subject: String,
@@ -93,9 +115,26 @@ pub enum ClientMessage {
         #[serde(default)]
         note_text: Option<String>,
     },
+    ResolveApproval {
+        id: String,
+        task_run_id: String,
+        grant_scope: String,
+        #[serde(default)]
+        note_text: Option<String>,
+    },
     DeletePolicy {
         id: String,
         policy_id: String,
+    },
+    CreateScheduledJob {
+        id: String,
+        name: String,
+        prompt: String,
+        interval_seconds: u64,
+    },
+    DeleteScheduledJob {
+        id: String,
+        job_id: String,
     },
 }
 
@@ -155,6 +194,10 @@ pub enum ServerMessage {
         id: String,
         policies: Vec<PolicySummary>,
     },
+    ScheduledJobList {
+        id: String,
+        jobs: Vec<ScheduledJobSummary>,
+    },
     PolicyMutationResult {
         id: String,
         policy: PolicySummary,
@@ -164,10 +207,22 @@ pub enum ServerMessage {
         id: String,
         policy_id: String,
     },
+    ScheduledJobMutationResult {
+        id: String,
+        job: ScheduledJobSummary,
+    },
+    ScheduledJobDeleteResult {
+        id: String,
+        job_id: String,
+    },
 }
 
 fn default_list_limit() -> u32 {
     10
+}
+
+fn default_task_kind() -> String {
+    "shell_request".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +402,7 @@ mod tests {
                     task_id: "t1".into(),
                     conversation_id: "c1".into(),
                     task_run_id: "tr1".into(),
+                    task_kind: "shell_request".into(),
                     updated_at_ms: 1,
                     task_status: "waiting".into(),
                     run_status: "waiting".into(),
@@ -372,6 +428,22 @@ mod tests {
                     updated_at_ms: 1,
                 }],
             },
+            ServerMessage::ScheduledJobList {
+                id: "u1".into(),
+                jobs: vec![ScheduledJobSummary {
+                    job_id: "job1".into(),
+                    name: "check os".into(),
+                    prompt_preview: "what OS is this?".into(),
+                    interval_seconds: 60,
+                    enabled: true,
+                    next_run_at_ms: 1,
+                    conversation_id: Some("c1".into()),
+                    last_run_status: Some("completed".into()),
+                    last_task_id: Some("t1".into()),
+                    last_task_run_id: Some("tr1".into()),
+                    updated_at_ms: 1,
+                }],
+            },
             ServerMessage::PolicyMutationResult {
                 id: "u1".into(),
                 policy: PolicySummary {
@@ -393,6 +465,26 @@ mod tests {
                 id: "u1".into(),
                 policy_id: "p1".into(),
             },
+            ServerMessage::ScheduledJobMutationResult {
+                id: "u1".into(),
+                job: ScheduledJobSummary {
+                    job_id: "job1".into(),
+                    name: "check os".into(),
+                    prompt_preview: "what OS is this?".into(),
+                    interval_seconds: 60,
+                    enabled: true,
+                    next_run_at_ms: 1,
+                    conversation_id: Some("c1".into()),
+                    last_run_status: None,
+                    last_task_id: None,
+                    last_task_run_id: None,
+                    updated_at_ms: 1,
+                },
+            },
+            ServerMessage::ScheduledJobDeleteResult {
+                id: "u1".into(),
+                job_id: "job1".into(),
+            },
         ] {
             let out = Envelope::new(msg);
             let mut buf = Vec::new();
@@ -409,6 +501,10 @@ mod tests {
                 id: "ctl1".into(),
                 limit: 10,
             },
+            ClientMessage::ListScheduledJobs {
+                id: "ctl1b".into(),
+                limit: 10,
+            },
             ClientMessage::UpsertPolicy {
                 id: "ctl2".into(),
                 subject: "shell_request".into(),
@@ -422,6 +518,22 @@ mod tests {
             ClientMessage::DeletePolicy {
                 id: "ctl3".into(),
                 policy_id: "p1".into(),
+            },
+            ClientMessage::ResolveApproval {
+                id: "ctl4".into(),
+                task_run_id: "tr1".into(),
+                grant_scope: "once".into(),
+                note_text: Some("approved from shell".into()),
+            },
+            ClientMessage::CreateScheduledJob {
+                id: "ctl5".into(),
+                name: "check os".into(),
+                prompt: "what OS is this?".into(),
+                interval_seconds: 60,
+            },
+            ClientMessage::DeleteScheduledJob {
+                id: "ctl6".into(),
+                job_id: "job1".into(),
             },
         ] {
             let out = Envelope::new(msg);

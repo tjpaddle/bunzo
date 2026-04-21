@@ -10,6 +10,7 @@ use anyhow::Result;
 use crate::store::{PreparedRequest, RuntimeStore};
 
 pub const SUBJECT_SHELL_REQUEST: &str = "shell_request";
+pub const SUBJECT_SCHEDULED_JOB: &str = "scheduled_job";
 pub const ACTION_INVOKE_SKILL: &str = "invoke_skill";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +64,15 @@ impl GrantScope {
             "session" => Some(Self::Session),
             "persistent" => Some(Self::Persistent),
             _ => None,
+        }
+    }
+
+    pub fn precedence(self) -> u8 {
+        match self {
+            Self::Once => 4,
+            Self::Task => 3,
+            Self::Session => 2,
+            Self::Persistent => 1,
         }
     }
 }
@@ -121,7 +131,7 @@ impl ToolPolicyContext {
     pub fn evaluate_skill_invocation(&self, skill_name: &str) -> Result<PolicyEvaluation> {
         self.store.evaluate_policy(
             &self.request,
-            SUBJECT_SHELL_REQUEST,
+            &self.request.policy_subject,
             ACTION_INVOKE_SKILL,
             skill_name,
         )

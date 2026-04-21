@@ -86,7 +86,7 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 
 **Definition of done:** fresh boot shows the Rust chat shell on the serial console, typing "hello" gets a bunzo-style stub response, an explicit recovery path exists, and `ps` shows `bunzo-shell` under 5 MB RSS.
 
-**Status (2026-04-16):** first three boxes verified on the Debian remote builder; the RSS measurement is still pending an in-VM reading (binary is 594 KB stripped static musl, so the ceiling is safe but un-formally confirmed). Infrastructure to take the measurement has landed alongside the M3 scaffold: `scripts/run-qemu.sh` now hostfwds `tcp::2222->:22`, `etc/ssh/sshd_config.d/bunzo-dev.conf` permits empty-password root (DEV-ONLY), and `scripts/measure-shell-rss.sh` greps `/proc/$pid/status` over SSH. Blocked only on booting the next image. Treating M2 as effectively complete and M3 as scaffolded.
+**Status (2026-04-20):** verified on the running `qemu_aarch64` guest. In-guest `/proc/$pid/status` sampling over the forwarded SSH port measured `bunzo-shell` at **572 kB VmRSS**, comfortably inside the M2 budget. QEMU-side reboot persistence is also now confirmed for the runtime-state work layered on top of the shell.
 
 ## Milestone 3 — "Actual agent"
 
@@ -103,7 +103,7 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 - [x] Skill registry scaffolding landed and is now populated by M4 skills
 - [x] systemd unit for `bunzod` with socket activation (`Type=notify` + `listenfd`; `bunzod.service` has no `[Install]`, so `bunzod.socket` pulls it in on first connect — daemon idles cold)
 
-**Definition of done:** from the chat shell, the user asks "what time is it?", `bunzod` answers with system time via the configured backend, the ledger records the exchange, and `bunzod` idles under 10 MB RSS when no model is loaded. **Chat pipe verified on image 2026-04-17** (real remote completions streamed over the socket protocol). Project policy is now GPT-5.4-family only, with `gpt-5.4-mini` as the current interactive default. RSS measurement still pending (needs either a working ssh drop-in or a recovery-console sample). Ledger line format verified by code; on-image inspection pending for the same reason.
+**Definition of done:** from the chat shell, the user asks "what time is it?", `bunzod` answers with system time via the configured backend, the ledger records the exchange, and `bunzod` idles under 10 MB RSS when no model is loaded. **Chat pipe verified on image 2026-04-17** (real remote completions streamed over the socket protocol). Project policy is now GPT-5.4-family only, with `gpt-5.4-mini` as the current interactive default. Idle-RSS is now measured on-image at **6932 kB VmRSS** on `qemu_aarch64`, which clears the memory budget. Ledger line format verified by code; optional on-image ledger inspection still remains if we want a fully explicit operational close-out note.
 
 ## Milestone 4 — "First skill"
 
@@ -116,7 +116,9 @@ Milestones are deliberately narrow. Each one is a shippable, testable artifact e
 - [x] Ledger records which skill ran, with what inputs, and the result. Each exchange's JSONL entry now carries a `tool_calls: [{name, ok, latency_ms}]` array.
 - [x] Sandboxing comes from the `wasmtime` boundary itself — no `bwrap`/`nsjail`/seccomp juggling for the skill runner. (systemd-side seccomp/audit still matters for non-skill services and is handled separately.)
 
-**Definition of done:** user asks a question that requires reading a bunzo-device file (e.g. "what OS is this?"), the LLM calls `read-local-file`, the host reads the file through the capability allowlist, the content is fed back to the LLM, the LLM answers, and the ledger records it. **Tool-call pipeline verified on image 2026-04-17** — model invoked `read-local-file`, `ToolActivity` frames streamed to the shell, skill error was fed back to the model and it recovered gracefully. Final step (wasmtime actually executing the skill) was blocked by an `env` vs `bunzo` import-module mismatch; fix committed to `bunzo-skill-abi` (`#[link(wasm_import_module = "bunzo")]`), needs one more build + smoke test cycle to confirm.
+**Definition of done:** user asks a question that requires reading a bunzo-device file (e.g. "what OS is this?"), the LLM calls `read-local-file`, the host reads the file through the capability allowlist, the content is fed back to the LLM, the LLM answers, and the ledger records it.
+
+**Status (2026-04-21):** operationally closed for the QEMU development loop. The tool-call pipeline is verified on-image end to end: `read-local-file` executes inside wasmtime, `ToolActivity` frames stream to the shell, and the assistant can answer from device-local file contents. The later M6 policy smoke also re-confirmed the same path under runtime policy control: explicit runtime `deny` blocked the tool, and removing that denial restored the normal skill path while leaving the manifest as the hard capability ceiling.
 
 ## Next phase — runtime foundations
 
@@ -136,37 +138,53 @@ dependency rationale.
 **Goal:** replace "current request + JSONL audit" with durable runtime state
 that can resume after reboot, power loss, or reconnect.
 
-- [ ] Introduce a canonical bunzo-owned runtime state store under
+- [x] Introduce a canonical bunzo-owned runtime state store under
   `/var/lib/bunzo/state/`
-- [ ] Persist conversations and message history as first-class runtime objects
-- [ ] Persist tasks and task-run state (`queued`, `running`, `waiting`,
+- [x] Persist conversations and message history as first-class runtime objects
+- [x] Persist tasks and task-run state (`queued`, `running`, `waiting`,
   `completed`, `failed`)
-- [ ] Store resumable context snapshots instead of reconstructing state from the
+- [x] Store resumable context snapshots instead of reconstructing state from the
   shell or from logs
-- [ ] Record tool activity as structured task events, not only as audit text
-- [ ] Keep the JSONL ledger as an append-only audit/export sink
-- [ ] Add shell commands to list and resume recent conversations/tasks
+- [x] Record tool activity as structured task events, not only as audit text
+- [x] Keep the JSONL ledger as an append-only audit/export sink
+- [x] Add shell commands to list and resume recent conversations/tasks
 
 **Definition of done:** a conversation survives reboot, the user can resume it
 without replaying raw ledger lines, and `bunzod` can answer "what tasks exist
 and what state are they in?" from durable state.
+
+**Status (2026-04-20):** closed for the QEMU development loop. The runtime store now lives under `/var/lib/bunzo/state/`, `bunzo-shell` exposes `/conversations` and `/tasks`, explicit `waiting`/`completed` paths are visible from durable state, and QEMU reboot persistence is verified. Real-hardware replay of the same persistence/waiting-path smoke is still worth doing, but it is now deferred follow-up work rather than the blocker for starting M6.
 
 ## Milestone 6 — "Policy engine"
 
 **Goal:** replace manifest-only gating with a user-centric policy layer that
 decides whether bunzo may perform an action in the context of a task.
 
-- [ ] Introduce policy concepts: subject, action, resource, decision, scope
-- [ ] Keep manifest capabilities as the hard ceiling for skill behavior
-- [ ] Add a policy evaluator in front of skill invocation
-- [ ] Persist grants and denials as runtime state
-- [ ] Support at least `allow`, `deny`, and `require approval`
-- [ ] Surface policy decisions and denials in the shell and audit trail
-- [ ] Apply the same evaluator to future scheduler-triggered work
+- [x] Introduce policy concepts: subject, action, resource, decision, scope
+- [x] Keep manifest capabilities as the hard ceiling for skill behavior
+- [x] Add a policy evaluator in front of skill invocation
+- [x] Persist grants and denials as runtime state
+- [x] Support at least `allow`, `deny`, and `require approval`
+- [x] Surface policy decisions and denials in the shell and audit trail
+- [x] Apply the same evaluator to future scheduler-triggered work
 
 **Definition of done:** every tool action is checked against both manifest
 capability and runtime policy, decisions are durable/reviewable, and bunzo can
 distinguish "explicitly allowed" from "denied by default".
+
+**Status (2026-04-21):** operationally closed in QEMU for both the interactive
+shell path and the first scheduler-created task path. `bunzod` persists durable
+`runtime_policies` in the SQLite runtime store, evaluates runtime policy in
+front of skill invocation, records `policy.decision` events on tasks/task-runs,
+and `bunzo-shell` exposes `/policy list`, `/policy allow`, `/policy deny`,
+`/policy require-approval`, `/policy delete`, `/approve`, and `/approvals`.
+On-image smoke has covered all four interactive policy branches: persistent
+`deny` blocks `read-local-file`, `require_approval` leaves the task in durable
+`waiting`, approval resolution resumes the same waiting task-run at `once` /
+`task` / `session` / `persistent`, and the unmatched-tool default now pauses on
+`require_approval` / `once` instead of implicitly allowing the tool. The first
+M8 scheduler slice now uses the same evaluator/default posture via the
+`scheduled_job` subject and task kind.
 
 ## Milestone 7 — "Provisioning engine"
 
@@ -207,17 +225,29 @@ device (desktop path), and both surfaces end in the same persisted config.
 **Goal:** bunzo can run proactive routines through the same task, policy, and
 audit path as interactive requests.
 
-- [ ] Introduce a durable job store
-- [ ] Support time-based recurring triggers
-- [ ] Claim due jobs safely and record job-run history
-- [ ] Create normal task runs for scheduler-fired work
-- [ ] Run scheduler-triggered work through the same policy engine
-- [ ] Persist retries/backoff and failure state
-- [ ] Expose job status and recent runs in the shell
+- [x] Introduce a durable job store
+- [x] Support time-based recurring triggers
+- [x] Claim due jobs safely and record job-run history
+- [x] Create normal task runs for scheduler-fired work
+- [x] Run scheduler-triggered work through the same policy engine
+- [x] Persist job-run failure state
+- [ ] Persist retries/backoff policy
+- [x] Expose job status and recent runs in the shell
 
 **Definition of done:** bunzo can run a routine such as "check X every
 morning", each run is recorded as a normal task, and scheduled actions are
 resumable, auditable, and policy-bounded.
+
+**Status (2026-04-21):** the first scheduler slice landed and is QEMU-verified.
+`bunzo-schedulerd` now exists as a dedicated service, the runtime store has
+durable `scheduled_jobs` and `scheduled_job_runs`, `/jobs` in `bunzo-shell` can
+create/list/delete interval jobs, and each firing creates a normal
+`scheduled_job` task run through the existing runtime/task/policy path. On
+image, `/jobs every 10 what OS is this?` created a recurring job whose first
+run paused on the default `require_approval` / `once` posture, `/approve latest
+persistent` resumed that same waiting run, and later recurring runs completed
+normally through the same path. Remaining M8 work is richer trigger shapes and
+persisted retry/backoff policy.
 
 ## Milestone 9 — "Phone control"
 

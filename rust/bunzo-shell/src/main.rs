@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bunzo_proto::{
     read_frame, write_frame, ClientMessage, ConversationSummary, Envelope, PolicySummary,
-    ServerFrame, ServerMessage, TaskSummary,
+    ScheduledJobSummary, ServerFrame, ServerMessage, TaskSummary,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -35,9 +35,12 @@ const BUNZOD_CONFIG_DIR: &str = "/etc/bunzo";
 const BUNZOD_CONFIG_PATH: &str = "/etc/bunzo/bunzod.toml";
 const OPENAI_KEY_PATH: &str = "/etc/bunzo/openai.key";
 const DEFAULT_REMOTE_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_POLICY_SUBJECT: &str = "shell_request";
+const SCHEDULED_JOB_POLICY_SUBJECT: &str = "scheduled_job";
 const RECENT_CONVERSATION_LIMIT: u32 = 12;
 const RECENT_TASK_LIMIT: u32 = 16;
 const RECENT_POLICY_LIMIT: u32 = 24;
+const RECENT_JOB_LIMIT: u32 = 24;
 
 struct App {
     banner: String,
@@ -165,8 +168,26 @@ fn run_serial_shell() -> io::Result<()> {
             stdout.flush()?;
             continue;
         }
+        if let Some(args) = command_args(input, &["/approvals"]) {
+            handle_approvals_command(args, &mut msg_counter, &mut stdout)?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+            continue;
+        }
+        if let Some(args) = command_args(input, &["/approve"]) {
+            handle_approve_command(args, &mut shell_state, &mut msg_counter, &mut stdout)?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+            continue;
+        }
         if let Some(args) = command_args(input, &["/policy", "/policies"]) {
             handle_policy_command(args, &shell_state, &mut msg_counter, &mut stdout)?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+            continue;
+        }
+        if let Some(args) = command_args(input, &["/jobs"]) {
+            handle_jobs_command(args, &mut msg_counter, &mut stdout)?;
             writeln!(stdout)?;
             stdout.flush()?;
             continue;
@@ -375,6 +396,9 @@ fn round_trip(
             ServerMessage::PolicyList { .. } => {}
             ServerMessage::PolicyMutationResult { .. } => {}
             ServerMessage::PolicyDeleteResult { .. } => {}
+            ServerMessage::ScheduledJobList { .. } => {}
+            ServerMessage::ScheduledJobMutationResult { .. } => {}
+            ServerMessage::ScheduledJobDeleteResult { .. } => {}
         }
     }
 }
@@ -615,6 +639,23 @@ fn handle_tasks_command(args: &str, msg_counter: &mut u64, stdout: &mut Stdout) 
     Ok(())
 }
 
+fn handle_approvals_command(
+    args: &str,
+    msg_counter: &mut u64,
+    stdout: &mut Stdout,
+) -> io::Result<()> {
+    if !args.trim().is_empty() {
+        writeln!(stdout, "{}", "usage: /approvals".dark_grey())?;
+        return Ok(());
+    }
+
+    match request_recent_tasks(next_control_id(msg_counter), RECENT_TASK_LIMIT) {
+        Ok(tasks) => render_waiting_approvals(stdout, &tasks)?,
+        Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+    }
+    Ok(())
+}
+
 fn render_recent_tasks(stdout: &mut Stdout, tasks: &[TaskSummary]) -> io::Result<()> {
     if tasks.is_empty() {
         writeln!(stdout, "{}", "no saved tasks yet".dark_grey())?;
@@ -622,6 +663,7 @@ fn render_recent_tasks(stdout: &mut Stdout, tasks: &[TaskSummary]) -> io::Result
     }
 
     writeln!(stdout, "{}", "recent tasks".bold().cyan())?;
+    let mut approval_index = 0usize;
     for task in tasks {
         let summary = if task.summary.is_empty() {
             "(no summary)"
@@ -635,8 +677,9 @@ fn render_recent_tasks(stdout: &mut Stdout, tasks: &[TaskSummary]) -> io::Result
         };
         writeln!(
             stdout,
-            "{} [{}] conv:{} {}",
+            "{} [{} {}] conv:{} {}",
             short_id(&task.task_id),
+            task_kind_label(&task.task_kind),
             status,
             short_id(&task.conversation_id),
             summary
@@ -656,7 +699,73 @@ fn render_recent_tasks(stdout: &mut Stdout, tasks: &[TaskSummary]) -> io::Result
         if task.snapshot_kind.is_some() {
             writeln!(stdout, "{}", "  resumable snapshot saved".dark_grey())?;
         }
+        if is_waiting_approval(task) {
+            approval_index += 1;
+            let label = if approval_index == 1 {
+                "#1 (latest)".to_string()
+            } else {
+                format!("#{approval_index}")
+            };
+            writeln!(stdout, "{}", format!("  approval: {label}").dark_grey())?;
+            writeln!(
+                stdout,
+                "{}",
+                format!(
+                    "  approve: /approve {} <once|task|session|persistent>",
+                    approval_index
+                )
+                .dark_grey()
+            )?;
+        }
     }
+    Ok(())
+}
+
+fn render_waiting_approvals(stdout: &mut Stdout, tasks: &[TaskSummary]) -> io::Result<()> {
+    let approvals = waiting_approval_tasks(tasks);
+    if approvals.is_empty() {
+        writeln!(stdout, "{}", "no waiting approvals".dark_grey())?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "{}", "waiting approvals".bold().cyan())?;
+    for (index, task) in approvals.iter().enumerate() {
+        let approval_number = index + 1;
+        let summary = if task.summary.is_empty() {
+            "(no summary)"
+        } else {
+            &task.summary
+        };
+        let label = if approval_number == 1 {
+            "1 (latest)".to_string()
+        } else {
+            approval_number.to_string()
+        };
+        writeln!(
+            stdout,
+            "{}. {} run:{} conv:{} {}",
+            label,
+            task_kind_label(&task.task_kind),
+            short_id(&task.task_run_id),
+            short_id(&task.conversation_id),
+            summary
+        )?;
+        if let Some(reason) = task.state_reason_text.as_deref() {
+            if !reason.is_empty() {
+                writeln!(stdout, "{}", format!("  reason: {reason}").dark_grey())?;
+            }
+        }
+        writeln!(
+            stdout,
+            "{}",
+            format!(
+                "  approve: /approve {} <once|task|session|persistent>",
+                approval_number
+            )
+            .dark_grey()
+        )?;
+    }
+    writeln!(stdout, "{}", approve_usage().dark_grey())?;
     Ok(())
 }
 
@@ -737,7 +846,13 @@ fn handle_policy_command(
             }
         }
         "allow" | "deny" | "require-approval" => {
-            let Some(resource) = parts.next() else {
+            let Some(first_arg) = parts.next() else {
+                writeln!(stdout, "{}", policy_usage().dark_grey())?;
+                return Ok(());
+            };
+            let Some((subject, resource)) =
+                parse_policy_subject_and_resource(first_arg, &mut parts)
+            else {
                 writeln!(stdout, "{}", policy_usage().dark_grey())?;
                 return Ok(());
             };
@@ -750,7 +865,7 @@ fn handle_policy_command(
             } else {
                 parts.next().map(str::to_string)
             };
-            if scope == "session" && target.is_none() {
+            if subject == DEFAULT_POLICY_SUBJECT && scope == "session" && target.is_none() {
                 target = shell_state.active_conversation.clone();
             }
             if matches!(scope, "session" | "task" | "once") && target.is_none() {
@@ -775,7 +890,7 @@ fn handle_policy_command(
             };
             match request_upsert_policy(
                 next_control_id(msg_counter),
-                "shell_request".into(),
+                subject,
                 "invoke_skill".into(),
                 resource.to_string(),
                 decision.to_string(),
@@ -790,6 +905,130 @@ fn handle_policy_command(
         _ => {
             writeln!(stdout, "{}", policy_usage().dark_grey())?;
         }
+    }
+
+    Ok(())
+}
+
+fn handle_jobs_command(args: &str, msg_counter: &mut u64, stdout: &mut Stdout) -> io::Result<()> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() || trimmed == "list" {
+        match request_scheduled_jobs(next_control_id(msg_counter), RECENT_JOB_LIMIT) {
+            Ok(jobs) => render_scheduled_jobs(stdout, &jobs)?,
+            Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+        }
+        return Ok(());
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let subcommand = parts.next().unwrap_or_default();
+    match subcommand {
+        "every" => {
+            let Some(interval_text) = parts.next() else {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            };
+            let interval_seconds = match parse_job_interval_seconds(interval_text) {
+                Ok(seconds) => seconds,
+                Err(reason) => {
+                    writeln!(stdout, "{}", reason.red())?;
+                    return Ok(());
+                }
+            };
+            let prompt = parts.collect::<Vec<_>>().join(" ");
+            if prompt.trim().is_empty() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            let name = truncate_text(prompt.trim(), 48);
+            match request_create_scheduled_job(
+                next_control_id(msg_counter),
+                name,
+                prompt,
+                interval_seconds,
+            ) {
+                Ok(job) => render_scheduled_job_mutation(stdout, &job)?,
+                Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+            }
+        }
+        "delete" | "rm" => {
+            let Some(job_id) = parts.next() else {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            };
+            if parts.next().is_some() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            match request_delete_scheduled_job(next_control_id(msg_counter), job_id.to_string()) {
+                Ok(job_id) => writeln!(
+                    stdout,
+                    "{}",
+                    format!("deleted job {}", short_id(&job_id)).green()
+                )?,
+                Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+            }
+        }
+        _ => {
+            writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_approve_command(
+    args: &str,
+    shell_state: &mut ShellState,
+    msg_counter: &mut u64,
+    stdout: &mut Stdout,
+) -> io::Result<()> {
+    let mut parts = args.trim().split_whitespace();
+    let Some(requested_target) = parts.next() else {
+        writeln!(stdout, "{}", approve_usage().dark_grey())?;
+        return Ok(());
+    };
+    let Some(grant_scope) = parts.next() else {
+        writeln!(stdout, "{}", approve_usage().dark_grey())?;
+        return Ok(());
+    };
+    let note_text = {
+        let rest = parts.collect::<Vec<_>>().join(" ");
+        if rest.is_empty() {
+            None
+        } else {
+            Some(rest)
+        }
+    };
+    let task_run_id = if requested_target.eq_ignore_ascii_case("latest")
+        || requested_target.parse::<usize>().is_ok()
+    {
+        match request_recent_tasks(next_control_id(msg_counter), RECENT_TASK_LIMIT) {
+            Ok(tasks) => match resolve_waiting_approval_alias(&tasks, requested_target) {
+                Ok(task) => task.task_run_id.clone(),
+                Err(reason) => {
+                    writeln!(stdout, "{}", reason.red())?;
+                    return Ok(());
+                }
+            },
+            Err(err) => {
+                writeln!(stdout, "{}", round_trip_error_text(err).red())?;
+                return Ok(());
+            }
+        }
+    } else {
+        requested_target.to_string()
+    };
+
+    match request_approval_resolution(
+        next_control_id(msg_counter),
+        task_run_id,
+        grant_scope.to_string(),
+        note_text,
+        stdout,
+    ) {
+        Ok(outcome) => apply_round_trip_outcome(shell_state, outcome, stdout)?,
+        Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
     }
 
     Ok(())
@@ -846,7 +1085,82 @@ fn render_policy_mutation(
         stdout,
         "{}",
         format!(
-            "{} policy {} [{}/{}] {}",
+            "{} policy {} [{}/{}] {} {}",
+            verb,
+            short_id(&policy.policy_id),
+            policy.decision,
+            policy.grant_scope,
+            policy.subject,
+            policy.resource
+        )
+        .green()
+    )
+}
+
+fn render_scheduled_jobs(stdout: &mut Stdout, jobs: &[ScheduledJobSummary]) -> io::Result<()> {
+    if jobs.is_empty() {
+        writeln!(stdout, "{}", "no scheduled jobs yet".dark_grey())?;
+        writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "{}", "scheduled jobs".bold().cyan())?;
+    for job in jobs {
+        let enabled = if job.enabled { "active" } else { "deleted" };
+        let last_status = job.last_run_status.as_deref().unwrap_or("never-run");
+        writeln!(
+            stdout,
+            "{} [{} every {} {}] {}",
+            short_id(&job.job_id),
+            enabled,
+            format_job_interval(job.interval_seconds),
+            format_next_due(job.next_run_at_ms),
+            job.name
+        )?;
+        writeln!(stdout, "{}", format!("  last: {last_status}").dark_grey())?;
+        writeln!(
+            stdout,
+            "{}",
+            format!("  prompt: {}", job.prompt_preview).dark_grey()
+        )?;
+        if let Some(task_run_id) = job.last_task_run_id.as_deref() {
+            writeln!(
+                stdout,
+                "{}",
+                format!("  latest run: {}", short_id(task_run_id)).dark_grey()
+            )?;
+        }
+    }
+    writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+    Ok(())
+}
+
+fn render_scheduled_job_mutation(stdout: &mut Stdout, job: &ScheduledJobSummary) -> io::Result<()> {
+    writeln!(
+        stdout,
+        "{}",
+        format!(
+            "created job {} [every {} {}] {}",
+            short_id(&job.job_id),
+            format_job_interval(job.interval_seconds),
+            format_next_due(job.next_run_at_ms),
+            job.name
+        )
+        .green()
+    )
+}
+
+fn render_approval_resolution(
+    stdout: &mut Stdout,
+    policy: &PolicySummary,
+    created: bool,
+) -> io::Result<()> {
+    let verb = if created { "approved" } else { "reapproved" };
+    writeln!(
+        stdout,
+        "{}",
+        format!(
+            "{} waiting request via policy {} [{}/{}] {}",
             verb,
             short_id(&policy.policy_id),
             policy.decision,
@@ -858,7 +1172,36 @@ fn render_policy_mutation(
 }
 
 fn policy_usage() -> &'static str {
-    "usage: /policy list | /policy <allow|deny|require-approval> <resource> <persistent|session|task|once> [target-id-prefix] [note...] | /policy delete <policy-id-prefix>"
+    "usage: /policy list | /policy <allow|deny|require-approval> [shell_request|scheduled_job] <resource> <persistent|session|task|once> [target-id-prefix] [note...] | /policy delete <policy-id-prefix>"
+}
+
+fn jobs_usage() -> &'static str {
+    "usage: /jobs list | /jobs every <seconds> <prompt...> | /jobs delete <job-id-prefix>"
+}
+
+fn approve_usage() -> &'static str {
+    "usage: /approve <latest|approval-number|task-run-id-prefix> <once|task|session|persistent> [note...]"
+}
+
+fn task_kind_label(task_kind: &str) -> &str {
+    match task_kind {
+        "shell_request" => "shell",
+        "scheduled_job" => "job",
+        _ => task_kind,
+    }
+}
+
+fn parse_policy_subject_and_resource<'a>(
+    first_arg: &'a str,
+    parts: &mut std::str::SplitWhitespace<'a>,
+) -> Option<(String, &'a str)> {
+    match first_arg {
+        DEFAULT_POLICY_SUBJECT | SCHEDULED_JOB_POLICY_SUBJECT => {
+            let resource = parts.next()?;
+            Some((first_arg.to_string(), resource))
+        }
+        _ => Some((DEFAULT_POLICY_SUBJECT.into(), first_arg)),
+    }
 }
 
 fn request_runtime_policies(id: String, limit: u32) -> Result<Vec<PolicySummary>, RoundTripError> {
@@ -890,6 +1233,50 @@ fn request_runtime_policies(id: String, limit: u32) -> Result<Vec<PolicySummary>
                 policies,
             } if list_id == id => return Ok(policies),
             ServerMessage::PolicyList { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+fn request_scheduled_jobs(
+    id: String,
+    limit: u32,
+) -> Result<Vec<ScheduledJobSummary>, RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::ListScheduledJobs {
+        id: id.clone(),
+        limit,
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::ScheduledJobList { id: list_id, jobs } if list_id == id => {
+                return Ok(jobs);
+            }
+            ServerMessage::ScheduledJobList { .. } => {}
             ServerMessage::Error {
                 id: err_id,
                 code,
@@ -961,6 +1348,54 @@ fn request_upsert_policy(
     }
 }
 
+fn request_create_scheduled_job(
+    id: String,
+    name: String,
+    prompt: String,
+    interval_seconds: u64,
+) -> Result<ScheduledJobSummary, RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::CreateScheduledJob {
+        id: id.clone(),
+        name,
+        prompt,
+        interval_seconds,
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::ScheduledJobMutationResult { id: result_id, job } if result_id == id => {
+                return Ok(job);
+            }
+            ServerMessage::ScheduledJobMutationResult { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            _ => {}
+        }
+    }
+}
+
 fn request_delete_policy(id: String, policy_id: String) -> Result<String, RoundTripError> {
     let mut stream = UnixStream::connect(BUNZOD_SOCKET)
         .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
@@ -1003,6 +1438,177 @@ fn request_delete_policy(id: String, policy_id: String) -> Result<String, RoundT
     }
 }
 
+fn request_delete_scheduled_job(id: String, job_id: String) -> Result<String, RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::DeleteScheduledJob {
+        id: id.clone(),
+        job_id,
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::ScheduledJobDeleteResult {
+                id: result_id,
+                job_id,
+            } if result_id == id => {
+                return Ok(job_id);
+            }
+            ServerMessage::ScheduledJobDeleteResult { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+fn request_approval_resolution(
+    id: String,
+    task_run_id: String,
+    grant_scope: String,
+    note_text: Option<String>,
+    stdout: &mut Stdout,
+) -> Result<RoundTripOutcome, RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::ResolveApproval {
+        id: id.clone(),
+        task_run_id,
+        grant_scope,
+        note_text,
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    let mut outcome: Option<RoundTripOutcome> = None;
+    let mut assistant_tag_open = false;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection mid-stream".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::RequestContext {
+                id: ctx_id,
+                conversation_id,
+                created_conversation,
+                ..
+            } if ctx_id == id => {
+                outcome = Some(RoundTripOutcome {
+                    conversation_id,
+                    created_conversation,
+                });
+            }
+            ServerMessage::RequestContext { .. } => {}
+            ServerMessage::PolicyMutationResult {
+                id: result_id,
+                policy,
+                created,
+            } if result_id == id => {
+                render_approval_resolution(stdout, &policy, created)
+                    .map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+            }
+            ServerMessage::PolicyMutationResult { .. } => {}
+            ServerMessage::AssistantChunk { id: chunk_id, text } if chunk_id == id => {
+                if !assistant_tag_open {
+                    write!(stdout, "{} ", "bunzo".bold().magenta())
+                        .map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+                    assistant_tag_open = true;
+                }
+                write!(stdout, "{text}").map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+                stdout
+                    .flush()
+                    .map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+            }
+            ServerMessage::AssistantChunk { .. } => {}
+            ServerMessage::AssistantEnd { id: end_id, .. } if end_id == id => {
+                return outcome.ok_or_else(|| {
+                    RoundTripError::Protocol(
+                        "bunzod ended the approval flow without request context".into(),
+                    )
+                });
+            }
+            ServerMessage::AssistantEnd { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            ServerMessage::ToolActivity {
+                id: act_id,
+                name,
+                phase,
+                detail,
+            } if act_id == id => {
+                render_tool_activity(stdout, &name, &phase, &detail)
+                    .map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+                assistant_tag_open = true;
+            }
+            ServerMessage::ToolActivity { .. } => {}
+            ServerMessage::PolicyDecision {
+                id: policy_id,
+                action,
+                resource,
+                decision,
+                grant_scope,
+                detail,
+                ..
+            } if policy_id == id => {
+                render_policy_decision(
+                    stdout,
+                    &action,
+                    &resource,
+                    &decision,
+                    &grant_scope,
+                    &detail,
+                )
+                .map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+                assistant_tag_open = true;
+            }
+            ServerMessage::PolicyDecision { .. } => {}
+            ServerMessage::ConversationList { .. } => {}
+            ServerMessage::TaskList { .. } => {}
+            ServerMessage::PolicyList { .. } => {}
+            ServerMessage::PolicyDeleteResult { .. } => {}
+            ServerMessage::ScheduledJobList { .. } => {}
+            ServerMessage::ScheduledJobMutationResult { .. } => {}
+            ServerMessage::ScheduledJobDeleteResult { .. } => {}
+        }
+    }
+}
+
 fn resolve_recent_conversation<'a>(
     conversations: &'a [ConversationSummary],
     prefix: &str,
@@ -1021,9 +1627,56 @@ fn resolve_recent_conversation<'a>(
     Ok(first)
 }
 
+fn is_waiting_approval(task: &TaskSummary) -> bool {
+    task.state_reason_code.as_deref() == Some("policy_approval_required")
+        && !task.task_run_id.is_empty()
+}
+
+fn waiting_approval_tasks<'a>(tasks: &'a [TaskSummary]) -> Vec<&'a TaskSummary> {
+    tasks
+        .iter()
+        .filter(|task| is_waiting_approval(task))
+        .collect()
+}
+
+fn resolve_waiting_approval_alias<'a>(
+    tasks: &'a [TaskSummary],
+    requested: &str,
+) -> Result<&'a TaskSummary, String> {
+    let approvals = waiting_approval_tasks(tasks);
+    if approvals.is_empty() {
+        return Err("no waiting approvals in the recent task list".into());
+    }
+
+    if requested.eq_ignore_ascii_case("latest") {
+        return Ok(approvals[0]);
+    }
+
+    let index = requested.parse::<usize>().map_err(|_| {
+        format!("approval alias '{requested}' must be 'latest' or a positive number")
+    })?;
+    if index == 0 {
+        return Err("approval number must start at 1".into());
+    }
+    approvals
+        .get(index - 1)
+        .copied()
+        .ok_or_else(|| format!("no waiting approval #{index} in the recent task list"))
+}
+
 fn next_control_id(msg_counter: &mut u64) -> String {
     *msg_counter = msg_counter.wrapping_add(1);
     format!("ctl{}", *msg_counter)
+}
+
+fn parse_job_interval_seconds(input: &str) -> Result<u64, String> {
+    let seconds = input
+        .parse::<u64>()
+        .map_err(|_| format!("job interval '{input}' must be an integer number of seconds"))?;
+    if seconds < 5 {
+        return Err("job interval must be at least 5 seconds".into());
+    }
+    Ok(seconds)
 }
 
 fn command_args<'a>(input: &'a str, commands: &[&str]) -> Option<&'a str> {
@@ -1047,6 +1700,44 @@ fn short_id(id: &str) -> &str {
         .map(|(idx, _)| idx)
         .unwrap_or(id.len());
     &id[..end]
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn format_job_interval(seconds: u64) -> String {
+    if seconds % 3600 == 0 {
+        format!("{}h", seconds / 3600)
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn format_next_due(next_run_at_ms: u64) -> String {
+    let now = now_ms();
+    if next_run_at_ms <= now {
+        return "due now".into();
+    }
+    let remaining = (next_run_at_ms - now) / 1000;
+    format!("next in {}", format_job_interval(remaining.max(1)))
 }
 
 fn round_trip_error_text(err: RoundTripError) -> String {
@@ -1298,6 +1989,26 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 mod tests {
     use super::*;
 
+    fn task_summary(
+        task_id: &str,
+        task_run_id: &str,
+        state_reason_code: Option<&str>,
+    ) -> TaskSummary {
+        TaskSummary {
+            task_id: task_id.into(),
+            conversation_id: format!("conv-{task_id}"),
+            task_run_id: task_run_id.into(),
+            task_kind: "shell_request".into(),
+            updated_at_ms: 0,
+            task_status: "waiting".into(),
+            run_status: "waiting".into(),
+            summary: format!("summary-{task_id}"),
+            state_reason_code: state_reason_code.map(str::to_string),
+            state_reason_text: None,
+            snapshot_kind: Some("shell_request_waiting_v1".into()),
+        }
+    }
+
     #[test]
     fn setup_offer_matches_config_errors() {
         assert!(should_offer_setup(
@@ -1345,5 +2056,56 @@ mod tests {
         assert_eq!(shell_state.active_conversation.as_deref(), Some("c1"));
         let rendered = String::from_utf8(buf).unwrap();
         assert!(rendered.contains("/conversations new"));
+    }
+
+    #[test]
+    fn waiting_approval_alias_resolves_latest() {
+        let tasks = vec![
+            task_summary("t1", "run-1", Some("policy_approval_required")),
+            task_summary("t2", "run-2", Some("policy_approval_required")),
+        ];
+
+        let resolved = resolve_waiting_approval_alias(&tasks, "latest").unwrap();
+        assert_eq!(resolved.task_run_id, "run-1");
+    }
+
+    #[test]
+    fn waiting_approval_alias_resolves_numeric_index() {
+        let tasks = vec![
+            task_summary("t1", "run-1", Some("policy_approval_required")),
+            task_summary("t2", "run-2", Some("other_wait")),
+            task_summary("t3", "run-3", Some("policy_approval_required")),
+        ];
+
+        let resolved = resolve_waiting_approval_alias(&tasks, "2").unwrap();
+        assert_eq!(resolved.task_run_id, "run-3");
+    }
+
+    #[test]
+    fn waiting_approval_alias_rejects_missing_index() {
+        let tasks = vec![task_summary(
+            "t1",
+            "run-1",
+            Some("policy_approval_required"),
+        )];
+
+        let err = resolve_waiting_approval_alias(&tasks, "2").unwrap_err();
+        assert!(err.contains("no waiting approval #2"));
+    }
+
+    #[test]
+    fn parse_policy_subject_defaults_to_shell_request() {
+        let mut parts = "read-local-file persistent".split_whitespace();
+        let parsed = parse_policy_subject_and_resource(parts.next().unwrap(), &mut parts).unwrap();
+        assert_eq!(parsed.0, "shell_request");
+        assert_eq!(parsed.1, "read-local-file");
+    }
+
+    #[test]
+    fn parse_policy_subject_accepts_scheduled_job() {
+        let mut parts = "scheduled_job read-local-file persistent".split_whitespace();
+        let parsed = parse_policy_subject_and_resource(parts.next().unwrap(), &mut parts).unwrap();
+        assert_eq!(parsed.0, "scheduled_job");
+        assert_eq!(parsed.1, "read-local-file");
     }
 }

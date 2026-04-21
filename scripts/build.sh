@@ -68,7 +68,7 @@ if [[ -n "${RUST_TARGET}" && -f "${REPO_ROOT}/rust/Cargo.toml" ]]; then
     CARGO_BIN_BASE="${CARGO_TARGET_DIR:-${REPO_ROOT}/rust/target}"
     OVERLAY_BIN_DIR="${BOARD_DIR}/bunzo/common/rootfs-overlay/usr/bin"
     mkdir -p "${OVERLAY_BIN_DIR}"
-    for bin in bunzo-shell bunzod; do
+    for bin in bunzo-shell bunzod bunzo-schedulerd; do
         BIN_PATH="${CARGO_BIN_BASE}/${RUST_TARGET}/release/${bin}"
         if [[ ! -x "${BIN_PATH}" ]]; then
             echo "build: cargo build succeeded but ${BIN_PATH} is missing" >&2
@@ -76,7 +76,7 @@ if [[ -n "${RUST_TARGET}" && -f "${REPO_ROOT}/rust/Cargo.toml" ]]; then
         fi
         install -m 0755 "${BIN_PATH}" "${OVERLAY_BIN_DIR}/${bin}"
     done
-    echo "build: staged bunzo-shell + bunzod into overlay"
+    echo "build: staged bunzo-shell + bunzod + bunzo-schedulerd into overlay"
 
     # --- WASM skills ---
     # Each entry in rust/skills/<name>/ is a standalone Cargo crate producing

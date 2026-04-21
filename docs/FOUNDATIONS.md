@@ -29,6 +29,26 @@ Do **not** chase multi-agent coordination before these four land. Right now
 the missing pieces are not "more agents"; they are durable state, authority,
 and deterministic system ownership.
 
+## Current status (2026-04-21)
+
+- **Workstream 1 is operationally closed in QEMU.** The canonical runtime
+  store now lives under `/var/lib/bunzo/state/runtime.sqlite3`, conversations
+  and task state survive reboot, and `bunzo-shell` can list/resume recent
+  conversations and tasks through `/conversations` and `/tasks`.
+- **Workstream 2 is operationally closed for interactive shell work in QEMU.**
+  Runtime policy exists as durable state in the same SQLite store; `bunzod`
+  evaluates it in front of skill invocation while keeping manifests as the hard
+  capability ceiling; `bunzo-shell` can author/list/delete rules through
+  `/policy`; approval-required tasks can be resumed in-product through
+  `/approve`; and first-time unmatched tool use now pauses on
+  `require_approval` / `once` instead of implicitly allowing the action.
+- **Workstream 4 now has a live first slice in QEMU.** `bunzo-schedulerd`
+  exists as a dedicated local service, interval jobs are durable in the shared
+  runtime store, `/jobs` can create/list/delete them from `bunzo-shell`, and
+  each firing creates a normal `scheduled_job` task run through the same
+  evaluator/default path as interactive work. Remaining work is scheduler
+  hardening plus the provisioning engine.
+
 ## Foundation decisions
 
 These are the planning assumptions for the next phase.
@@ -99,6 +119,11 @@ The first implementation slice should be intentionally narrow:
 - The runtime can store "task is waiting", "task completed", and "task failed"
   as durable state instead of inferring that from logs.
 
+**Status (2026-04-20):** operationally closed for the QEMU development loop.
+Fresh-image `waiting` behavior, `/tasks` + `/conversations`, and reboot
+persistence are all verified in QEMU. Real-hardware replay is still deferred
+follow-up work, not the blocker for moving forward.
+
 ## Workstream 2 — policy engine
 
 ### Goal
@@ -137,6 +162,18 @@ Persist policy state in bunzo-owned runtime data, not in shell-local memory.
 2. Add a policy evaluator in front of skill invocation.
 3. Add durable grants/denials with audit records.
 4. Surface denials and approvals in the shell as first-class runtime events.
+
+**Status (2026-04-21):** this slice is delivered and QEMU-verified, and the
+interactive shell path has already moved beyond it. Runtime policy rules
+persist in the SQLite store; denials and approval-needed decisions surface as
+first-class shell/runtime events; `/policy` can now list/create/delete rules
+directly from `bunzo-shell`; `require_approval` leaves the affected task in
+durable `waiting` with a resumable snapshot; `/approve` can resolve that wait
+at `once` / `task` / `session` / `persistent`; and unmatched shell tool use now
+defaults to `require_approval` / `once`. That same evaluator/default posture
+now covers the first scheduler-created run path too; remaining policy follow-on
+work is about future subjects such as provisioning and richer scheduler
+semantics, not the core scheduler handoff.
 
 ### Exit criteria
 
@@ -224,6 +261,18 @@ interactive requests.
 - bunzo can run a routine such as "check X every morning" without custom glue.
 - Each scheduled run is resumable, auditable, and policy-bounded.
 - Scheduler failures do not disappear into logs; they appear as task/job state.
+
+**Status (2026-04-21):** the first slice is delivered and QEMU-verified.
+`bunzo-schedulerd` now claims durable interval jobs from the shared SQLite
+runtime store, records `scheduled_job_runs`, and creates normal
+`scheduled_job` task/task-run state through the same runtime execution path as
+interactive shell work. `bunzo-shell` exposes `/jobs list`,
+`/jobs every <seconds> <prompt...>`, and `/jobs delete <job-id-prefix>`. On
+image, `/jobs every 10 what OS is this?` created a recurring job whose first
+run paused in durable `waiting` on the default `require_approval` / `once`
+policy posture; `/approve latest persistent` resumed that same waiting run; and
+later firings completed through the same task/policy path. Remaining M8 work is
+richer schedules plus persisted retry/backoff policy.
 
 ## Milestone order
 

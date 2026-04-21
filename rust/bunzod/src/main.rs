@@ -1,38 +1,24 @@
-//! bunzod — bunzo's agent daemon.
+//! bunzod — bunzo's interactive socket daemon.
 //!
 //! Listens on /run/bunzod.sock (or a systemd-activated socket), speaks the
-//! bunzo wire protocol v1 from `bunzo-proto`, and streams replies back to
-//! the chat shell via the configured LLM backend. The model can call skills
-//! — WASM modules loaded from `/usr/lib/bunzo/skills` at startup — and each
-//! completed exchange (including any skill invocations) is appended to the
-//! action ledger.
-
-mod backend;
-mod config;
-mod ledger;
-mod policy;
-mod skills;
-mod store;
-
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Instant;
+//! bunzo wire protocol v1 from `bunzo-proto`, and hands prepared requests to
+//! the shared runtime execution path used by both the shell and scheduler.
 
 use anyhow::{Context, Result};
 use bunzo_proto::async_io::{read_frame_async, write_frame_async};
 use bunzo_proto::{ClientFrame, ClientMessage, Envelope, ServerMessage, PROTOCOL_VERSION};
+use bunzod::ledger::Ledger;
+use bunzod::policy::{Decision as PolicyDecision, GrantScope, NewRuntimePolicy};
+use bunzod::runtime;
+use bunzod::skills::{self, Registry};
+use bunzod::store::{self, LookupError, PrepareRequestError, RuntimeStore, WaitingApprovalError};
 use listenfd::ListenFd;
 use sd_notify::NotifyState;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::sync::Arc;
 use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
-
-use crate::backend::BackendEvent;
-use crate::ledger::{Entry, Ledger, ToolRecord};
-use crate::policy::{Decision as PolicyDecision, GrantScope, NewRuntimePolicy, ToolPolicyContext};
-use crate::skills::Registry;
-use crate::store::{LookupError, PrepareRequestError, RuntimeStore};
 
 const SOCKET_PATH: &str = "/run/bunzod.sock";
 
@@ -136,6 +122,9 @@ async fn handle_connection(
             ClientMessage::ListPolicies { id, limit } => {
                 handle_list_policies(&mut write_half, &id, limit, &store).await?;
             }
+            ClientMessage::ListScheduledJobs { id, limit } => {
+                handle_list_scheduled_jobs(&mut write_half, &id, limit, &store).await?;
+            }
             ClientMessage::UpsertPolicy {
                 id,
                 subject,
@@ -163,6 +152,43 @@ async fn handle_connection(
             ClientMessage::DeletePolicy { id, policy_id } => {
                 handle_delete_policy(&mut write_half, &id, &policy_id, &store).await?;
             }
+            ClientMessage::CreateScheduledJob {
+                id,
+                name,
+                prompt,
+                interval_seconds,
+            } => {
+                handle_create_scheduled_job(
+                    &mut write_half,
+                    &id,
+                    &name,
+                    &prompt,
+                    interval_seconds,
+                    &store,
+                )
+                .await?;
+            }
+            ClientMessage::DeleteScheduledJob { id, job_id } => {
+                handle_delete_scheduled_job(&mut write_half, &id, &job_id, &store).await?;
+            }
+            ClientMessage::ResolveApproval {
+                id,
+                task_run_id,
+                grant_scope,
+                note_text,
+            } => {
+                handle_resolve_approval(
+                    &mut write_half,
+                    &id,
+                    &task_run_id,
+                    &grant_scope,
+                    note_text.as_deref(),
+                    &ledger,
+                    &store,
+                    registry.clone(),
+                )
+                .await?;
+            }
             ClientMessage::Cancel { id: _ } => {
                 // In-flight request cancellation is not wired yet; the real
                 // hook is an abort-handle on the backend task, added when a
@@ -184,7 +210,6 @@ async fn handle_user_message<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let started = Instant::now();
     let request = match store.prepare_shell_request(id, requested_conversation, user_text) {
         Ok(request) => request,
         Err(PrepareRequestError::ConversationNotFound(requested)) => {
@@ -212,205 +237,173 @@ where
                 .await;
         }
     };
-    let request_context = Envelope::new(ServerMessage::RequestContext {
-        id: id.into(),
-        conversation_id: request.conversation_id.clone(),
-        task_id: request.task_id.clone(),
-        task_run_id: request.task_run_id.clone(),
-        created_conversation: request.created_conversation,
-    });
-    write_frame_async(w, &request_context).await?;
+    write_request_context(w, id, &request).await?;
 
-    let cfg = match config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            let text = format!("{e:#}");
-            persist_request_waiting(store, &request, "unconfigured", &text, None);
-            return finish_with_error(w, id, "unconfigured", &text, "waiting").await;
+    runtime::execute_prepared_request(w, id, request, ledger, store, registry).await
+}
+
+async fn handle_resolve_approval<W>(
+    w: &mut W,
+    id: &str,
+    requested_task_run: &str,
+    grant_scope: &str,
+    note_text: Option<&str>,
+    ledger: &Ledger,
+    store: &RuntimeStore,
+    registry: Registry,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let grant_scope = match GrantScope::from_str(grant_scope) {
+        Some(scope) => scope,
+        None => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "invalid_policy_scope".into(),
+                text: format!("unsupported approval scope '{grant_scope}'"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
         }
     };
 
-    let backend = match backend::load_from_config(cfg) {
-        Ok(b) => b,
-        Err(e) => {
-            let text = format!("{e:#}");
-            persist_request_waiting(store, &request, "backend_init_failed", &text, None);
-            return finish_with_error(w, id, "backend_init_failed", &text, "waiting").await;
+    let waiting = match store.load_waiting_approval(requested_task_run) {
+        Ok(waiting) => waiting,
+        Err(WaitingApprovalError::NotFound(requested)) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "task_run_not_found".into(),
+                text: format!("task run '{requested}' was not found"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+        Err(WaitingApprovalError::Ambiguous(requested)) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "task_run_ambiguous".into(),
+                text: format!("task run prefix '{requested}' matches multiple records"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+        Err(WaitingApprovalError::NotWaiting(task_run_id)) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "task_run_not_waiting".into(),
+                text: format!("task run '{task_run_id}' is not waiting"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+        Err(WaitingApprovalError::ApprovalNotRequired(task_run_id)) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "approval_not_required".into(),
+                text: format!(
+                    "task run '{task_run_id}' is waiting for something other than approval"
+                ),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+        Err(WaitingApprovalError::SnapshotMissing(task_run_id))
+        | Err(WaitingApprovalError::SnapshotInvalid(task_run_id)) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "task_run_not_resumable".into(),
+                text: format!("task run '{task_run_id}' has no valid resumable snapshot"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+        Err(WaitingApprovalError::PolicyContextMissing(task_run_id)) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "approval_context_missing".into(),
+                text: format!("task run '{task_run_id}' has no approval policy context"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+        Err(WaitingApprovalError::Store(e)) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "runtime_store_error".into(),
+                text: format!("{e:#}"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
         }
     };
-    let backend_name: &'static str = backend.name();
-    if let Err(e) = store.mark_shell_request_running(&request, Some(backend_name)) {
-        eprintln!("bunzod: runtime-store running transition failed: {e:#}");
-    }
 
-    let (tx, mut rx) = mpsc::channel::<BackendEvent>(32);
-    let messages = request.history.clone();
-    let policy = ToolPolicyContext::new(store.clone(), request.clone());
-    let backend_task = tokio::spawn(async move {
-        backend
-            .stream_complete(messages, registry, policy, tx)
-            .await
-    });
-
-    let mut assistant_acc = String::new();
-    let mut tool_records: Vec<ToolRecord> = Vec::new();
-    let mut saw_error = false;
-    let mut error_code: Option<&'static str> = None;
-    let mut error_text: Option<String> = None;
-    let mut waiting_policy = None;
-
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            BackendEvent::Chunk(chunk) => {
-                assistant_acc.push_str(&chunk);
-                let frame = Envelope::new(ServerMessage::AssistantChunk {
-                    id: id.into(),
-                    text: chunk,
-                });
-                write_frame_async(w, &frame).await?;
-            }
-            BackendEvent::PolicyDecision { evaluation } => {
-                let frame = Envelope::new(ServerMessage::PolicyDecision {
-                    id: id.into(),
-                    subject: evaluation.subject.clone(),
-                    action: evaluation.action.clone(),
-                    resource: evaluation.resource.clone(),
-                    decision: evaluation.decision.as_str().into(),
-                    grant_scope: evaluation.grant_scope.as_str().into(),
-                    detail: evaluation.detail.clone(),
-                });
-                write_frame_async(w, &frame).await?;
-                if evaluation.decision == PolicyDecision::RequireApproval {
-                    waiting_policy = Some(evaluation);
-                }
-            }
-            BackendEvent::ToolInvoke { name } => {
-                let frame = Envelope::new(ServerMessage::ToolActivity {
-                    id: id.into(),
-                    name: name.clone(),
-                    phase: "invoke".into(),
-                    detail: String::new(),
-                });
-                write_frame_async(w, &frame).await?;
-                if let Err(e) = store.record_tool_invoke(&request, &name) {
-                    eprintln!("bunzod: runtime-store tool invoke failed: {e:#}");
-                }
-            }
-            BackendEvent::ToolResult {
-                name,
-                ok,
-                latency_ms,
-                detail,
-            } => {
-                if let Err(e) = store.record_tool_result(&request, &name, ok, latency_ms, &detail) {
-                    eprintln!("bunzod: runtime-store tool result failed: {e:#}");
-                }
-                let frame = Envelope::new(ServerMessage::ToolActivity {
-                    id: id.into(),
-                    name: name.clone(),
-                    phase: if ok { "ok".into() } else { "error".into() },
-                    detail,
-                });
-                write_frame_async(w, &frame).await?;
-                tool_records.push(ToolRecord {
-                    name,
-                    ok,
-                    latency_ms,
-                });
-            }
-            BackendEvent::Error(e) => {
-                let err = Envelope::new(ServerMessage::Error {
-                    id: id.into(),
-                    code: "backend_error".into(),
-                    text: format!("{e:#}"),
-                });
-                write_frame_async(w, &err).await?;
-                saw_error = true;
-                error_code = Some("backend_error");
-                error_text = Some(format!("{e:#}"));
-                break;
-            }
-        }
-    }
-
-    match backend_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) if !saw_error => {
-            let text = format!("{e:#}");
-            let err = Envelope::new(ServerMessage::Error {
-                id: id.into(),
-                code: "backend_error".into(),
-                text: text.clone(),
-            });
-            write_frame_async(w, &err).await?;
-            saw_error = true;
-            error_code = Some("backend_error");
-            error_text = Some(text);
-        }
-        Err(e) if !saw_error => {
-            let text = format!("backend task failed: {e}");
-            let err = Envelope::new(ServerMessage::Error {
-                id: id.into(),
-                code: "backend_error".into(),
-                text: text.clone(),
-            });
-            write_frame_async(w, &err).await?;
-            saw_error = true;
-            error_code = Some("backend_error");
-            error_text = Some(text);
-        }
-        _ => {}
-    }
-
-    if let Some(policy) = waiting_policy {
-        let end = Envelope::new(ServerMessage::AssistantEnd {
-            id: id.into(),
-            finish_reason: "waiting".into(),
-        });
-        write_frame_async(w, &end).await?;
-        persist_request_waiting(
-            store,
-            &request,
-            "policy_approval_required",
-            &policy.detail,
-            Some(&assistant_acc),
-        );
-        return Ok(());
-    }
-
-    let finish_reason = if saw_error { "error" } else { "stop" };
-    let end = Envelope::new(ServerMessage::AssistantEnd {
-        id: id.into(),
-        finish_reason: finish_reason.into(),
-    });
-    write_frame_async(w, &end).await?;
-
-    persist_request_finish(
-        store,
-        &request,
-        &assistant_acc,
-        finish_reason,
-        Some(backend_name),
-        error_code,
-        error_text.as_deref(),
+    let default_note = format!(
+        "approved waiting task {} to allow {} {} [{}]",
+        waiting.request.task_run_id,
+        waiting.action,
+        waiting.resource,
+        grant_scope.as_str()
     );
-
-    if let Err(e) = ledger.append(&Entry {
-        ts_ms: ledger::now_ms(),
-        conv_id: &request.conversation_id,
-        task_id: Some(&request.task_id),
-        task_run_id: Some(&request.task_run_id),
-        user: user_text,
-        assistant: &assistant_acc,
-        backend: backend_name,
-        latency_ms: started.elapsed().as_millis(),
-        finish_reason,
-        tool_calls: &tool_records,
-    }) {
-        eprintln!("bunzod: ledger append failed: {e:#}");
+    let chosen_note = note_text.unwrap_or(&default_note).to_string();
+    if needs_resume_override(waiting.blocking_scope, grant_scope) {
+        let (conversation_id, task_id, task_run_id) =
+            policy_targets_for_request(&waiting.request, waiting.blocking_scope);
+        if let Err(e) = store.upsert_runtime_policy(NewRuntimePolicy {
+            subject: waiting.subject.clone(),
+            action: waiting.action.clone(),
+            resource: waiting.resource.clone(),
+            decision: PolicyDecision::Allow,
+            grant_scope: waiting.blocking_scope,
+            conversation_id,
+            task_id,
+            task_run_id,
+            note_text: Some(format!("{chosen_note} (resume override)")),
+        }) {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "runtime_store_error".into(),
+                text: format!("{e:#}"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
     }
 
-    Ok(())
+    let (conversation_id, task_id, task_run_id) =
+        policy_targets_for_request(&waiting.request, grant_scope);
+    let (policy, created) = match store.upsert_runtime_policy(NewRuntimePolicy {
+        subject: waiting.subject.clone(),
+        action: waiting.action.clone(),
+        resource: waiting.resource.clone(),
+        decision: PolicyDecision::Allow,
+        grant_scope,
+        conversation_id,
+        task_id,
+        task_run_id,
+        note_text: Some(chosen_note),
+    }) {
+        Ok(result) => result,
+        Err(e) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "runtime_store_error".into(),
+                text: format!("{e:#}"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+    };
+
+    let mutation = Envelope::new(ServerMessage::PolicyMutationResult {
+        id: id.into(),
+        policy,
+        created,
+    });
+    write_frame_async(w, &mutation).await?;
+    write_request_context(w, id, &waiting.request).await?;
+
+    runtime::execute_prepared_request(w, id, waiting.request, ledger, store, registry).await
 }
 
 async fn handle_list_conversations<W>(
@@ -480,6 +473,35 @@ where
             let frame = Envelope::new(ServerMessage::PolicyList {
                 id: id.into(),
                 policies,
+            });
+            write_frame_async(w, &frame).await?;
+        }
+        Err(e) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "runtime_store_error".into(),
+                text: format!("{e:#}"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_list_scheduled_jobs<W>(
+    w: &mut W,
+    id: &str,
+    limit: u32,
+    store: &RuntimeStore,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match store.list_scheduled_jobs(limit) {
+        Ok(jobs) => {
+            let frame = Envelope::new(ServerMessage::ScheduledJobList {
+                id: id.into(),
+                jobs,
             });
             write_frame_async(w, &frame).await?;
         }
@@ -643,6 +665,94 @@ where
     Ok(())
 }
 
+async fn handle_create_scheduled_job<W>(
+    w: &mut W,
+    id: &str,
+    name: &str,
+    prompt: &str,
+    interval_seconds: u64,
+    store: &RuntimeStore,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if prompt.trim().is_empty() {
+        let err = Envelope::new(ServerMessage::Error {
+            id: id.into(),
+            code: "invalid_job_prompt".into(),
+            text: "scheduled job prompt must not be empty".into(),
+        });
+        write_frame_async(w, &err).await?;
+        return Ok(());
+    }
+
+    match store.create_scheduled_job(bunzod::store::NewScheduledJob {
+        name: name.to_string(),
+        prompt: prompt.to_string(),
+        interval_seconds,
+    }) {
+        Ok(job) => {
+            let frame =
+                Envelope::new(ServerMessage::ScheduledJobMutationResult { id: id.into(), job });
+            write_frame_async(w, &frame).await?;
+        }
+        Err(e) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "runtime_store_error".into(),
+                text: format!("{e:#}"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_delete_scheduled_job<W>(
+    w: &mut W,
+    id: &str,
+    job_id: &str,
+    store: &RuntimeStore,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match store.delete_scheduled_job(job_id) {
+        Ok(job_id) => {
+            let frame = Envelope::new(ServerMessage::ScheduledJobDeleteResult {
+                id: id.into(),
+                job_id,
+            });
+            write_frame_async(w, &frame).await?;
+        }
+        Err(LookupError::NotFound { kind, value }) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "job_not_found".into(),
+                text: format!("{kind} '{value}' was not found"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+        Err(LookupError::Ambiguous { kind, value }) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "job_ambiguous".into(),
+                text: format!("{kind} prefix '{value}' matches multiple records"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+        Err(LookupError::Store(e)) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "runtime_store_error".into(),
+                text: format!("{e:#}"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+    }
+    Ok(())
+}
+
 fn resolve_policy_target(
     store: &RuntimeStore,
     grant_scope: GrantScope,
@@ -675,6 +785,41 @@ fn resolve_policy_target(
     }
 }
 
+fn policy_targets_for_request(
+    request: &store::PreparedRequest,
+    grant_scope: GrantScope,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match grant_scope {
+        GrantScope::Persistent => (None, None, None),
+        GrantScope::Session => (Some(request.conversation_id.clone()), None, None),
+        GrantScope::Task => (None, Some(request.task_id.clone()), None),
+        GrantScope::Once => (None, None, Some(request.task_run_id.clone())),
+    }
+}
+
+fn needs_resume_override(blocking_scope: GrantScope, chosen_scope: GrantScope) -> bool {
+    blocking_scope.precedence() > chosen_scope.precedence()
+}
+
+async fn write_request_context<W>(
+    w: &mut W,
+    id: &str,
+    request: &store::PreparedRequest,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let request_context = Envelope::new(ServerMessage::RequestContext {
+        id: id.into(),
+        conversation_id: request.conversation_id.clone(),
+        task_id: request.task_id.clone(),
+        task_run_id: request.task_run_id.clone(),
+        created_conversation: request.created_conversation,
+    });
+    write_frame_async(w, &request_context).await?;
+    Ok(())
+}
+
 async fn finish_with_error<W>(
     w: &mut W,
     id: &str,
@@ -699,37 +844,25 @@ where
     Ok(())
 }
 
-fn persist_request_finish(
-    store: &RuntimeStore,
-    request: &store::PreparedRequest,
-    assistant_text: &str,
-    finish_reason: &str,
-    backend: Option<&str>,
-    error_code: Option<&str>,
-    error_text: Option<&str>,
-) {
-    if let Err(e) = store.finish_shell_request(
-        request,
-        assistant_text,
-        finish_reason,
-        backend,
-        error_code,
-        error_text,
-    ) {
-        eprintln!("bunzod: runtime-store finish failed: {e:#}");
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn persist_request_waiting(
-    store: &RuntimeStore,
-    request: &store::PreparedRequest,
-    reason_code: &str,
-    reason_text: &str,
-    assistant_partial_text: Option<&str>,
-) {
-    if let Err(e) =
-        store.wait_shell_request(request, reason_code, reason_text, assistant_partial_text)
-    {
-        eprintln!("bunzod: runtime-store waiting transition failed: {e:#}");
+    #[test]
+    fn broader_grants_add_resume_override_for_narrower_blocking_rules() {
+        assert!(needs_resume_override(
+            GrantScope::Task,
+            GrantScope::Persistent
+        ));
+        assert!(needs_resume_override(
+            GrantScope::Session,
+            GrantScope::Persistent
+        ));
+        assert!(needs_resume_override(GrantScope::Once, GrantScope::Task));
+        assert!(!needs_resume_override(
+            GrantScope::Persistent,
+            GrantScope::Session
+        ));
+        assert!(!needs_resume_override(GrantScope::Task, GrantScope::Task));
     }
 }

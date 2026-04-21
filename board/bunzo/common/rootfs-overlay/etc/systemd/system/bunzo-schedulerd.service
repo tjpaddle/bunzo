@@ -1,0 +1,16 @@
+[Unit]
+Description=bunzo scheduled job runner
+Documentation=https://github.com/tjpaddle/bunzo
+After=network-online.target systemd-tmpfiles-setup.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bunzo-schedulerd
+Restart=always
+RestartSec=2s
+MemoryHigh=192M
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

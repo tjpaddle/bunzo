@@ -6,10 +6,23 @@ bunzo is an operating system built around the idea that AI agents should be a fi
 
 ## Status
 
-Early prototype. QEMU boot, `bunzod`, and the first skill all work in principle, and `bunzo-shell` can now collect an OpenAI API key in-band via `/setup`. The current product direction is **screen-optional**: on headless hardware the user should be able to provision bunzo from a phone, while on desktop-class hardware with a display and keyboard the local shell should remain a normal first-class setup and usage path. See [docs/ROADMAP.md](docs/ROADMAP.md) for milestones.
-The next planned platform phase is: durable context/task state, a real policy
-engine, a provisioning service behind `/setup`, and a scheduler for proactive
-jobs.
+Early prototype, but the runtime foundations are no longer hypothetical. M5 is
+operationally closed in QEMU, the interactive shell path of M6 is operationally
+closed there too, and the first M8 scheduler slice is now live on-image:
+runtime policy lives in the SQLite state store, tool use is approval-first by
+default, `bunzo-shell` ships `/policy`, `/approve`, `/approvals`,
+`/conversations`, `/tasks`, and `/jobs`, and scheduler-fired work now creates
+normal `scheduled_job` task runs through the same runtime/task/policy path as
+interactive requests. The current product direction is still
+**screen-optional**: on headless hardware the user should be able to provision
+bunzo from a phone, while on desktop-class hardware with a display and keyboard
+the local shell should remain a normal first-class setup and usage path. See
+[docs/ROADMAP.md](docs/ROADMAP.md) for milestones.
+
+The next platform work is: move `/setup` behind a real provisioning service,
+harden the new scheduler with richer schedules plus retry/backoff policy, and
+continue replaying the runtime path on real hardware once the provisioning
+surface exists.
 
 ## Building
 

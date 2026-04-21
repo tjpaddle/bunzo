@@ -15,7 +15,7 @@ for f in /etc/os-release /etc/motd /etc/hostname; do
     fi
 done
 
-for unit in bunzo-shell.service bunzod.socket bunzod.service; do
+for unit in bunzo-shell.service bunzod.socket bunzod.service bunzo-schedulerd.service; do
     if [[ ! -f "${TARGET_DIR}/etc/systemd/system/${unit}" ]]; then
         echo "post-build: ${unit} missing from rootfs overlay" >&2
         exit 1
@@ -43,7 +43,7 @@ if [[ ! -f "${TARGET_DIR}/etc/ssh/sshd_config.d/bunzo-dev.conf" ]]; then
     exit 1
 fi
 
-for bin in bunzo-shell bunzod; do
+for bin in bunzo-shell bunzod bunzo-schedulerd; do
     if [[ ! -x "${TARGET_DIR}/usr/bin/${bin}" ]]; then
         echo "post-build: /usr/bin/${bin} missing from rootfs" >&2
         echo "post-build: run cargo build before buildroot (see scripts/build.sh)" >&2
@@ -72,5 +72,6 @@ fi
 
 echo "post-build: bunzo-shell.service enabled via [Install]; recovery via kernel cmdline 'bunzo.recovery'"
 echo "post-build: bunzod.socket enabled via [Install]; bunzod.service is socket-activated (no [Install])"
+echo "post-build: bunzo-schedulerd.service enabled via [Install]; it claims due jobs from the runtime store"
 
 echo "post-build: bunzo rootfs verified ($(grep '^PRETTY_NAME=' "${TARGET_DIR}/etc/os-release"))"

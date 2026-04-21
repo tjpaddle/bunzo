@@ -18,18 +18,18 @@ This document separates **what exists now** (or is actively being built) from **
 ┌───────────────────────────────────────────────────────┐
 │  User interaction                                     │
 │   - provisioning UI (phone-led)   [Later]             │
-│   - local setup shell / console   [Now: M2/M3]        │
+│   - local setup shell / console   [Now: M2/M3/M6/M8]  │
 │   - phone client                  [Later]             │
 │   - voice I/O                     [Later]             │
 ├───────────────────────────────────────────────────────┤
 │  Agent runtime                                        │
 │   - bunzod (agent daemon)         [Now: M3]           │
 │   - skill registry                [Now: M4]           │
-│   - context / task store          [Next: M5]          │
-│   - policy engine                 [Next: M6]          │
-│   - action ledger                 [Now: M3/M4]        │
+│   - context / task store          [Now: M5]           │
+│   - policy engine                 [Now: M6]           │
+│   - action ledger                 [Now: audit sink]   │
 │   - provisioning API / state      [Next: M7]          │
-│   - scheduler / jobs              [Next: M8]          │
+│   - scheduler / jobs              [Now: M8 slice 1]    │
 ├───────────────────────────────────────────────────────┤
 │  System services                                      │
 │   - init + service manager        [Now: M1]           │
@@ -82,25 +82,35 @@ bunzo's own code is written in **Rust**. This is a foundational decision driven 
 - **Init / service manager:** **systemd**. Decided in the M1 scaffolding batch — rejected the "busybox init first, migrate in M2" path because we would have replaced it immediately for socket activation and service supervision. The 20–40 MB cost is acceptable for an agent OS.
 - **Userland:** Buildroot-assembled minimal rootfs — coreutils, bash, openssh, networking tools, `ca-certificates`, `haveged`, `sudo`. No language runtime — bunzo's own code (M2+) is Rust, cross-compiled to static musl binaries and staged via the rootfs overlay.
 - **Identity:** `/etc/os-release`, `/etc/motd`, `/etc/hostname` — set to bunzo.
-- **Shell / local console:** `bunzo-shell` is in the image and currently provides the only implemented setup surface. It can now collect the API key in-band via `/setup`, but that path still writes config files directly and is explicitly a stopgap before `bunzo-provisiond`.
-- **Agent runtime:** `bunzod` is present today as a socket-activated Rust daemon behind a local Unix-socket API. It can stream model replies, invoke skills, and append to the action ledger.
-- **Action ledger:** append-only JSONL audit at `/var/lib/bunzo/ledger.jsonl`. This is currently the only durable runtime record and should be treated as an audit sink, not the future canonical runtime store.
-- **Skills:** one real skill exists today (`read-local-file`), compiled to WASM and executed inside `wasmtime` with manifest-scoped capabilities. The current "policy" is just the manifest allowlist.
+- **Shell / local console:** `bunzo-shell` is in the image and currently provides the implemented local setup and control surface. It supports `/setup`, `/conversations`, `/tasks`, `/policy`, `/approve`, `/approvals`, and `/jobs`; provisioning still writes config files directly for now and remains a stopgap before `bunzo-provisiond`.
+- **Agent runtime:** `bunzod` is present today as a socket-activated Rust daemon behind a local Unix-socket API. It streams model replies, invokes skills, persists conversations/tasks/task-runs/events into the runtime store, and evaluates runtime policy before skill use.
+- **Runtime store:** canonical durable runtime state now lives under `/var/lib/bunzo/state/runtime.sqlite3`. Conversations, messages, tasks, task runs, snapshots, runtime policies, and task events are persisted there and survive QEMU reboot.
+- **Action ledger:** append-only JSONL audit at `/var/lib/bunzo/ledger.jsonl`. This is now explicitly an audit/export sink, not the canonical runtime store.
+- **Skills and policy:** one real skill exists today (`read-local-file`), compiled to WASM and executed inside `wasmtime` with manifest-scoped capabilities. The manifest remains the hard capability ceiling, and a runtime policy layer now sits in front of skill invocation with durable `allow`, `deny`, and `require_approval` decisions, a shell authoring surface, in-product approval resolution, and an approval-first default for unmatched shell tool use.
+- **Scheduler / jobs:** a first live scheduler slice now exists as `bunzo-schedulerd` plus shell `/jobs`. Recurring interval jobs are stored durably, claimed under lease, and each firing creates a normal `scheduled_job` task/task-run pair through the shared runtime path instead of a separate execution pipeline.
 
-## Next platform phase
+## Current platform phase
 
-After M4, bunzo's next implementation phase is the runtime foundation layer
-described in [FOUNDATIONS.md](FOUNDATIONS.md).
+After M4, bunzo moved into the runtime foundation layer described in
+[FOUNDATIONS.md](FOUNDATIONS.md). M5 is operationally closed in QEMU, and the
+interactive shell path of M6 is now operationally closed there too. The first
+M8 scheduler slice is also live and QEMU-verified.
 
 - **Context / task store (M5):** durable conversations, tasks, snapshots, and
-  runtime events above the JSONL ledger.
+  runtime events above the JSONL ledger. Closed for the QEMU dev loop.
 - **Policy engine (M6):** user-centric, task-aware allow/deny/approval
-  decisions that sit in front of tool use and proactive execution.
+  decisions that sit in front of tool use and proactive execution. Durable
+  policy rules plus `/policy` authoring are now in place; `/approve` and
+  `/approvals` cover waiting-task resolution in the shell; and unmatched shell
+  tool actions now default to `require_approval` / `once`. That same model now
+  also covers the first scheduler-created task-run path in M8.
 - **Provisioning engine (M7):** `bunzo-provisiond`, persisted config under
   `/var/lib/bunzo`, config rendering into `/etc`, and `/setup` as a real
   frontend instead of a file-writing shortcut.
-- **Scheduler (M8):** durable proactive jobs that create normal task runs and
-  flow through the same state and policy layers as interactive work.
+- **Scheduler (M8):** first slice landed: recurring interval jobs, durable
+  job/job-run state, `/jobs` in the shell, and scheduler-fired work flowing
+  through the same state and policy layers as interactive work. Richer trigger
+  shapes plus retry/backoff policy remain open follow-up work.
 
 ## Later
 
