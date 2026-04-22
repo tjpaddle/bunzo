@@ -4,18 +4,20 @@ Load this file only for M7 provisioning work.
 
 ## Current slice
 
-The first M7 slice is now landed:
+The first two local-shell-focused M7 slices are now landed:
 
 - `bunzo-provisiond` exists as the provisioning owner
 - local-shell `/setup` calls the provisioning socket API instead of writing
   `/etc/bunzo/*` directly
 - canonical config/secrets/state live under `/var/lib/bunzo/`
 - `/etc/bunzo/bunzod.toml` is rendered runtime output, not source of truth
+- bogus OpenAI credentials do not transition provisioning to `ready`
+- restart/boot reconciliation re-renders `/etc/bunzo/bunzod.toml` from
+  canonical `/var/lib/bunzo/` state
 
 Still open:
 
 - headless phone/browser frontend
-- stronger provider credential validation before declaring `ready`
 - hostname/network activation beyond the local-shell defaults used in this
   first slice
 
@@ -50,6 +52,14 @@ restart-safe state machine.
 
 Transitions should survive reboot. Power loss during setup should resume from
 saved state instead of restarting from zero.
+
+In the current local-shell slices:
+
+- `validating` performs a live OpenAI credential/model probe before `ready`
+- failed provider validation lands in `failed_recoverable` with persisted
+  detail for the frontend
+- restart/boot reconciliation re-renders `/etc/bunzo/bunzod.toml` from
+  canonical state before normal runtime use
 
 ## What setup should ask
 
@@ -110,6 +120,10 @@ Then a renderer/activation step materializes runtime-facing files such as:
 The current slice renders only `/etc/bunzo/bunzod.toml`. Hostname/network
 activation still remains future work.
 
+Boot-time reconciliation is currently handled by
+`bunzo-provisioning-reconcile.service`, while `bunzo-provisiond` and `bunzod`
+also re-check canonical state on startup for defense in depth.
+
 ## Handoff into normal runtime
 
 When provisioning reaches `ready`:
@@ -145,5 +159,6 @@ This should not require reflashing the image.
 
 Status:
 
-- Steps 1 through 4 are now live for the local-shell/OpenAI path
+- Steps 1 through 4 are now live for the local-shell/OpenAI path, including
+  live provider validation and boot-time runtime-config reconciliation
 - Step 5 is still open

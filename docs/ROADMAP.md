@@ -51,14 +51,17 @@ Open work:
 - [x] Make `/setup` call the provisioning API instead of writing files directly
 - [x] Implement a restart-safe first-boot state machine for the local-shell
   path
+- [x] Reconcile rendered runtime config from canonical `/var/lib/bunzo/` state
+  on restart/boot
+- [x] Validate provider credentials before declaring setup complete
 - [ ] Add the headless phone/browser setup frontend
-- [ ] Validate provider credentials before declaring setup complete
 
-**Current status:** local-shell provisioning is now service-owned and
-QEMU-targeted. `bunzo-provisiond` persists canonical state under
-`/var/lib/bunzo/`, `/setup` talks to its socket API, and
-`/etc/bunzo/bunzod.toml` is rendered output. The remaining M7 work is the
-headless frontend plus stronger provider validation.
+**Current status:** the local-shell provisioning engine is now hardened and
+QEMU-verified. `bunzo-provisiond` persists canonical state under
+`/var/lib/bunzo/`, `/setup` talks to its socket API, provider credentials are
+live-validated before `ready`, and canonical provisioning state re-renders
+`/etc/bunzo/bunzod.toml` on restart/boot. The remaining M7 work is the
+headless frontend plus broader hostname/network activation.
 
 **Definition of done:** a user can complete setup locally or from a phone, both
 paths end in the same persisted config, and `/setup` is just one frontend to

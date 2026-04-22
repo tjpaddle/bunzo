@@ -6,7 +6,7 @@
 //! backend invokes it through [`Registry::invoke_sync`] (on a blocking task)
 //! and feeds the result back to the model.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_openai::{
@@ -47,23 +47,16 @@ pub struct OpenAiBackend {
 
 impl OpenAiBackend {
     pub fn new(cfg: OpenAiConfig) -> Result<Self> {
-        let key = std::fs::read_to_string(&cfg.api_key_path)
-            .with_context(|| format!("reading api key from {}", cfg.api_key_path.display()))?;
-        let key = key.trim().to_string();
-        if key.is_empty() {
-            bail!("api key file {} is empty", cfg.api_key_path.display());
-        }
-        let mut oai_cfg = OpenAIConfig::new().with_api_key(key);
-        if let Some(base) = cfg.base_url {
-            oai_cfg = oai_cfg.with_api_base(base);
-        }
+        let client = build_client(&cfg)?;
+        let model = cfg.model;
+        let system_prompt = Some(
+            cfg.system_prompt
+                .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
+        );
         Ok(Self {
-            client: Client::with_config(oai_cfg),
-            model: cfg.model,
-            system_prompt: Some(
-                cfg.system_prompt
-                    .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
-            ),
+            client,
+            model,
+            system_prompt,
         })
     }
 
@@ -84,6 +77,32 @@ impl OpenAiBackend {
             })
             .collect()
     }
+}
+
+fn build_client(cfg: &OpenAiConfig) -> Result<Client<OpenAIConfig>> {
+    let key = std::fs::read_to_string(&cfg.api_key_path)
+        .with_context(|| format!("reading api key from {}", cfg.api_key_path.display()))?;
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        bail!("api key file {} is empty", cfg.api_key_path.display());
+    }
+    let mut oai_cfg = OpenAIConfig::new().with_api_key(key);
+    if let Some(base) = &cfg.base_url {
+        oai_cfg = oai_cfg.with_api_base(base);
+    }
+    Ok(Client::with_config(oai_cfg))
+}
+
+pub async fn validate_access(cfg: &OpenAiConfig) -> Result<()> {
+    let client = build_client(cfg)?;
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        client.models().retrieve(&cfg.model),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out validating OpenAI credentials"))?
+    .with_context(|| format!("validating OpenAI access to model '{}'", cfg.model))?;
+    Ok(())
 }
 
 #[async_trait]

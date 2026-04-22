@@ -1902,11 +1902,15 @@ fn run_openai_setup(
     match apply_local_openai_setup("setup-apply".into(), None, key) {
         Ok(status) => {
             let device_name = status.device_name.as_deref().unwrap_or("this device");
+            let rendered_path = status
+                .rendered_config_path
+                .as_deref()
+                .unwrap_or(BUNZOD_CONFIG_PATH);
             writeln!(
                 stdout,
                 "{}",
                 format!(
-                    "saved provisioning state for {device_name} and rendered bunzod for {}",
+                    "validated OpenAI access for {device_name} and rendered {rendered_path} for {}",
                     status.model.as_deref().unwrap_or(DEFAULT_REMOTE_MODEL)
                 )
                 .green()
@@ -1919,6 +1923,9 @@ fn run_openai_setup(
                 "{}",
                 format!("setup failed: {}", provisioning_error_text(err)).red()
             )?;
+            if let Ok(status) = request_provisioning_status("setup-status-after-failure".into()) {
+                writeln!(stdout, "{}", provisioning_issue_text(&status).dark_grey())?;
+            }
             Ok(false)
         }
     }
@@ -1941,10 +1948,15 @@ fn provisioning_issue_text(status: &ProvisioningStatus) -> String {
         .detail
         .as_deref()
         .unwrap_or("setup has not completed yet");
-    format!(
-        "provisioning phase '{}' is not ready: {}",
-        status.phase, detail
-    )
+    let device = status.device_name.as_deref().unwrap_or("this device");
+    let provider = status.provider_kind.as_deref().unwrap_or("backend");
+    match status.phase.as_str() {
+        "failed_recoverable" => format!(
+            "{device} is not ready: {provider} validation failed and can be retried: {detail}"
+        ),
+        "validating" => format!("{device} is still validating {provider}: {detail}"),
+        phase => format!("{device} provisioning phase '{phase}' is not ready: {detail}"),
+    }
 }
 
 struct StdinEchoGuard {
@@ -2135,7 +2147,8 @@ mod tests {
         };
 
         let text = provisioning_issue_text(&status);
-        assert!(text.contains("failed_recoverable"));
+        assert!(text.contains("bunzo-qemu"));
+        assert!(text.contains("validation failed"));
         assert!(text.contains("/var/lib/bunzo/secrets/openai.key"));
     }
 

@@ -8,9 +8,11 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use bunzo_proto::async_io::{read_frame_async, write_frame_async};
 use bunzo_proto::{
     Envelope, ProvisionClientFrame, ProvisionClientMessage, ProvisionServerMessage,
@@ -21,7 +23,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::config::{BackendConfig, BunzodConfig, RECOMMENDED_OPENAI_MODEL};
+use crate::backend::openai;
+use crate::config::{BackendConfig, BunzodConfig, OpenAiConfig, RECOMMENDED_OPENAI_MODEL};
 
 pub const SOCKET_PATH: &str = "/run/bunzo-provisiond.sock";
 pub const DEFAULT_CONFIG_DIR: &str = "/var/lib/bunzo/config";
@@ -107,7 +110,7 @@ impl ProvisioningPhase {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ProvisioningStateRecord {
     phase: ProvisioningPhase,
     device_name: Option<String>,
@@ -181,23 +184,58 @@ struct RenderedOpenAiConfig {
     system_prompt: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[async_trait]
+trait ProviderValidator: Send + Sync {
+    async fn validate(
+        &self,
+        provider_cfg: &ProviderConfig,
+        paths: &ProvisioningPaths,
+    ) -> Result<()>;
+}
+
+#[derive(Default)]
+struct LiveProviderValidator;
+
+#[async_trait]
+impl ProviderValidator for LiveProviderValidator {
+    async fn validate(
+        &self,
+        provider_cfg: &ProviderConfig,
+        paths: &ProvisioningPaths,
+    ) -> Result<()> {
+        match provider_cfg.openai_runtime_config(paths)? {
+            Some(cfg) => openai::validate_access(&cfg).await,
+            None => bail!("unsupported provider configuration"),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ProvisioningEngine {
     paths: ProvisioningPaths,
+    validator: Arc<dyn ProviderValidator>,
 }
 
 impl Default for ProvisioningEngine {
     fn default() -> Self {
-        Self::new(ProvisioningPaths::default())
+        Self::with_validator(
+            ProvisioningPaths::default(),
+            Arc::new(LiveProviderValidator),
+        )
     }
 }
 
 impl ProvisioningEngine {
     pub fn new(paths: ProvisioningPaths) -> Self {
-        Self { paths }
+        Self::with_validator(paths, Arc::new(LiveProviderValidator))
+    }
+
+    fn with_validator(paths: ProvisioningPaths, validator: Arc<dyn ProviderValidator>) -> Self {
+        Self { paths, validator }
     }
 
     pub fn status(&self) -> Result<ProvisioningStatus> {
+        self.reconcile_runtime_state()?;
         let state = self.load_state()?.unwrap_or_default();
         let mut effective_phase = state.phase.clone();
         let mut ready = matches!(effective_phase, ProvisioningPhase::Ready);
@@ -217,6 +255,14 @@ impl ProvisioningEngine {
     }
 
     pub fn apply_local_setup(
+        &self,
+        requested_device_name: Option<&str>,
+        api_key: &str,
+    ) -> Result<ProvisioningStatus> {
+        futures::executor::block_on(self.apply_local_setup_async(requested_device_name, api_key))
+    }
+
+    pub async fn apply_local_setup_async(
         &self,
         requested_device_name: Option<&str>,
         api_key: &str,
@@ -290,10 +336,65 @@ impl ProvisioningEngine {
             self.write_failed_state(&state, &format!("{err:#}"))?;
             return Err(err);
         }
+        if let Err(err) = self.validator.validate(&provider_cfg, &self.paths).await {
+            self.write_failed_state(&state, &format!("{err:#}"))?;
+            return Err(err);
+        }
 
         state.last_error = None;
         self.write_state_checkpoint(&mut state, ProvisioningPhase::Ready)?;
         self.status()
+    }
+
+    pub fn reconcile_runtime_state(&self) -> Result<()> {
+        self.ensure_dirs()?;
+
+        let mut state = match self.load_state()? {
+            Some(state) => state,
+            None => return Ok(()),
+        };
+        let original = state.clone();
+
+        if let Some(device) =
+            self.read_optional_toml::<DeviceConfig>(&self.paths.device_config_path())?
+        {
+            state.device_name = Some(device.device_name);
+        }
+        if let Some(network) =
+            self.read_optional_toml::<NetworkConfig>(&self.paths.network_config_path())?
+        {
+            state.connectivity_kind = Some(network.kind);
+        }
+
+        let Some(provider_cfg) =
+            self.read_optional_toml::<ProviderConfig>(&self.paths.provider_config_path())?
+        else {
+            if state != original {
+                self.persist_state(&mut state)?;
+            }
+            return Ok(());
+        };
+
+        self.apply_provider_metadata(&mut state, &provider_cfg);
+
+        match self
+            .render_runtime_config(&provider_cfg)
+            .and_then(|_| self.validate_rendered_runtime())
+        {
+            Ok(()) => {
+                if matches!(state.phase, ProvisioningPhase::Ready) {
+                    state.last_error = None;
+                }
+                if state != original {
+                    self.persist_state(&mut state)?;
+                }
+            }
+            Err(err) => {
+                self.write_failed_state(&state, &format!("{err:#}"))?;
+            }
+        }
+
+        Ok(())
     }
 
     fn ensure_dirs(&self) -> Result<()> {
@@ -305,11 +406,7 @@ impl ProvisioningEngine {
     }
 
     fn load_state(&self) -> Result<Option<ProvisioningStateRecord>> {
-        match self.read_toml::<ProvisioningStateRecord>(&self.paths.state_path()) {
-            Ok(state) => Ok(Some(state)),
-            Err(err) if is_not_found(&err) => Ok(None),
-            Err(err) => Err(err),
-        }
+        self.read_optional_toml::<ProvisioningStateRecord>(&self.paths.state_path())
     }
 
     fn status_from_state(
@@ -339,16 +436,35 @@ impl ProvisioningEngine {
         phase: ProvisioningPhase,
     ) -> Result<()> {
         state.phase = phase;
-        state.updated_at_ms = now_ms();
-        self.write_toml_atomic(&self.paths.state_path(), state, 0o600)
+        self.persist_state(state)
     }
 
     fn write_failed_state(&self, prior: &ProvisioningStateRecord, detail: &str) -> Result<()> {
         let mut failed = prior.clone();
         failed.phase = ProvisioningPhase::FailedRecoverable;
         failed.last_error = Some(detail.to_string());
-        failed.updated_at_ms = now_ms();
-        self.write_toml_atomic(&self.paths.state_path(), &failed, 0o600)
+        self.persist_state(&mut failed)
+    }
+
+    fn persist_state(&self, state: &mut ProvisioningStateRecord) -> Result<()> {
+        state.updated_at_ms = now_ms();
+        self.write_toml_atomic(&self.paths.state_path(), state, 0o600)
+    }
+
+    fn apply_provider_metadata(
+        &self,
+        state: &mut ProvisioningStateRecord,
+        provider_cfg: &ProviderConfig,
+    ) {
+        match &provider_cfg.backend {
+            CanonicalBackendConfig::Openai { model, .. } => {
+                state.provider_kind = Some(PROVIDER_KIND_OPENAI.into());
+                state.model = Some(model.clone());
+                state.secret_path = Some(self.paths.openai_secret_path().display().to_string());
+                state.rendered_config_path =
+                    Some(self.paths.runtime_config_path.display().to_string());
+            }
+        }
     }
 
     fn render_runtime_config(&self, provider_cfg: &ProviderConfig) -> Result<()> {
@@ -402,6 +518,14 @@ impl ProvisioningEngine {
         Ok(())
     }
 
+    fn read_optional_toml<T: DeserializeOwned>(&self, path: &Path) -> Result<Option<T>> {
+        match self.read_toml::<T>(path) {
+            Ok(value) => Ok(Some(value)),
+            Err(err) if is_not_found(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     fn read_toml<T: DeserializeOwned>(&self, path: &Path) -> Result<T> {
         let raw =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -446,9 +570,34 @@ impl ProvisioningEngine {
     }
 }
 
+impl ProviderConfig {
+    fn openai_runtime_config(&self, paths: &ProvisioningPaths) -> Result<Option<OpenAiConfig>> {
+        match &self.backend {
+            CanonicalBackendConfig::Openai {
+                model,
+                api_key_secret,
+                base_url,
+                system_prompt,
+            } => Ok(Some(OpenAiConfig {
+                model: model.clone(),
+                api_key_path: paths.secrets_dir.join(api_key_secret),
+                base_url: base_url.clone(),
+                system_prompt: system_prompt.clone(),
+            })),
+        }
+    }
+}
+
+pub fn reconcile_runtime_state() -> Result<()> {
+    ProvisioningEngine::default().reconcile_runtime_state()
+}
+
 pub async fn run_server() -> Result<()> {
     let listener = acquire_listener()?;
     let engine = ProvisioningEngine::default();
+    if let Err(err) = engine.reconcile_runtime_state() {
+        eprintln!("bunzo-provisiond: startup reconciliation failed: {err:#}");
+    }
     eprintln!("bunzo-provisiond: accepting connections");
 
     loop {
@@ -560,7 +709,7 @@ async fn handle_apply_local_setup<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    match engine.apply_local_setup(device_name, api_key) {
+    match engine.apply_local_setup_async(device_name, api_key).await {
         Ok(status) => {
             let frame = Envelope::new(ProvisionServerMessage::ProvisioningResult {
                 id: id.into(),
@@ -631,7 +780,41 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use anyhow::bail;
     use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct StubValidator {
+        result: std::result::Result<(), String>,
+    }
+
+    impl StubValidator {
+        fn success() -> Arc<Self> {
+            Arc::new(Self { result: Ok(()) })
+        }
+
+        fn failure(message: &str) -> Arc<Self> {
+            Arc::new(Self {
+                result: Err(message.to_string()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ProviderValidator for StubValidator {
+        async fn validate(
+            &self,
+            _provider_cfg: &ProviderConfig,
+            _paths: &ProvisioningPaths,
+        ) -> Result<()> {
+            match &self.result {
+                Ok(()) => Ok(()),
+                Err(message) => bail!("{message}"),
+            }
+        }
+    }
 
     fn test_paths(tmp: &TempDir) -> ProvisioningPaths {
         let root = tmp.path();
@@ -644,12 +827,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn local_setup_writes_canonical_state_and_renders_runtime_config() {
-        let tmp = TempDir::new().unwrap();
-        let engine = ProvisioningEngine::new(test_paths(&tmp));
+    fn test_engine(tmp: &TempDir, validator: Arc<dyn ProviderValidator>) -> ProvisioningEngine {
+        ProvisioningEngine::with_validator(test_paths(tmp), validator)
+    }
 
-        let status = engine.apply_local_setup(None, "sk-test").unwrap();
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_setup_writes_canonical_state_and_renders_runtime_config() {
+        let tmp = TempDir::new().unwrap();
+        let engine = test_engine(&tmp, StubValidator::success());
+
+        let status = engine
+            .apply_local_setup_async(None, "sk-test")
+            .await
+            .unwrap();
         assert!(status.ready);
         assert_eq!(status.phase, "ready");
         assert_eq!(status.provider_kind.as_deref(), Some("openai"));
@@ -684,11 +874,69 @@ mod tests {
         assert_eq!(secret.trim(), "sk-test");
     }
 
-    #[test]
-    fn broken_rendered_runtime_reports_failed_recoverable() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_live_validation_stays_non_ready_with_detail() {
         let tmp = TempDir::new().unwrap();
-        let engine = ProvisioningEngine::new(test_paths(&tmp));
-        engine.apply_local_setup(None, "sk-test").unwrap();
+        let engine = test_engine(&tmp, StubValidator::failure("authentication failed"));
+
+        let err = engine
+            .apply_local_setup_async(None, "sk-test")
+            .await
+            .expect_err("validation should fail");
+        assert!(format!("{err:#}").contains("authentication failed"));
+
+        let status = engine.status().unwrap();
+        assert!(!status.ready);
+        assert_eq!(status.phase, "failed_recoverable");
+        assert!(status
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("authentication failed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_recreates_runtime_config_for_ready_state() {
+        let tmp = TempDir::new().unwrap();
+        let engine = test_engine(&tmp, StubValidator::success());
+        engine
+            .apply_local_setup_async(None, "sk-test")
+            .await
+            .unwrap();
+
+        fs::write(&engine.paths.runtime_config_path, "broken = true\n").unwrap();
+        engine.reconcile_runtime_state().unwrap();
+
+        let status = engine.status().unwrap();
+        assert!(status.ready);
+        let runtime_cfg = fs::read_to_string(&engine.paths.runtime_config_path).unwrap();
+        assert!(runtime_cfg.contains("kind = \"openai\""));
+        assert!(!runtime_cfg.contains("broken = true"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_does_not_promote_failed_validation_to_ready() {
+        let tmp = TempDir::new().unwrap();
+        let engine = test_engine(&tmp, StubValidator::failure("authentication failed"));
+        let _ = engine.apply_local_setup_async(None, "sk-test").await;
+
+        fs::remove_file(&engine.paths.runtime_config_path).unwrap();
+        engine.reconcile_runtime_state().unwrap();
+
+        let status = engine.status().unwrap();
+        assert!(!status.ready);
+        assert_eq!(status.phase, "failed_recoverable");
+        assert!(engine.paths.runtime_config_path.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn broken_rendered_runtime_reports_failed_recoverable() {
+        let tmp = TempDir::new().unwrap();
+        let engine = test_engine(&tmp, StubValidator::success());
+        engine
+            .apply_local_setup_async(None, "sk-test")
+            .await
+            .unwrap();
 
         fs::remove_file(engine.paths.openai_secret_path()).unwrap();
         let status = engine.status().unwrap();

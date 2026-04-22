@@ -24,6 +24,10 @@ const SOCKET_PATH: &str = "/run/bunzod.sock";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    if let Err(err) = bunzod::provisioning::reconcile_runtime_state() {
+        eprintln!("bunzod: provisioning reconciliation failed: {err:#}");
+    }
+
     let listener = acquire_listener()?;
     let ledger = Arc::new(Ledger::new(Ledger::default_path()));
     let store = Arc::new(RuntimeStore::new(RuntimeStore::default_path()));

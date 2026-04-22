@@ -73,6 +73,8 @@ Responsibilities:
 - own canonical config under `/var/lib/bunzo/config/`
 - own canonical secrets under `/var/lib/bunzo/secrets/`
 - render `/etc/bunzo/bunzod.toml` from canonical provisioning state
+- validate provider credentials before provisioning reaches `ready`
+- reconcile rendered runtime config from canonical state on restart/boot
 - expose a local Unix-socket API that thin frontends such as `bunzo-shell`
   call during setup/reconfiguration
 
@@ -107,8 +109,15 @@ evaluation → skill/model execution → task events/state updates
 ### Provisioning path
 
 `bunzo-shell /setup` → `bunzo-provisiond` → canonical `/var/lib/bunzo/`
-state/config/secrets → rendered `/etc/bunzo/bunzod.toml` → normal `bunzod`
-request path on the next shell request
+state/config/secrets → live provider validation → rendered
+`/etc/bunzo/bunzod.toml` → normal `bunzod` request path on the next shell
+request
+
+### Provisioning reconciliation path
+
+boot/startup → `bunzo-provisioning-reconcile.service` and startup
+reconciliation hooks → canonical `/var/lib/bunzo/` state →
+re-rendered `/etc/bunzo/bunzod.toml`
 
 ### Scheduler path
 
@@ -129,6 +138,7 @@ runtime/task/policy path as interactive work
 - local runtime store and audit trail
 - proactive interval jobs via `/jobs`
 - local-shell provisioning via `bunzo-provisiond`
+- boot-safe runtime-config reconciliation from canonical provisioning state
 
 ### Next
 
