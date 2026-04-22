@@ -1,0 +1,16 @@
+[Unit]
+Description=bunzo provisioning daemon
+Documentation=https://github.com/tjpaddle/bunzo
+Requires=bunzo-provisiond.socket
+After=bunzo-provisiond.socket systemd-tmpfiles-setup.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bunzo-provisiond
+Restart=on-failure
+RestartSec=2s
+MemoryHigh=64M
+MemoryMax=96M
+
+# No [Install] section on purpose: the service is started by
+# bunzo-provisiond.socket when a frontend connects.

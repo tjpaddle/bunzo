@@ -1,7 +1,9 @@
 //! Configuration loaded from /etc/bunzo/bunzod.toml.
 //!
-//! The file is intended to be written by the onboarding flow and is
-//! re-read on every request so edits take effect without a restart.
+//! In M7 this file becomes rendered runtime output written by
+//! `bunzo-provisiond` from canonical provisioning-owned state under
+//! `/var/lib/bunzo/`. It is still re-read on every request so provisioning
+//! changes take effect without restarting `bunzod`.
 
 use std::fs;
 use std::path::PathBuf;
@@ -74,7 +76,7 @@ mod tests {
     fn test_cfg(model: &str) -> OpenAiConfig {
         OpenAiConfig {
             model: model.to_string(),
-            api_key_path: PathBuf::from("/etc/bunzo/openai.key"),
+            api_key_path: PathBuf::from("/var/lib/bunzo/secrets/openai.key"),
             base_url: None,
             system_prompt: None,
         }

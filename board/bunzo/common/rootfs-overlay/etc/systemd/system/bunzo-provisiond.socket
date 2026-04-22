@@ -1,0 +1,13 @@
+[Unit]
+Description=bunzo provisioning daemon socket
+Documentation=https://github.com/tjpaddle/bunzo
+PartOf=bunzo-provisiond.service
+
+[Socket]
+ListenStream=/run/bunzo-provisiond.sock
+SocketMode=0660
+RemoveOnStop=yes
+Accept=no
+
+[Install]
+WantedBy=sockets.target

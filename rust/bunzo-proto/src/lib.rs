@@ -72,6 +72,20 @@ pub struct ScheduledJobSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisioningStatus {
+    pub phase: String,
+    pub ready: bool,
+    pub device_name: Option<String>,
+    pub connectivity_kind: Option<String>,
+    pub provider_kind: Option<String>,
+    pub model: Option<String>,
+    pub rendered_config_path: Option<String>,
+    pub secret_path: Option<String>,
+    pub detail: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientMessage {
     UserMessage {
@@ -217,6 +231,38 @@ pub enum ServerMessage {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProvisionClientMessage {
+    GetProvisioningStatus {
+        id: String,
+    },
+    ApplyLocalSetup {
+        id: String,
+        #[serde(default)]
+        device_name: Option<String>,
+        api_key: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProvisionServerMessage {
+    ProvisioningStatus {
+        id: String,
+        status: ProvisioningStatus,
+    },
+    ProvisioningResult {
+        id: String,
+        status: ProvisioningStatus,
+    },
+    Error {
+        id: String,
+        code: String,
+        text: String,
+    },
+}
+
 fn default_list_limit() -> u32 {
     10
 }
@@ -243,6 +289,8 @@ impl<T> Envelope<T> {
 
 pub type ClientFrame = Envelope<ClientMessage>;
 pub type ServerFrame = Envelope<ServerMessage>;
+pub type ProvisionClientFrame = Envelope<ProvisionClientMessage>;
+pub type ProvisionServerFrame = Envelope<ProvisionServerMessage>;
 
 pub fn write_frame<W, T>(w: &mut W, msg: &T) -> io::Result<()>
 where
@@ -541,6 +589,59 @@ mod tests {
             write_frame(&mut buf, &out).unwrap();
             let mut cur = Cursor::new(buf);
             let _back: ClientFrame = read_frame(&mut cur).unwrap();
+        }
+    }
+
+    #[test]
+    fn roundtrip_provisioning_frames() {
+        let status = ProvisioningStatus {
+            phase: "ready".into(),
+            ready: true,
+            device_name: Some("bunzo-qemu".into()),
+            connectivity_kind: Some("existing_network".into()),
+            provider_kind: Some("openai".into()),
+            model: Some("gpt-5.4-mini".into()),
+            rendered_config_path: Some("/etc/bunzo/bunzod.toml".into()),
+            secret_path: Some("/var/lib/bunzo/secrets/openai.key".into()),
+            detail: None,
+            updated_at_ms: 42,
+        };
+
+        for msg in [
+            ProvisionClientMessage::GetProvisioningStatus { id: "p1".into() },
+            ProvisionClientMessage::ApplyLocalSetup {
+                id: "p2".into(),
+                device_name: Some("bunzo-qemu".into()),
+                api_key: "sk-test".into(),
+            },
+        ] {
+            let out = Envelope::new(msg);
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &out).unwrap();
+            let mut cur = Cursor::new(buf);
+            let _back: ProvisionClientFrame = read_frame(&mut cur).unwrap();
+        }
+
+        for msg in [
+            ProvisionServerMessage::ProvisioningStatus {
+                id: "p1".into(),
+                status: status.clone(),
+            },
+            ProvisionServerMessage::ProvisioningResult {
+                id: "p2".into(),
+                status: status.clone(),
+            },
+            ProvisionServerMessage::Error {
+                id: "p3".into(),
+                code: "invalid_request".into(),
+                text: "api key cannot be empty".into(),
+            },
+        ] {
+            let out = Envelope::new(msg);
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &out).unwrap();
+            let mut cur = Cursor::new(buf);
+            let _back: ProvisionServerFrame = read_frame(&mut cur).unwrap();
         }
     }
 

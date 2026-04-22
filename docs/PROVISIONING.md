@@ -2,11 +2,22 @@
 
 Load this file only for M7 provisioning work.
 
-## Current gap
+## Current slice
 
-Today `/setup` is still a shell-owned shortcut that writes `/etc/bunzo/*`
-directly. That is useful for development, but it is not the long-term product
-shape and it is not compatible with durable config ownership.
+The first M7 slice is now landed:
+
+- `bunzo-provisiond` exists as the provisioning owner
+- local-shell `/setup` calls the provisioning socket API instead of writing
+  `/etc/bunzo/*` directly
+- canonical config/secrets/state live under `/var/lib/bunzo/`
+- `/etc/bunzo/bunzod.toml` is rendered runtime output, not source of truth
+
+Still open:
+
+- headless phone/browser frontend
+- stronger provider credential validation before declaring `ready`
+- hostname/network activation beyond the local-shell defaults used in this
+  first slice
 
 ## Required outcome
 
@@ -51,6 +62,15 @@ Keep the v1 flow minimal:
 
 That is enough to get the device into a useful ready state.
 
+In the current local-shell slice, the engine seeds:
+
+- device name from the current hostname unless a frontend overrides it
+- connectivity as `existing_network`
+- provider as OpenAI with the current GPT-5.4-family restriction
+
+That keeps the state machine and durable ownership real while leaving richer
+frontend UX for the next slice.
+
 ## Frontends
 
 ### Local setup
@@ -59,7 +79,8 @@ For devices with local I/O:
 
 - `bunzo-shell` detects unprovisioned state
 - `/setup` enters the provisioning flow
-- local setup asks for the same core fields as the phone/browser flow
+- the current slice persists current hostname/current network defaults and
+  collects the provider credential locally
 
 ### Headless setup
 
@@ -86,6 +107,9 @@ Then a renderer/activation step materializes runtime-facing files such as:
 - `/etc/bunzo/bunzod.toml`
 - hostname/network runtime config
 
+The current slice renders only `/etc/bunzo/bunzod.toml`. Hostname/network
+activation still remains future work.
+
 ## Handoff into normal runtime
 
 When provisioning reaches `ready`:
@@ -95,6 +119,11 @@ When provisioning reaches `ready`:
 3. stop provisioning-only services
 4. start the normal runtime mode
 5. mark provisioning complete
+
+In the current local-shell slice, step 3 is effectively a no-op because
+`bunzo-provisiond` is socket-activated and `bunzod` re-reads its config on
+every request. The important boundary is still preserved: provisioning owns the
+canonical state and renders the runtime-facing config.
 
 ## Re-entering setup
 
@@ -113,3 +142,8 @@ This should not require reflashing the image.
 3. Make `/setup` call the provisioning API instead of writing files directly
 4. Land the local-shell path first
 5. Add the headless phone/browser path
+
+Status:
+
+- Steps 1 through 4 are now live for the local-shell/OpenAI path
+- Step 5 is still open

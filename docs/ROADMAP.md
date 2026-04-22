@@ -43,15 +43,22 @@ service that owns durable config, secrets, and first-boot state.
 
 Open work:
 
-- [ ] Introduce `bunzo-provisiond`
-- [ ] Persist provisioning/config state under `/var/lib/bunzo/config/`
-- [ ] Persist secrets under `/var/lib/bunzo/secrets/`
-- [ ] Render runtime-facing files from canonical state instead of treating
+- [x] Introduce `bunzo-provisiond`
+- [x] Persist provisioning/config state under `/var/lib/bunzo/config/`
+- [x] Persist secrets under `/var/lib/bunzo/secrets/`
+- [x] Render runtime-facing files from canonical state instead of treating
   `/etc` as the source of truth
-- [ ] Make `/setup` call the provisioning API instead of writing files directly
-- [ ] Implement a restart-safe first-boot state machine
-- [ ] Support both local-shell setup and headless phone/browser setup
+- [x] Make `/setup` call the provisioning API instead of writing files directly
+- [x] Implement a restart-safe first-boot state machine for the local-shell
+  path
+- [ ] Add the headless phone/browser setup frontend
 - [ ] Validate provider credentials before declaring setup complete
+
+**Current status:** local-shell provisioning is now service-owned and
+QEMU-targeted. `bunzo-provisiond` persists canonical state under
+`/var/lib/bunzo/`, `/setup` talks to its socket API, and
+`/etc/bunzo/bunzod.toml` is rendered output. The remaining M7 work is the
+headless frontend plus stronger provider validation.
 
 **Definition of done:** a user can complete setup locally or from a phone, both
 paths end in the same persisted config, and `/setup` is just one frontend to

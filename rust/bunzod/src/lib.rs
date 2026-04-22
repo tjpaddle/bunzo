@@ -2,6 +2,7 @@ pub mod backend;
 pub mod config;
 pub mod ledger;
 pub mod policy;
+pub mod provisioning;
 pub mod runtime;
 pub mod scheduler;
 pub mod skills;

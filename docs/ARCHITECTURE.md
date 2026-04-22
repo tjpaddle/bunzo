@@ -30,7 +30,8 @@ Current commands include:
 - `/approvals`
 - `/jobs`
 
-Today it is still both a developer console and the temporary local setup path.
+It is still the developer console, and `/setup` is now the first local
+frontend for `bunzo-provisiond` rather than a direct file-writing shortcut.
 
 ### `bunzod`
 
@@ -62,10 +63,21 @@ Responsibilities:
 Important constraint: scheduler work must keep sharing the main runtime/task/
 policy path. There should not be a second scheduler-only execution pipeline.
 
-### `bunzo-provisiond` (next)
+### `bunzo-provisiond`
 
-Not built yet. This should become the owner of first-boot and reconfiguration
-state so `/setup` stops writing `/etc/bunzo/*` directly.
+The provisioning service introduced in the first M7 slice.
+
+Responsibilities:
+
+- own durable provisioning state under `/var/lib/bunzo/provisioning/`
+- own canonical config under `/var/lib/bunzo/config/`
+- own canonical secrets under `/var/lib/bunzo/secrets/`
+- render `/etc/bunzo/bunzod.toml` from canonical provisioning state
+- expose a local Unix-socket API that thin frontends such as `bunzo-shell`
+  call during setup/reconfiguration
+
+Current scope is the local-shell path only. Headless phone/browser setup is
+still the next provisioning slice.
 
 ## Key data paths
 
@@ -73,14 +85,17 @@ state so `/setup` stops writing `/etc/bunzo/*` directly.
   `/var/lib/bunzo/state/runtime.sqlite3`
 - Audit sink:
   `/var/lib/bunzo/ledger.jsonl`
+- Provisioning state:
+  `/var/lib/bunzo/provisioning/state.toml`
+- Canonical provider config:
+  `/var/lib/bunzo/config/provider.toml`
+- Canonical backend secret:
+  `/var/lib/bunzo/secrets/openai.key`
 - Current runtime config:
   `/etc/bunzo/bunzod.toml`
-- Current backend secret:
-  `/etc/bunzo/openai.key`
 
-Today `/etc/bunzo/*` is still directly written by the shell. The architectural
-target is for provisioning-owned state under `/var/lib/bunzo/` to become the
-source of truth and `/etc` to become rendered runtime output.
+`/etc/bunzo/bunzod.toml` is now rendered runtime output. The source of truth
+for setup lives under `/var/lib/bunzo/`.
 
 ## Current runtime model
 
@@ -88,6 +103,12 @@ source of truth and `/etc` to become rendered runtime output.
 
 `bunzo-shell` request → `bunzod` → runtime store/task creation → policy
 evaluation → skill/model execution → task events/state updates
+
+### Provisioning path
+
+`bunzo-shell /setup` → `bunzo-provisiond` → canonical `/var/lib/bunzo/`
+state/config/secrets → rendered `/etc/bunzo/bunzod.toml` → normal `bunzod`
+request path on the next shell request
 
 ### Scheduler path
 
@@ -107,6 +128,7 @@ runtime/task/policy path as interactive work
 - local shell on the device
 - local runtime store and audit trail
 - proactive interval jobs via `/jobs`
+- local-shell provisioning via `bunzo-provisiond`
 
 ### Next
 

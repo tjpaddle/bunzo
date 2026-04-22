@@ -1,13 +1,12 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Stdout, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::time::Duration;
 
 use bunzo_proto::{
     read_frame, write_frame, ClientMessage, ConversationSummary, Envelope, PolicySummary,
+    ProvisionClientMessage, ProvisionServerFrame, ProvisionServerMessage, ProvisioningStatus,
     ScheduledJobSummary, ServerFrame, ServerMessage, TaskSummary,
 };
 use crossterm::{
@@ -31,9 +30,8 @@ const DEFAULT_LINES: u16 = 24;
 const MIN_COLUMNS: u16 = 40;
 const MIN_LINES: u16 = 10;
 const BUNZOD_SOCKET: &str = "/run/bunzod.sock";
-const BUNZOD_CONFIG_DIR: &str = "/etc/bunzo";
+const PROVISIOND_SOCKET: &str = "/run/bunzo-provisiond.sock";
 const BUNZOD_CONFIG_PATH: &str = "/etc/bunzo/bunzod.toml";
-const OPENAI_KEY_PATH: &str = "/etc/bunzo/openai.key";
 const DEFAULT_REMOTE_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_POLICY_SUBJECT: &str = "shell_request";
 const SCHEDULED_JOB_POLICY_SUBJECT: &str = "scheduled_job";
@@ -259,6 +257,12 @@ fn run_serial_shell() -> io::Result<()> {
 }
 
 enum RoundTripError {
+    Unreachable(String),
+    Protocol(String),
+    Remote { code: String, text: String },
+}
+
+enum ProvisioningRoundTripError {
     Unreachable(String),
     Protocol(String),
     Remote { code: String, text: String },
@@ -1290,6 +1294,96 @@ fn request_scheduled_jobs(
     }
 }
 
+fn request_provisioning_status(
+    id: String,
+) -> Result<ProvisioningStatus, ProvisioningRoundTripError> {
+    let mut stream = UnixStream::connect(PROVISIOND_SOCKET)
+        .map_err(|e| ProvisioningRoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ProvisionClientMessage::GetProvisioningStatus { id: id.clone() });
+    write_frame(&mut stream, &req)
+        .map_err(|e| ProvisioningRoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ProvisionServerFrame = match read_frame(&mut stream) {
+            Ok(frame) => frame,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(ProvisioningRoundTripError::Protocol(
+                    "bunzo-provisiond closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(ProvisioningRoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ProvisionServerMessage::ProvisioningStatus {
+                id: result_id,
+                status,
+            } if result_id == id => return Ok(status),
+            ProvisionServerMessage::ProvisioningStatus { .. } => {}
+            ProvisionServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(ProvisioningRoundTripError::Remote { code, text });
+            }
+            ProvisionServerMessage::Error { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+fn apply_local_openai_setup(
+    id: String,
+    device_name: Option<String>,
+    api_key: String,
+) -> Result<ProvisioningStatus, ProvisioningRoundTripError> {
+    let mut stream = UnixStream::connect(PROVISIOND_SOCKET)
+        .map_err(|e| ProvisioningRoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ProvisionClientMessage::ApplyLocalSetup {
+        id: id.clone(),
+        device_name,
+        api_key,
+    });
+    write_frame(&mut stream, &req)
+        .map_err(|e| ProvisioningRoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ProvisionServerFrame = match read_frame(&mut stream) {
+            Ok(frame) => frame,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(ProvisioningRoundTripError::Protocol(
+                    "bunzo-provisiond closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(ProvisioningRoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ProvisionServerMessage::ProvisioningResult {
+                id: result_id,
+                status,
+            } if result_id == id => return Ok(status),
+            ProvisionServerMessage::ProvisioningResult { .. } => {}
+            ProvisionServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(ProvisioningRoundTripError::Remote { code, text });
+            }
+            ProvisionServerMessage::Error { .. } => {}
+            _ => {}
+        }
+    }
+}
+
 fn request_upsert_policy(
     id: String,
     subject: String,
@@ -1748,22 +1842,27 @@ fn round_trip_error_text(err: RoundTripError) -> String {
     }
 }
 
-fn local_setup_issue() -> Option<String> {
-    if !Path::new(BUNZOD_CONFIG_PATH).is_file() {
-        return Some("OpenAI backend config is missing.".into());
+fn provisioning_error_text(err: ProvisioningRoundTripError) -> String {
+    match err {
+        ProvisioningRoundTripError::Unreachable(reason) => {
+            format!("bunzo-provisiond unreachable: {reason}")
+        }
+        ProvisioningRoundTripError::Protocol(reason) => format!("protocol error: {reason}"),
+        ProvisioningRoundTripError::Remote { code, text } => format!("[{code}] {text}"),
     }
-    match fs::read_to_string(OPENAI_KEY_PATH) {
-        Ok(key) if !key.trim().is_empty() => None,
-        Ok(_) => Some("OpenAI API key is empty.".into()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Some("OpenAI API key is missing.".into()),
-        Err(e) => Some(format!("OpenAI API key is unreadable: {e}")),
+}
+
+fn local_setup_issue() -> Option<String> {
+    match request_provisioning_status("setup-status".into()) {
+        Ok(status) if status.ready => None,
+        Ok(status) => Some(provisioning_issue_text(&status)),
+        Err(err) => Some(provisioning_error_text(err)),
     }
 }
 
 fn should_offer_setup(code: &str, text: &str) -> bool {
     matches!(code, "unconfigured" | "backend_init_failed")
         || text.contains(BUNZOD_CONFIG_PATH)
-        || text.contains(OPENAI_KEY_PATH)
         || text.contains("unsupported OpenAI model")
 }
 
@@ -1785,8 +1884,8 @@ fn run_openai_setup(
         stdout,
         "{}",
         format!(
-            "Paste your OpenAI API key. bunzo will save it to {} and configure {}.",
-            OPENAI_KEY_PATH, DEFAULT_REMOTE_MODEL
+            "Paste your OpenAI API key. bunzo will persist it under /var/lib/bunzo/secrets/ and render {} for {}.",
+            BUNZOD_CONFIG_PATH, DEFAULT_REMOTE_MODEL
         )
         .dark_grey()
     )?;
@@ -1800,17 +1899,29 @@ fn run_openai_setup(
         return Ok(false);
     }
 
-    write_openai_setup(&key)?;
-    writeln!(
-        stdout,
-        "{}",
-        format!(
-            "saved API key and configured bunzod to use {}",
-            DEFAULT_REMOTE_MODEL
-        )
-        .green()
-    )?;
-    Ok(true)
+    match apply_local_openai_setup("setup-apply".into(), None, key) {
+        Ok(status) => {
+            let device_name = status.device_name.as_deref().unwrap_or("this device");
+            writeln!(
+                stdout,
+                "{}",
+                format!(
+                    "saved provisioning state for {device_name} and rendered bunzod for {}",
+                    status.model.as_deref().unwrap_or(DEFAULT_REMOTE_MODEL)
+                )
+                .green()
+            )?;
+            Ok(true)
+        }
+        Err(err) => {
+            writeln!(
+                stdout,
+                "{}",
+                format!("setup failed: {}", provisioning_error_text(err)).red()
+            )?;
+            Ok(false)
+        }
+    }
 }
 
 fn read_secret_line(stdin: &mut impl BufRead, stdout: &mut Stdout) -> io::Result<String> {
@@ -1825,30 +1936,15 @@ fn read_secret_line(stdin: &mut impl BufRead, stdout: &mut Stdout) -> io::Result
     Ok(line.trim().to_string())
 }
 
-fn write_openai_setup(key: &str) -> io::Result<()> {
-    fs::create_dir_all(BUNZOD_CONFIG_DIR)?;
-    fs::set_permissions(BUNZOD_CONFIG_DIR, fs::Permissions::from_mode(0o755))?;
-    write_file_with_mode(
-        BUNZOD_CONFIG_PATH,
-        &format!(
-            concat!(
-                "# Written by bunzo-shell setup.\n",
-                "[backend]\n",
-                "kind = \"openai\"\n",
-                "model = \"{}\"\n",
-                "api_key_path = \"{}\"\n",
-            ),
-            DEFAULT_REMOTE_MODEL, OPENAI_KEY_PATH
-        ),
-        0o644,
-    )?;
-    write_file_with_mode(OPENAI_KEY_PATH, &format!("{key}\n"), 0o600)?;
-    Ok(())
-}
-
-fn write_file_with_mode(path: &str, contents: &str, mode: u32) -> io::Result<()> {
-    fs::write(path, contents)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+fn provisioning_issue_text(status: &ProvisioningStatus) -> String {
+    let detail = status
+        .detail
+        .as_deref()
+        .unwrap_or("setup has not completed yet");
+    format!(
+        "provisioning phase '{}' is not ready: {}",
+        status.phase, detail
+    )
 }
 
 struct StdinEchoGuard {
@@ -2015,10 +2111,7 @@ mod tests {
             "unconfigured",
             "reading /etc/bunzo/bunzod.toml"
         ));
-        assert!(should_offer_setup(
-            "backend_init_failed",
-            "reading api key from /etc/bunzo/openai.key"
-        ));
+        assert!(should_offer_setup("backend_init_failed", "api key missing"));
         assert!(should_offer_setup(
             "backend_error",
             "unsupported OpenAI model 'gpt-4o-mini'"
@@ -2027,19 +2120,23 @@ mod tests {
     }
 
     #[test]
-    fn setup_writes_expected_config() {
-        let cfg = format!(
-            concat!(
-                "# Written by bunzo-shell setup.\n",
-                "[backend]\n",
-                "kind = \"openai\"\n",
-                "model = \"{}\"\n",
-                "api_key_path = \"{}\"\n",
-            ),
-            DEFAULT_REMOTE_MODEL, OPENAI_KEY_PATH
-        );
-        assert!(cfg.contains("model = \"gpt-5.4-mini\""));
-        assert!(cfg.contains("api_key_path = \"/etc/bunzo/openai.key\""));
+    fn provisioning_issue_text_surfaces_phase_and_detail() {
+        let status = ProvisioningStatus {
+            phase: "failed_recoverable".into(),
+            ready: false,
+            device_name: Some("bunzo-qemu".into()),
+            connectivity_kind: Some("existing_network".into()),
+            provider_kind: Some("openai".into()),
+            model: Some(DEFAULT_REMOTE_MODEL.into()),
+            rendered_config_path: Some(BUNZOD_CONFIG_PATH.into()),
+            secret_path: Some("/var/lib/bunzo/secrets/openai.key".into()),
+            detail: Some("reading api key from /var/lib/bunzo/secrets/openai.key".into()),
+            updated_at_ms: 0,
+        };
+
+        let text = provisioning_issue_text(&status);
+        assert!(text.contains("failed_recoverable"));
+        assert!(text.contains("/var/lib/bunzo/secrets/openai.key"));
     }
 
     #[test]
