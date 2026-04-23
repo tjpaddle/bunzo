@@ -56,16 +56,21 @@ Open work:
   on restart/boot
 - [x] Validate provider credentials before declaring setup complete
 - [x] Add the headless phone/browser setup frontend
-- [ ] Broaden hostname/network activation beyond the current
-  `existing_network` slice boundary
+- [x] Make device name a real provisioning-owned hostname and reconcile it on
+  restart/boot
+- [x] Make the current `existing_network` path render and reconcile explicit
+  runtime-facing network config from canonical provisioning state
+- [ ] Broaden connectivity beyond the current `existing_network` slice
+  boundary
 
 **Current status:** QEMU-verified. `bunzo-provisiond` persists canonical state
 under `/var/lib/bunzo/`, `/setup` talks to its socket API, provider
 credentials are live-validated before `ready`, canonical provisioning state
-re-renders `/etc/bunzo/bunzod.toml` on restart/boot, and a new
-`bunzo-setup-httpd` frontend now exposes the same setup/status flow over the
-QEMU/dev network path. The remaining M7 work is broader hostname/network
-activation beyond the current `existing_network` default.
+now re-renders `/etc/hostname`, `/etc/network/interfaces`, and
+`/etc/bunzo/bunzod.toml` on restart/boot, and `bunzo-setup-httpd` exposes the
+same setup/status flow over the QEMU/dev network path. Device name is now a
+real live + persistent hostname, while connectivity remains intentionally
+narrow to the explicit `existing_network` path.
 
 **Definition of done:** a user can complete setup locally or from a phone, both
 paths end in the same persisted config, and `/setup` is just one frontend to

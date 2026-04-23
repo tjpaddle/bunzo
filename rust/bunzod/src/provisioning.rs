@@ -8,10 +8,11 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bunzo_proto::async_io::{read_frame_async, write_frame_async};
 use bunzo_proto::{
@@ -30,8 +31,11 @@ pub const SOCKET_PATH: &str = "/run/bunzo-provisiond.sock";
 pub const DEFAULT_CONFIG_DIR: &str = "/var/lib/bunzo/config";
 pub const DEFAULT_SECRETS_DIR: &str = "/var/lib/bunzo/secrets";
 pub const DEFAULT_PROVISIONING_DIR: &str = "/var/lib/bunzo/provisioning";
+pub const DEFAULT_RUNTIME_ROOT_DIR: &str = "/etc";
 pub const DEFAULT_RUNTIME_CONFIG_DIR: &str = "/etc/bunzo";
 pub const DEFAULT_RUNTIME_CONFIG_PATH: &str = "/etc/bunzo/bunzod.toml";
+pub const DEFAULT_RUNTIME_HOSTNAME_PATH: &str = "/etc/hostname";
+pub const DEFAULT_RUNTIME_NETWORK_INTERFACES_PATH: &str = "/etc/network/interfaces";
 
 const DEVICE_CONFIG_NAME: &str = "device.toml";
 const NETWORK_CONFIG_NAME: &str = "network.toml";
@@ -39,16 +43,22 @@ const PROVIDER_CONFIG_NAME: &str = "provider.toml";
 const STATE_FILE_NAME: &str = "state.toml";
 const OPENAI_SECRET_NAME: &str = "openai.key";
 const CONNECTIVITY_KIND_EXISTING_NETWORK: &str = "existing_network";
+const EXISTING_NETWORK_INTERFACE: &str = "eth0";
 const PROVIDER_KIND_OPENAI: &str = "openai";
 const FRONTEND_SOURCE_SHARED: &str = "provisioning_frontend";
+const NETWORK_SERVICE_NAME: &str = "network.service";
+const MAX_DEVICE_NAME_LEN: usize = 63;
 
 #[derive(Debug, Clone)]
 pub struct ProvisioningPaths {
     pub config_dir: PathBuf,
     pub secrets_dir: PathBuf,
     pub provisioning_dir: PathBuf,
+    pub runtime_root_dir: PathBuf,
     pub runtime_config_dir: PathBuf,
     pub runtime_config_path: PathBuf,
+    pub runtime_hostname_path: PathBuf,
+    pub runtime_network_interfaces_path: PathBuf,
 }
 
 impl Default for ProvisioningPaths {
@@ -57,8 +67,11 @@ impl Default for ProvisioningPaths {
             config_dir: PathBuf::from(DEFAULT_CONFIG_DIR),
             secrets_dir: PathBuf::from(DEFAULT_SECRETS_DIR),
             provisioning_dir: PathBuf::from(DEFAULT_PROVISIONING_DIR),
+            runtime_root_dir: PathBuf::from(DEFAULT_RUNTIME_ROOT_DIR),
             runtime_config_dir: PathBuf::from(DEFAULT_RUNTIME_CONFIG_DIR),
             runtime_config_path: PathBuf::from(DEFAULT_RUNTIME_CONFIG_PATH),
+            runtime_hostname_path: PathBuf::from(DEFAULT_RUNTIME_HOSTNAME_PATH),
+            runtime_network_interfaces_path: PathBuf::from(DEFAULT_RUNTIME_NETWORK_INTERFACES_PATH),
         }
     }
 }
@@ -149,6 +162,8 @@ struct DeviceConfig {
 struct NetworkConfig {
     kind: String,
     source: String,
+    #[serde(default = "default_existing_network_interface")]
+    interface_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,8 +209,16 @@ trait ProviderValidator: Send + Sync {
     ) -> Result<()>;
 }
 
+trait RuntimeActivator: Send + Sync {
+    fn set_live_hostname(&self, device_name: &str) -> Result<()>;
+    fn restart_network_if_active(&self) -> Result<()>;
+}
+
 #[derive(Default)]
 struct LiveProviderValidator;
+
+#[derive(Default)]
+struct LiveRuntimeActivator;
 
 #[async_trait]
 impl ProviderValidator for LiveProviderValidator {
@@ -211,28 +234,74 @@ impl ProviderValidator for LiveProviderValidator {
     }
 }
 
+impl RuntimeActivator for LiveRuntimeActivator {
+    fn set_live_hostname(&self, device_name: &str) -> Result<()> {
+        let status = Command::new("hostname")
+            .arg(device_name)
+            .status()
+            .with_context(|| format!("setting live hostname to '{device_name}'"))?;
+        if !status.success() {
+            bail!("hostname {device_name} exited with {status}");
+        }
+        Ok(())
+    }
+
+    fn restart_network_if_active(&self) -> Result<()> {
+        let status = Command::new("systemctl")
+            .args(["is-active", "--quiet", NETWORK_SERVICE_NAME])
+            .status()
+            .context("checking network.service state")?;
+        if !status.success() {
+            return Ok(());
+        }
+
+        let status = Command::new("systemctl")
+            .args(["restart", NETWORK_SERVICE_NAME])
+            .status()
+            .context("restarting network.service")?;
+        if !status.success() {
+            bail!("systemctl restart {NETWORK_SERVICE_NAME} exited with {status}");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct ProvisioningEngine {
     paths: ProvisioningPaths,
     validator: Arc<dyn ProviderValidator>,
+    activator: Arc<dyn RuntimeActivator>,
 }
 
 impl Default for ProvisioningEngine {
     fn default() -> Self {
-        Self::with_validator(
+        Self::with_components(
             ProvisioningPaths::default(),
             Arc::new(LiveProviderValidator),
+            Arc::new(LiveRuntimeActivator),
         )
     }
 }
 
 impl ProvisioningEngine {
     pub fn new(paths: ProvisioningPaths) -> Self {
-        Self::with_validator(paths, Arc::new(LiveProviderValidator))
+        Self::with_components(
+            paths,
+            Arc::new(LiveProviderValidator),
+            Arc::new(LiveRuntimeActivator),
+        )
     }
 
-    fn with_validator(paths: ProvisioningPaths, validator: Arc<dyn ProviderValidator>) -> Self {
-        Self { paths, validator }
+    fn with_components(
+        paths: ProvisioningPaths,
+        validator: Arc<dyn ProviderValidator>,
+        activator: Arc<dyn RuntimeActivator>,
+    ) -> Self {
+        Self {
+            paths,
+            validator,
+            activator,
+        }
     }
 
     pub fn status(&self) -> Result<ProvisioningStatus> {
@@ -294,27 +363,19 @@ impl ProvisioningEngine {
         self.ensure_dirs()?;
 
         let mut state = self.load_state()?.unwrap_or_default();
-        let device_name = setup
-            .device_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                self.read_toml::<DeviceConfig>(&self.paths.device_config_path())
-                    .ok()
-                    .map(|cfg| cfg.device_name)
-            })
-            .unwrap_or_else(current_device_name);
+        let device_name = match self.resolve_device_name(setup.device_name.as_deref()) {
+            Ok(device_name) => device_name,
+            Err(err) => {
+                self.write_failed_state(&state, &format!("{err:#}"))?;
+                return Err(err);
+            }
+        };
+        let device_cfg = DeviceConfig { device_name };
 
-        state.device_name = Some(device_name.clone());
+        state.device_name = Some(device_cfg.device_name.clone());
         state.last_error = None;
         self.write_state_checkpoint(&mut state, ProvisioningPhase::Naming)?;
-        self.write_toml_atomic(
-            &self.paths.device_config_path(),
-            &DeviceConfig { device_name },
-            0o600,
-        )?;
+        self.write_toml_atomic(&self.paths.device_config_path(), &device_cfg, 0o600)?;
 
         let connectivity_kind = setup
             .connectivity_kind
@@ -323,21 +384,21 @@ impl ProvisioningEngine {
             .filter(|kind| !kind.is_empty())
             .unwrap_or(CONNECTIVITY_KIND_EXISTING_NETWORK);
         if connectivity_kind != CONNECTIVITY_KIND_EXISTING_NETWORK {
-            bail!(
+            let err = anyhow!(
                 "unsupported connectivity kind '{connectivity_kind}'; this slice only supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}'"
             );
+            self.write_failed_state(&state, &format!("{err:#}"))?;
+            return Err(err);
         }
 
+        let network_cfg = NetworkConfig {
+            kind: connectivity_kind.into(),
+            source: FRONTEND_SOURCE_SHARED.into(),
+            interface_name: default_existing_network_interface(),
+        };
         state.connectivity_kind = Some(connectivity_kind.into());
         self.write_state_checkpoint(&mut state, ProvisioningPhase::Connectivity)?;
-        self.write_toml_atomic(
-            &self.paths.network_config_path(),
-            &NetworkConfig {
-                kind: connectivity_kind.into(),
-                source: FRONTEND_SOURCE_SHARED.into(),
-            },
-            0o600,
-        )?;
+        self.write_toml_atomic(&self.paths.network_config_path(), &network_cfg, 0o600)?;
 
         let provider_kind = setup
             .provider_kind
@@ -346,9 +407,11 @@ impl ProvisioningEngine {
             .filter(|kind| !kind.is_empty())
             .unwrap_or(PROVIDER_KIND_OPENAI);
         if provider_kind != PROVIDER_KIND_OPENAI {
-            bail!(
+            let err = anyhow!(
                 "unsupported provider kind '{provider_kind}'; this slice only supports '{PROVIDER_KIND_OPENAI}'"
             );
+            self.write_failed_state(&state, &format!("{err:#}"))?;
+            return Err(err);
         }
 
         let provider_cfg = ProviderConfig {
@@ -375,7 +438,9 @@ impl ProvisioningEngine {
         self.write_state_checkpoint(&mut state, ProvisioningPhase::Validating)?;
 
         if let Err(err) = self
-            .render_runtime_config(&provider_cfg)
+            .apply_runtime_hostname(&device_cfg)
+            .and_then(|_| self.apply_runtime_network(&network_cfg))
+            .and_then(|_| self.render_runtime_config(&provider_cfg))
             .and_then(|_| self.validate_rendered_runtime())
         {
             self.write_failed_state(&state, &format!("{err:#}"))?;
@@ -400,32 +465,29 @@ impl ProvisioningEngine {
         };
         let original = state.clone();
 
-        if let Some(device) =
-            self.read_optional_toml::<DeviceConfig>(&self.paths.device_config_path())?
-        {
-            state.device_name = Some(device.device_name);
-        }
-        if let Some(network) =
-            self.read_optional_toml::<NetworkConfig>(&self.paths.network_config_path())?
-        {
-            state.connectivity_kind = Some(network.kind);
+        let device_cfg =
+            self.read_optional_toml::<DeviceConfig>(&self.paths.device_config_path())?;
+        if let Some(device) = &device_cfg {
+            state.device_name = Some(device.device_name.clone());
         }
 
-        let Some(provider_cfg) =
-            self.read_optional_toml::<ProviderConfig>(&self.paths.provider_config_path())?
-        else {
-            if state != original {
-                self.persist_state(&mut state)?;
-            }
-            return Ok(());
-        };
+        let network_cfg =
+            self.read_optional_toml::<NetworkConfig>(&self.paths.network_config_path())?;
+        if let Some(network) = &network_cfg {
+            state.connectivity_kind = Some(network.kind.clone());
+        }
 
-        self.apply_provider_metadata(&mut state, &provider_cfg);
+        let provider_cfg =
+            self.read_optional_toml::<ProviderConfig>(&self.paths.provider_config_path())?;
+        if let Some(provider_cfg) = &provider_cfg {
+            self.apply_provider_metadata(&mut state, provider_cfg);
+        }
 
-        match self
-            .render_runtime_config(&provider_cfg)
-            .and_then(|_| self.validate_rendered_runtime())
-        {
+        match self.reconcile_runtime_outputs(
+            device_cfg.as_ref(),
+            network_cfg.as_ref(),
+            provider_cfg.as_ref(),
+        ) {
             Ok(()) => {
                 if matches!(state.phase, ProvisioningPhase::Ready) {
                     state.last_error = None;
@@ -512,6 +574,75 @@ impl ProvisioningEngine {
         }
     }
 
+    fn resolve_device_name(&self, requested_device_name: Option<&str>) -> Result<String> {
+        if let Some(requested) = requested_device_name {
+            return normalize_device_name(requested);
+        }
+
+        self.read_toml::<DeviceConfig>(&self.paths.device_config_path())
+            .ok()
+            .map(|cfg| cfg.device_name)
+            .map(Ok)
+            .unwrap_or_else(|| Ok(self.current_device_name()))
+    }
+
+    fn current_device_name(&self) -> String {
+        fs::read_to_string(&self.paths.runtime_hostname_path)
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "bunzo".into())
+    }
+
+    fn reconcile_runtime_outputs(
+        &self,
+        device_cfg: Option<&DeviceConfig>,
+        network_cfg: Option<&NetworkConfig>,
+        provider_cfg: Option<&ProviderConfig>,
+    ) -> Result<()> {
+        if let Some(device_cfg) = device_cfg {
+            self.apply_runtime_hostname(device_cfg)?;
+        }
+        if let Some(network_cfg) = network_cfg {
+            self.apply_runtime_network(network_cfg)?;
+        }
+        if let Some(provider_cfg) = provider_cfg {
+            self.render_runtime_config(provider_cfg)?;
+            self.validate_rendered_runtime()?;
+        }
+        Ok(())
+    }
+
+    fn apply_runtime_hostname(&self, device_cfg: &DeviceConfig) -> Result<()> {
+        let device_name = normalize_device_name(&device_cfg.device_name)?;
+        let hostname_body = format!("{device_name}\n");
+        self.write_string_if_changed(&self.paths.runtime_hostname_path, &hostname_body, 0o644)?;
+        self.activator.set_live_hostname(&device_name)
+    }
+
+    fn apply_runtime_network(&self, network_cfg: &NetworkConfig) -> Result<()> {
+        if network_cfg.kind != CONNECTIVITY_KIND_EXISTING_NETWORK {
+            bail!(
+                "unsupported connectivity kind '{}'; this slice only supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}'",
+                network_cfg.kind
+            );
+        }
+
+        let interface_name = normalize_network_interface_name(&network_cfg.interface_name)?;
+        let body = render_existing_network_interfaces(&interface_name);
+        let changed = self.write_string_if_changed(
+            &self.paths.runtime_network_interfaces_path,
+            &body,
+            0o644,
+        )?;
+        if changed {
+            self.activator.restart_network_if_active()?;
+        }
+        Ok(())
+    }
+
     fn render_runtime_config(&self, provider_cfg: &ProviderConfig) -> Result<()> {
         let rendered = match &provider_cfg.backend {
             CanonicalBackendConfig::Openai {
@@ -586,13 +717,25 @@ impl ProvisioningEngine {
         self.write_string_atomic(path, &body, mode)
     }
 
+    fn write_string_if_changed(&self, path: &Path, contents: &str, mode: u32) -> Result<bool> {
+        if let Ok(existing) = fs::read_to_string(path) {
+            if existing == contents {
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("chmod {:o} {}", mode, path.display()))?;
+                return Ok(false);
+            }
+        }
+        self.write_string_atomic(path, contents, mode)?;
+        Ok(true)
+    }
+
     fn write_string_atomic(&self, path: &Path, contents: &str, mode: u32) -> Result<()> {
         let parent = path
             .parent()
             .with_context(|| format!("{} has no parent directory", path.display()))?;
         ensure_dir_mode(
             parent,
-            if path.starts_with(&self.paths.runtime_config_dir) {
+            if path.starts_with(&self.paths.runtime_root_dir) {
                 0o755
             } else {
                 0o700
@@ -771,7 +914,7 @@ fn default_phase_detail(phase: &ProvisioningPhase) -> &'static str {
     match phase {
         ProvisioningPhase::Unprovisioned => "setup has not completed yet",
         ProvisioningPhase::Naming => "device identity is being persisted",
-        ProvisioningPhase::Connectivity => "current connectivity mode is being persisted",
+        ProvisioningPhase::Connectivity => "runtime connectivity config is being persisted",
         ProvisioningPhase::Provider => "provider config is being persisted",
         ProvisioningPhase::Validating => "rendered runtime config is being validated",
         ProvisioningPhase::Ready => "runtime config is ready",
@@ -779,14 +922,61 @@ fn default_phase_detail(phase: &ProvisioningPhase) -> &'static str {
     }
 }
 
-fn current_device_name() -> String {
-    fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|name| !name.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "bunzo".into())
+fn default_existing_network_interface() -> String {
+    EXISTING_NETWORK_INTERFACE.into()
+}
+
+fn normalize_device_name(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("device name cannot be empty");
+    }
+    if trimmed.len() > MAX_DEVICE_NAME_LEN {
+        bail!("device name '{trimmed}' exceeds {MAX_DEVICE_NAME_LEN} characters");
+    }
+    let bytes = trimmed.as_bytes();
+    if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+        bail!("device name '{trimmed}' must start and end with an ASCII letter or digit");
+    }
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    {
+        bail!("device name '{trimmed}' must contain only ASCII letters, digits, or hyphens");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_network_interface_name(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("network interface name cannot be empty");
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+    {
+        bail!("network interface name '{trimmed}' contains unsupported characters");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn render_existing_network_interfaces(interface_name: &str) -> String {
+    format!(
+        concat!(
+            "# interface file auto-generated by buildroot\n",
+            "\n",
+            "auto lo\n",
+            "iface lo inet loopback\n",
+            "\n",
+            "auto {interface_name}\n",
+            "iface {interface_name} inet dhcp\n",
+            "  pre-up /etc/network/nfs_check\n",
+            "  wait-delay 15\n",
+            "  hostname $(hostname)\n"
+        ),
+        interface_name = interface_name
+    )
 }
 
 fn ensure_dir_mode(path: &Path, mode: u32) -> Result<()> {
@@ -813,7 +1003,8 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use anyhow::bail;
     use tempfile::TempDir;
@@ -849,34 +1040,105 @@ mod tests {
         }
     }
 
+    struct StubRuntimeActivator {
+        hostname_result: std::result::Result<(), String>,
+        network_result: std::result::Result<(), String>,
+        hostname_calls: Mutex<Vec<String>>,
+        network_restart_calls: AtomicUsize,
+    }
+
+    impl StubRuntimeActivator {
+        fn success() -> Arc<Self> {
+            Arc::new(Self {
+                hostname_result: Ok(()),
+                network_result: Ok(()),
+                hostname_calls: Mutex::new(Vec::new()),
+                network_restart_calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn hostname_failure(message: &str) -> Arc<Self> {
+            Arc::new(Self {
+                hostname_result: Err(message.to_string()),
+                network_result: Ok(()),
+                hostname_calls: Mutex::new(Vec::new()),
+                network_restart_calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl RuntimeActivator for StubRuntimeActivator {
+        fn set_live_hostname(&self, device_name: &str) -> Result<()> {
+            self.hostname_calls
+                .lock()
+                .unwrap()
+                .push(device_name.to_string());
+            match &self.hostname_result {
+                Ok(()) => Ok(()),
+                Err(message) => bail!("{message}"),
+            }
+        }
+
+        fn restart_network_if_active(&self) -> Result<()> {
+            self.network_restart_calls.fetch_add(1, Ordering::Relaxed);
+            match &self.network_result {
+                Ok(()) => Ok(()),
+                Err(message) => bail!("{message}"),
+            }
+        }
+    }
+
     fn test_paths(tmp: &TempDir) -> ProvisioningPaths {
         let root = tmp.path();
+        let runtime_root = root.join("etc");
+        fs::create_dir_all(runtime_root.join("network")).unwrap();
+        fs::write(runtime_root.join("hostname"), "bunzo\n").unwrap();
         ProvisioningPaths {
             config_dir: root.join("var/lib/bunzo/config"),
             secrets_dir: root.join("var/lib/bunzo/secrets"),
             provisioning_dir: root.join("var/lib/bunzo/provisioning"),
+            runtime_root_dir: runtime_root.clone(),
             runtime_config_dir: root.join("etc/bunzo"),
             runtime_config_path: root.join("etc/bunzo/bunzod.toml"),
+            runtime_hostname_path: runtime_root.join("hostname"),
+            runtime_network_interfaces_path: runtime_root.join("network/interfaces"),
         }
     }
 
-    fn test_engine(tmp: &TempDir, validator: Arc<dyn ProviderValidator>) -> ProvisioningEngine {
-        ProvisioningEngine::with_validator(test_paths(tmp), validator)
+    fn test_engine(
+        tmp: &TempDir,
+        validator: Arc<dyn ProviderValidator>,
+        activator: Arc<dyn RuntimeActivator>,
+    ) -> ProvisioningEngine {
+        ProvisioningEngine::with_components(test_paths(tmp), validator, activator)
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn local_setup_writes_canonical_state_and_renders_runtime_config() {
+    async fn local_setup_writes_canonical_state_and_runtime_outputs() {
         let tmp = TempDir::new().unwrap();
-        let engine = test_engine(&tmp, StubValidator::success());
+        let activator = StubRuntimeActivator::success();
+        let engine = test_engine(&tmp, StubValidator::success(), activator.clone());
 
         let status = engine
-            .apply_local_setup_async(None, "sk-test")
+            .apply_local_setup_async(Some("bunzo-qemu"), "sk-test")
             .await
             .unwrap();
         assert!(status.ready);
         assert_eq!(status.phase, "ready");
+        assert_eq!(status.device_name.as_deref(), Some("bunzo-qemu"));
         assert_eq!(status.provider_kind.as_deref(), Some("openai"));
         assert_eq!(status.model.as_deref(), Some("gpt-5.4-mini"));
+
+        let device: DeviceConfig = engine
+            .read_toml(&engine.paths.device_config_path())
+            .expect("device config");
+        assert_eq!(device.device_name, "bunzo-qemu");
+
+        let network: NetworkConfig = engine
+            .read_toml(&engine.paths.network_config_path())
+            .expect("network config");
+        assert_eq!(network.kind, "existing_network");
+        assert_eq!(network.interface_name, "eth0");
 
         let provider: ProviderConfig = engine
             .read_toml(&engine.paths.provider_config_path())
@@ -905,12 +1167,80 @@ mod tests {
 
         let secret = fs::read_to_string(engine.paths.openai_secret_path()).unwrap();
         assert_eq!(secret.trim(), "sk-test");
+
+        let hostname = fs::read_to_string(&engine.paths.runtime_hostname_path).unwrap();
+        assert_eq!(hostname.trim(), "bunzo-qemu");
+
+        let interfaces = fs::read_to_string(&engine.paths.runtime_network_interfaces_path).unwrap();
+        assert!(interfaces.contains("auto eth0"));
+        assert!(interfaces.contains("hostname $(hostname)"));
+
+        let hostname_calls = activator.hostname_calls.lock().unwrap().clone();
+        assert_eq!(
+            hostname_calls,
+            vec!["bunzo-qemu".to_string(), "bunzo-qemu".to_string()]
+        );
+        assert_eq!(activator.network_restart_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_device_name_stays_non_ready_with_detail() {
+        let tmp = TempDir::new().unwrap();
+        let engine = test_engine(
+            &tmp,
+            StubValidator::success(),
+            StubRuntimeActivator::success(),
+        );
+
+        let err = engine
+            .apply_local_setup_async(Some("bunzo qemu"), "sk-test")
+            .await
+            .expect_err("device name should fail");
+        assert!(format!("{err:#}").contains("must contain only ASCII letters, digits, or hyphens"));
+
+        let status = engine.status().unwrap();
+        assert!(!status.ready);
+        assert_eq!(status.phase, "failed_recoverable");
+        assert!(status
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("must contain only ASCII letters, digits, or hyphens"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hostname_activation_failures_stay_recoverable() {
+        let tmp = TempDir::new().unwrap();
+        let engine = test_engine(
+            &tmp,
+            StubValidator::success(),
+            StubRuntimeActivator::hostname_failure("sethostname failed"),
+        );
+
+        let err = engine
+            .apply_local_setup_async(Some("bunzo-qemu"), "sk-test")
+            .await
+            .expect_err("hostname activation should fail");
+        assert!(format!("{err:#}").contains("sethostname failed"));
+
+        let status = engine.status().unwrap();
+        assert!(!status.ready);
+        assert_eq!(status.phase, "failed_recoverable");
+        assert!(status
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("sethostname failed"));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn failed_live_validation_stays_non_ready_with_detail() {
         let tmp = TempDir::new().unwrap();
-        let engine = test_engine(&tmp, StubValidator::failure("authentication failed"));
+        let engine = test_engine(
+            &tmp,
+            StubValidator::failure("authentication failed"),
+            StubRuntimeActivator::success(),
+        );
 
         let err = engine
             .apply_local_setup_async(None, "sk-test")
@@ -931,13 +1261,18 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn reconcile_recreates_runtime_config_for_ready_state() {
         let tmp = TempDir::new().unwrap();
-        let engine = test_engine(&tmp, StubValidator::success());
+        let engine = test_engine(
+            &tmp,
+            StubValidator::success(),
+            StubRuntimeActivator::success(),
+        );
         engine
-            .apply_local_setup_async(None, "sk-test")
+            .apply_local_setup_async(Some("bunzo-qemu"), "sk-test")
             .await
             .unwrap();
 
         fs::write(&engine.paths.runtime_config_path, "broken = true\n").unwrap();
+        fs::write(&engine.paths.runtime_hostname_path, "wrong\n").unwrap();
         engine.reconcile_runtime_state().unwrap();
 
         let status = engine.status().unwrap();
@@ -945,12 +1280,18 @@ mod tests {
         let runtime_cfg = fs::read_to_string(&engine.paths.runtime_config_path).unwrap();
         assert!(runtime_cfg.contains("kind = \"openai\""));
         assert!(!runtime_cfg.contains("broken = true"));
+        let hostname = fs::read_to_string(&engine.paths.runtime_hostname_path).unwrap();
+        assert_eq!(hostname.trim(), "bunzo-qemu");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn reconcile_does_not_promote_failed_validation_to_ready() {
         let tmp = TempDir::new().unwrap();
-        let engine = test_engine(&tmp, StubValidator::failure("authentication failed"));
+        let engine = test_engine(
+            &tmp,
+            StubValidator::failure("authentication failed"),
+            StubRuntimeActivator::success(),
+        );
         let _ = engine.apply_local_setup_async(None, "sk-test").await;
 
         fs::remove_file(&engine.paths.runtime_config_path).unwrap();
@@ -965,7 +1306,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn broken_rendered_runtime_reports_failed_recoverable() {
         let tmp = TempDir::new().unwrap();
-        let engine = test_engine(&tmp, StubValidator::success());
+        let engine = test_engine(
+            &tmp,
+            StubValidator::success(),
+            StubRuntimeActivator::success(),
+        );
         engine
             .apply_local_setup_async(None, "sk-test")
             .await

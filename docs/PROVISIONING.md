@@ -16,11 +16,14 @@ The first three M7 provisioning slices are now landed:
   canonical `/var/lib/bunzo/` state
 - `bunzo-setup-httpd` now exposes the same setup/status flow over HTTP on the
   current dev/QEMU network path
+- device name is now a real live + persistent system hostname owned by
+  canonical provisioning state
+- the current `existing_network` path now renders and reconciles
+  `/etc/network/interfaces` from canonical provisioning state
 
 Still open:
 
-- hostname/network activation beyond the local-shell defaults used in this
-  current slice
+- broader connectivity beyond the current `existing_network` slice
 
 ## Required outcome
 
@@ -75,12 +78,14 @@ That is enough to get the device into a useful ready state.
 
 In the current landed slice set, the engine seeds:
 
-- device name from the current hostname unless a frontend overrides it
-- connectivity as `existing_network`
+- device name from the current hostname unless a frontend overrides it, then
+  applies it as the live + persistent system hostname
+- connectivity as `existing_network`, rendered into the current
+  `/etc/network/interfaces` runtime output
 - provider as OpenAI with the current GPT-5.4-family restriction
 
 That keeps the state machine and durable ownership real while leaving broader
-hostname/network activation for the next slice.
+connectivity work for the next slice.
 
 ## Frontends
 
@@ -125,15 +130,19 @@ Suggested durable layout:
 
 Then a renderer/activation step materializes runtime-facing files such as:
 
+- `/etc/hostname`
+- `/etc/network/interfaces`
 - `/etc/bunzo/bunzod.toml`
-- hostname/network runtime config
 
-The current slice renders only `/etc/bunzo/bunzod.toml`. Hostname/network
-activation still remains future work.
+The current slice now renders all three of those runtime-facing outputs, but
+the connectivity side is still intentionally narrow to the `existing_network`
+path.
 
 Boot-time reconciliation is currently handled by
 `bunzo-provisioning-reconcile.service`, while `bunzo-provisiond` and `bunzod`
-also re-check canonical state on startup for defense in depth.
+also re-check canonical state on startup for defense in depth. That
+reconciliation now re-applies the runtime hostname, the current
+`existing_network` interfaces file, and `/etc/bunzo/bunzod.toml`.
 
 ## Handoff into normal runtime
 
@@ -172,6 +181,7 @@ This should not require reflashing the image.
 Status:
 
 - Steps 1 through 5 are now live for the current OpenAI path, including
-  live provider validation, boot-time runtime-config reconciliation, and the
-  first browser-accessible headless frontend
-- The remaining provisioning work is broader hostname/network activation
+  live provider validation, boot-time runtime hostname/network/config
+  reconciliation, and the first browser-accessible headless frontend
+- The remaining provisioning work is broader connectivity beyond
+  `existing_network`

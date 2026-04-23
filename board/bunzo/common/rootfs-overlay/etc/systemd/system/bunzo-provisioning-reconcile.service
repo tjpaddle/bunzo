@@ -2,11 +2,11 @@
 Description=bunzo provisioning reconciliation
 Documentation=https://github.com/tjpaddle/bunzo
 After=local-fs.target systemd-tmpfiles-setup.service
-Before=sockets.target bunzo-shell.service bunzo-schedulerd.service
+Before=network.service network.target network-online.target sockets.target bunzo-shell.service bunzo-schedulerd.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/bunzo-provisiond --reconcile-once
 
 [Install]
-WantedBy=sockets.target
+WantedBy=sysinit.target

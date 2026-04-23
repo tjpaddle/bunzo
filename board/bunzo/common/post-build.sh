@@ -74,7 +74,7 @@ echo "post-build: bunzo-shell.service enabled via [Install]; recovery via kernel
 echo "post-build: bunzod.socket enabled via [Install]; bunzod.service is socket-activated (no [Install])"
 echo "post-build: bunzo-provisiond.socket enabled via [Install]; provisioning owns /var/lib/bunzo/{config,secrets,provisioning}"
 echo "post-build: bunzo-setup-http.socket enabled via [Install]; the headless browser frontend stays thin and calls bunzo-provisiond over the provisioning socket"
-echo "post-build: bunzo-provisioning-reconcile.service re-renders /etc/bunzo/bunzod.toml from canonical /var/lib/bunzo/ state during boot"
+echo "post-build: bunzo-provisioning-reconcile.service re-applies /etc/hostname, /etc/network/interfaces, and /etc/bunzo/bunzod.toml from canonical /var/lib/bunzo/ state during boot"
 echo "post-build: bunzo-schedulerd.service enabled via [Install]; it claims due jobs from the runtime store"
 
 echo "post-build: bunzo rootfs verified ($(grep '^PRETTY_NAME=' "${TARGET_DIR}/etc/os-release"))"

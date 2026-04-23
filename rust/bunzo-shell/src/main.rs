@@ -1875,6 +1875,12 @@ fn run_openai_setup(
     stdout: &mut Stdout,
     reason: Option<&str>,
 ) -> io::Result<bool> {
+    let current_status = request_provisioning_status("setup-prompt-status".into()).ok();
+    let current_device_name = current_status
+        .as_ref()
+        .and_then(|status| status.device_name.as_deref())
+        .unwrap_or("bunzo");
+
     writeln!(stdout)?;
     writeln!(
         stdout,
@@ -1888,12 +1894,24 @@ fn run_openai_setup(
         stdout,
         "{}",
         format!(
-            "Paste your OpenAI API key. bunzo will persist it under /var/lib/bunzo/secrets/ and render {} for {}.",
+            "Choose the device name to use as the system hostname, then paste your OpenAI API key. bunzo will persist canonical state under /var/lib/bunzo/ and render {} for {}.",
             BUNZOD_CONFIG_PATH, DEFAULT_REMOTE_MODEL
         )
         .dark_grey()
     )?;
-    writeln!(stdout, "{}", "Leave it blank to cancel.".dark_grey())?;
+    writeln!(
+        stdout,
+        "{}",
+        format!("Press Enter to keep the current device name ({current_device_name}).").dark_grey()
+    )?;
+    write!(stdout, "{} ", "device name>".cyan().bold())?;
+    stdout.flush()?;
+    let requested_device_name = read_line(stdin)?;
+    writeln!(
+        stdout,
+        "{}",
+        "Leave the API key blank to cancel.".dark_grey()
+    )?;
     write!(stdout, "{} ", "api key>".cyan().bold())?;
     stdout.flush()?;
 
@@ -1903,7 +1921,8 @@ fn run_openai_setup(
         return Ok(false);
     }
 
-    match apply_local_openai_setup("setup-apply".into(), None, key) {
+    let device_name = (!requested_device_name.trim().is_empty()).then_some(requested_device_name);
+    match apply_local_openai_setup("setup-apply".into(), device_name, key) {
         Ok(status) => {
             let device_name = status.device_name.as_deref().unwrap_or("this device");
             let rendered_path = status
@@ -1914,7 +1933,7 @@ fn run_openai_setup(
                 stdout,
                 "{}",
                 format!(
-                    "validated OpenAI access for {device_name} and rendered {rendered_path} for {}",
+                    "validated OpenAI access for {device_name}, applied the hostname, and rendered {rendered_path} for {}",
                     status.model.as_deref().unwrap_or(DEFAULT_REMOTE_MODEL)
                 )
                 .green()
@@ -1935,16 +1954,21 @@ fn run_openai_setup(
     }
 }
 
-fn read_secret_line(stdin: &mut impl BufRead, stdout: &mut Stdout) -> io::Result<String> {
-    let _echo_guard = StdinEchoGuard::hide().ok();
+fn read_line(stdin: &mut impl BufRead) -> io::Result<String> {
     let mut line = String::new();
     let bytes = stdin.read_line(&mut line)?;
-    writeln!(stdout)?;
-    stdout.flush()?;
     if bytes == 0 {
         return Ok(String::new());
     }
     Ok(line.trim().to_string())
+}
+
+fn read_secret_line(stdin: &mut impl BufRead, stdout: &mut Stdout) -> io::Result<String> {
+    let _echo_guard = StdinEchoGuard::hide().ok();
+    let value = read_line(stdin)?;
+    writeln!(stdout)?;
+    stdout.flush()?;
+    Ok(value)
 }
 
 fn provisioning_issue_text(status: &ProvisioningStatus) -> String {
@@ -1955,9 +1979,9 @@ fn provisioning_issue_text(status: &ProvisioningStatus) -> String {
     let device = status.device_name.as_deref().unwrap_or("this device");
     let provider = status.provider_kind.as_deref().unwrap_or("backend");
     match status.phase.as_str() {
-        "failed_recoverable" => format!(
-            "{device} is not ready: {provider} validation failed and can be retried: {detail}"
-        ),
+        "failed_recoverable" => {
+            format!("{device} is not ready: setup failed and can be retried: {detail}")
+        }
         "validating" => format!("{device} is still validating {provider}: {detail}"),
         phase => format!("{device} provisioning phase '{phase}' is not ready: {detail}"),
     }
@@ -2152,7 +2176,7 @@ mod tests {
 
         let text = provisioning_issue_text(&status);
         assert!(text.contains("bunzo-qemu"));
-        assert!(text.contains("validation failed"));
+        assert!(text.contains("setup failed"));
         assert!(text.contains("/var/lib/bunzo/secrets/openai.key"));
     }
 

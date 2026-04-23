@@ -141,7 +141,7 @@ async fn route_request(request: HttpRequest) -> HttpResponse {
                     Some(&FlashMessage {
                         kind: FlashKind::Success,
                         text: format!(
-                            "validated OpenAI access for {} and rendered {} for {}",
+                            "validated OpenAI access for {}, applied the hostname, and rendered {} for {}",
                             status.device_name.as_deref().unwrap_or("this device"),
                             status
                                 .rendered_config_path
@@ -592,7 +592,7 @@ fn render_page(
             "<section class=\"hero\">",
             "<div class=\"eyebrow\">bunzo provisioning</div>",
             "<h1>{page_title}</h1>",
-            "<p class=\"summary\">This screen is a thin frontend over <code>bunzo-provisiond</code>. Setup still writes canonical state under <code>/var/lib/bunzo/</code> and re-renders runtime config from there.</p>",
+            "<p class=\"summary\">This screen is a thin frontend over <code>bunzo-provisiond</code>. Setup writes canonical state under <code>/var/lib/bunzo/</code>, applies the device name as the system hostname, and re-renders runtime config from there.</p>",
             "</section>",
             "<section class=\"panel stack\">",
             "{flash_html}{page_error_html}",
@@ -615,7 +615,7 @@ fn render_page(
             "<div class=\"field\"><label for=\"api_key\">OpenAI API key</label><input id=\"api_key\" name=\"api_key\" type=\"password\" placeholder=\"sk-...\" autocomplete=\"off\"></div>",
             "<button type=\"submit\">Validate and Provision</button>",
             "</form>",
-            "<p class=\"footnote\">This slice intentionally keeps networking narrow: the frontend only supports <code>existing_network</code>, and the backend remains pinned to the GPT-5.4 family with <code>{recommended_model}</code> as the current setup default.</p>",
+            "<p class=\"footnote\">The chosen device name becomes the live and persistent system hostname. This slice intentionally keeps networking narrow: the frontend only supports <code>existing_network</code>, and the backend remains pinned to the GPT-5.4 family with <code>{recommended_model}</code> as the current setup default.</p>",
             "<p class=\"footnote\">Need machine-readable status for smoke tests? Use <a href=\"/status\">/status</a>.</p>",
             "</section>",
             "</main></body></html>"
