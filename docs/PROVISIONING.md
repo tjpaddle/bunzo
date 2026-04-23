@@ -4,7 +4,7 @@ Load this file only for M7 provisioning work.
 
 ## Current slice
 
-The first two local-shell-focused M7 slices are now landed:
+The first three M7 provisioning slices are now landed:
 
 - `bunzo-provisiond` exists as the provisioning owner
 - local-shell `/setup` calls the provisioning socket API instead of writing
@@ -14,12 +14,13 @@ The first two local-shell-focused M7 slices are now landed:
 - bogus OpenAI credentials do not transition provisioning to `ready`
 - restart/boot reconciliation re-renders `/etc/bunzo/bunzod.toml` from
   canonical `/var/lib/bunzo/` state
+- `bunzo-setup-httpd` now exposes the same setup/status flow over HTTP on the
+  current dev/QEMU network path
 
 Still open:
 
-- headless phone/browser frontend
 - hostname/network activation beyond the local-shell defaults used in this
-  first slice
+  current slice
 
 ## Required outcome
 
@@ -53,7 +54,7 @@ restart-safe state machine.
 Transitions should survive reboot. Power loss during setup should resume from
 saved state instead of restarting from zero.
 
-In the current local-shell slices:
+In the current landed slices:
 
 - `validating` performs a live OpenAI credential/model probe before `ready`
 - failed provider validation lands in `failed_recoverable` with persisted
@@ -72,14 +73,14 @@ Keep the v1 flow minimal:
 
 That is enough to get the device into a useful ready state.
 
-In the current local-shell slice, the engine seeds:
+In the current landed slice set, the engine seeds:
 
 - device name from the current hostname unless a frontend overrides it
 - connectivity as `existing_network`
 - provider as OpenAI with the current GPT-5.4-family restriction
 
-That keeps the state machine and durable ownership real while leaving richer
-frontend UX for the next slice.
+That keeps the state machine and durable ownership real while leaving broader
+hostname/network activation for the next slice.
 
 ## Frontends
 
@@ -100,8 +101,18 @@ For screenless devices:
 - device exposes a phone/browser setup path
 - user completes the same core flow there
 
-The exact AP/captive-portal stack is an implementation detail. The important
-architectural rule is shared engine, shared state, shared resulting config.
+Current implementation:
+
+- `bunzo-setup-httpd` is the thin HTTP frontend
+- it talks to `bunzo-provisiond` over the provisioning socket API
+- it shows status plus submits device name, `existing_network`, OpenAI, and
+  the API key
+- in the QEMU/dev loop it is reachable on guest port `8080` and forwarded from
+  host port `8080`
+
+The exact AP/captive-portal stack remains future work. The important
+architectural rule is already preserved: shared engine, shared state, shared
+resulting config.
 
 ## Durable ownership
 
@@ -134,10 +145,11 @@ When provisioning reaches `ready`:
 4. start the normal runtime mode
 5. mark provisioning complete
 
-In the current local-shell slice, step 3 is effectively a no-op because
-`bunzo-provisiond` is socket-activated and `bunzod` re-reads its config on
-every request. The important boundary is still preserved: provisioning owns the
-canonical state and renders the runtime-facing config.
+In the current slice, step 3 is effectively a no-op because
+`bunzo-provisiond`, `bunzo-setup-httpd`, and `bunzod` are all socket- or
+request-activated enough that setup can stay thin while the provisioning
+boundary remains preserved: provisioning owns the canonical state and renders
+the runtime-facing config.
 
 ## Re-entering setup
 
@@ -159,6 +171,7 @@ This should not require reflashing the image.
 
 Status:
 
-- Steps 1 through 4 are now live for the local-shell/OpenAI path, including
-  live provider validation and boot-time runtime-config reconciliation
-- Step 5 is still open
+- Steps 1 through 5 are now live for the current OpenAI path, including
+  live provider validation, boot-time runtime-config reconciliation, and the
+  first browser-accessible headless frontend
+- The remaining provisioning work is broader hostname/network activation

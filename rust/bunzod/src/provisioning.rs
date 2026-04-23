@@ -1,9 +1,9 @@
-//! bunzo-provisiond — canonical provisioning owner for local setup state.
+//! bunzo-provisiond — canonical provisioning owner for setup state.
 //!
-//! The first M7 slice keeps the frontend narrow: local shell setup persists a
-//! canonical provider config + secret under `/var/lib/bunzo/`, advances a
-//! restart-safe state machine, and renders `/etc/bunzo/bunzod.toml` from that
-//! canonical state.
+//! Frontends stay narrow: shell and headless HTTP setup both call this service
+//! so canonical provider config + secret live under `/var/lib/bunzo/`, the
+//! restart-safe state machine advances in one place, and `/etc/bunzo/`
+//! remains rendered runtime output rather than source of truth.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bunzo_proto::async_io::{read_frame_async, write_frame_async};
 use bunzo_proto::{
     Envelope, ProvisionClientFrame, ProvisionClientMessage, ProvisionServerMessage,
-    ProvisioningStatus, PROTOCOL_VERSION,
+    ProvisioningSetupInput, ProvisioningStatus, PROTOCOL_VERSION,
 };
 use listenfd::ListenFd;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -40,6 +40,7 @@ const STATE_FILE_NAME: &str = "state.toml";
 const OPENAI_SECRET_NAME: &str = "openai.key";
 const CONNECTIVITY_KIND_EXISTING_NETWORK: &str = "existing_network";
 const PROVIDER_KIND_OPENAI: &str = "openai";
+const FRONTEND_SOURCE_SHARED: &str = "provisioning_frontend";
 
 #[derive(Debug, Clone)]
 pub struct ProvisioningPaths {
@@ -247,7 +248,8 @@ impl ProvisioningEngine {
                 effective_phase = ProvisioningPhase::FailedRecoverable;
                 detail = Some(format!("{e:#}"));
             }
-        } else if detail.is_none() {
+        }
+        if detail.is_none() {
             detail = Some(default_phase_detail(&effective_phase).to_string());
         }
 
@@ -267,7 +269,24 @@ impl ProvisioningEngine {
         requested_device_name: Option<&str>,
         api_key: &str,
     ) -> Result<ProvisioningStatus> {
-        let api_key = api_key.trim();
+        self.apply_setup_async(&ProvisioningSetupInput {
+            device_name: requested_device_name.map(str::to_string),
+            connectivity_kind: None,
+            provider_kind: None,
+            api_key: api_key.to_string(),
+        })
+        .await
+    }
+
+    pub fn apply_setup(&self, setup: &ProvisioningSetupInput) -> Result<ProvisioningStatus> {
+        futures::executor::block_on(self.apply_setup_async(setup))
+    }
+
+    pub async fn apply_setup_async(
+        &self,
+        setup: &ProvisioningSetupInput,
+    ) -> Result<ProvisioningStatus> {
+        let api_key = setup.api_key.trim();
         if api_key.is_empty() {
             bail!("api key cannot be empty");
         }
@@ -275,7 +294,9 @@ impl ProvisioningEngine {
         self.ensure_dirs()?;
 
         let mut state = self.load_state()?.unwrap_or_default();
-        let device_name = requested_device_name
+        let device_name = setup
+            .device_name
+            .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .map(str::to_string)
@@ -295,16 +316,40 @@ impl ProvisioningEngine {
             0o600,
         )?;
 
-        state.connectivity_kind = Some(CONNECTIVITY_KIND_EXISTING_NETWORK.into());
+        let connectivity_kind = setup
+            .connectivity_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or(CONNECTIVITY_KIND_EXISTING_NETWORK);
+        if connectivity_kind != CONNECTIVITY_KIND_EXISTING_NETWORK {
+            bail!(
+                "unsupported connectivity kind '{connectivity_kind}'; this slice only supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}'"
+            );
+        }
+
+        state.connectivity_kind = Some(connectivity_kind.into());
         self.write_state_checkpoint(&mut state, ProvisioningPhase::Connectivity)?;
         self.write_toml_atomic(
             &self.paths.network_config_path(),
             &NetworkConfig {
-                kind: CONNECTIVITY_KIND_EXISTING_NETWORK.into(),
-                source: "local_shell".into(),
+                kind: connectivity_kind.into(),
+                source: FRONTEND_SOURCE_SHARED.into(),
             },
             0o600,
         )?;
+
+        let provider_kind = setup
+            .provider_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or(PROVIDER_KIND_OPENAI);
+        if provider_kind != PROVIDER_KIND_OPENAI {
+            bail!(
+                "unsupported provider kind '{provider_kind}'; this slice only supports '{PROVIDER_KIND_OPENAI}'"
+            );
+        }
 
         let provider_cfg = ProviderConfig {
             backend: CanonicalBackendConfig::Openai {
@@ -314,7 +359,7 @@ impl ProvisioningEngine {
                 system_prompt: None,
             },
         };
-        state.provider_kind = Some(PROVIDER_KIND_OPENAI.into());
+        state.provider_kind = Some(provider_kind.into());
         state.model = Some(RECOMMENDED_OPENAI_MODEL.into());
         state.secret_path = Some(self.paths.openai_secret_path().display().to_string());
         state.rendered_config_path = Some(self.paths.runtime_config_path.display().to_string());
@@ -657,19 +702,8 @@ async fn handle_connection(mut stream: UnixStream, engine: ProvisioningEngine) -
             ProvisionClientMessage::GetProvisioningStatus { id } => {
                 handle_get_status(&mut write_half, &id, &engine).await?;
             }
-            ProvisionClientMessage::ApplyLocalSetup {
-                id,
-                device_name,
-                api_key,
-            } => {
-                handle_apply_local_setup(
-                    &mut write_half,
-                    &id,
-                    device_name.as_deref(),
-                    &api_key,
-                    &engine,
-                )
-                .await?;
+            ProvisionClientMessage::ApplySetup { id, setup } => {
+                handle_apply_setup(&mut write_half, &id, &setup, &engine).await?;
             }
         }
     }
@@ -699,17 +733,16 @@ where
     Ok(())
 }
 
-async fn handle_apply_local_setup<W>(
+async fn handle_apply_setup<W>(
     w: &mut W,
     id: &str,
-    device_name: Option<&str>,
-    api_key: &str,
+    setup: &ProvisioningSetupInput,
     engine: &ProvisioningEngine,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    match engine.apply_local_setup_async(device_name, api_key).await {
+    match engine.apply_setup_async(setup).await {
         Ok(status) => {
             let frame = Envelope::new(ProvisionServerMessage::ProvisioningResult {
                 id: id.into(),
@@ -718,7 +751,7 @@ where
             write_frame_async(w, &frame).await?;
         }
         Err(err) => {
-            let code = if api_key.trim().is_empty() {
+            let code = if setup.api_key.trim().is_empty() {
                 "invalid_request"
             } else {
                 "provisioning_apply_failed"
@@ -736,7 +769,7 @@ where
 
 fn default_phase_detail(phase: &ProvisioningPhase) -> &'static str {
     match phase {
-        ProvisioningPhase::Unprovisioned => "local setup has not completed yet",
+        ProvisioningPhase::Unprovisioned => "setup has not completed yet",
         ProvisioningPhase::Naming => "device identity is being persisted",
         ProvisioningPhase::Connectivity => "current connectivity mode is being persisted",
         ProvisioningPhase::Provider => "provider config is being persisted",

@@ -86,6 +86,17 @@ pub struct ProvisioningStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisioningSetupInput {
+    #[serde(default)]
+    pub device_name: Option<String>,
+    #[serde(default)]
+    pub connectivity_kind: Option<String>,
+    #[serde(default)]
+    pub provider_kind: Option<String>,
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientMessage {
     UserMessage {
@@ -237,11 +248,9 @@ pub enum ProvisionClientMessage {
     GetProvisioningStatus {
         id: String,
     },
-    ApplyLocalSetup {
+    ApplySetup {
         id: String,
-        #[serde(default)]
-        device_name: Option<String>,
-        api_key: String,
+        setup: ProvisioningSetupInput,
     },
 }
 
@@ -609,10 +618,14 @@ mod tests {
 
         for msg in [
             ProvisionClientMessage::GetProvisioningStatus { id: "p1".into() },
-            ProvisionClientMessage::ApplyLocalSetup {
+            ProvisionClientMessage::ApplySetup {
                 id: "p2".into(),
-                device_name: Some("bunzo-qemu".into()),
-                api_key: "sk-test".into(),
+                setup: ProvisioningSetupInput {
+                    device_name: Some("bunzo-qemu".into()),
+                    connectivity_kind: Some("existing_network".into()),
+                    provider_kind: Some("openai".into()),
+                    api_key: "sk-test".into(),
+                },
             },
         ] {
             let out = Envelope::new(msg);

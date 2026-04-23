@@ -76,10 +76,25 @@ Responsibilities:
 - validate provider credentials before provisioning reaches `ready`
 - reconcile rendered runtime config from canonical state on restart/boot
 - expose a local Unix-socket API that thin frontends such as `bunzo-shell`
-  call during setup/reconfiguration
+  and `bunzo-setup-httpd` call during setup/reconfiguration
 
-Current scope is the local-shell path only. Headless phone/browser setup is
-still the next provisioning slice.
+Current scope covers both the local-shell path and the first headless browser
+path. Hostname/network activation is still intentionally narrow.
+
+### `bunzo-setup-httpd`
+
+The thin headless provisioning frontend introduced in the latest M7 slice.
+
+Responsibilities:
+
+- expose a minimal browser/HTTP setup surface on the dev network path
+- show provisioning status from `bunzo-provisiond`
+- submit the same canonical setup inputs through the provisioning socket API
+- avoid owning provisioning logic or writing `/var/lib/bunzo/` or `/etc/bunzo/`
+  directly
+
+Current shape: socket-activated HTTP on guest port `8080`. In the QEMU dev
+loop, `run-qemu.sh` forwards host port `8080` to that guest port.
 
 ## Key data paths
 
@@ -108,8 +123,8 @@ evaluation → skill/model execution → task events/state updates
 
 ### Provisioning path
 
-`bunzo-shell /setup` → `bunzo-provisiond` → canonical `/var/lib/bunzo/`
-state/config/secrets → live provider validation → rendered
+`bunzo-shell /setup` or `bunzo-setup-httpd` → `bunzo-provisiond` → canonical
+`/var/lib/bunzo/` state/config/secrets → live provider validation → rendered
 `/etc/bunzo/bunzod.toml` → normal `bunzod` request path on the next shell
 request
 
@@ -137,12 +152,13 @@ runtime/task/policy path as interactive work
 - local shell on the device
 - local runtime store and audit trail
 - proactive interval jobs via `/jobs`
-- local-shell provisioning via `bunzo-provisiond`
+- provisioning via `bunzo-provisiond` with both local-shell and headless HTTP
+  frontends
 - boot-safe runtime-config reconciliation from canonical provisioning state
 
 ### Next
 
-- real provisioning engine with local and headless frontends
+- hostname/network activation beyond the current `existing_network` slice
 - scheduler hardening beyond interval-only slice 1
 
 ### Later

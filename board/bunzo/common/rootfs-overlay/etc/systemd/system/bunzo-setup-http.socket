@@ -1,0 +1,12 @@
+[Unit]
+Description=bunzo headless setup HTTP frontend socket
+Documentation=https://github.com/tjpaddle/bunzo
+PartOf=bunzo-setup-http.service
+
+[Socket]
+ListenStream=8080
+NoDelay=true
+Accept=no
+
+[Install]
+WantedBy=sockets.target

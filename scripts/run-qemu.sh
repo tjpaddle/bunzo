@@ -20,6 +20,7 @@ set -euo pipefail
 
 TARGET=""
 RECOVERY="${BUNZO_QEMU_RECOVERY:-0}"
+SETUP_HTTP_HOST_PORT="${BUNZO_QEMU_SETUP_HTTP_PORT:-8080}"
 for arg in "$@"; do
     case "${arg}" in
         --recovery)
@@ -71,6 +72,7 @@ case "${TARGET}" in
         else
             echo "run-qemu: booting bunzo in QEMU (Ctrl-A then X to exit)"
         fi
+        echo "run-qemu: forwarding host tcp:${SETUP_HTTP_HOST_PORT} to guest tcp:8080 for headless setup"
         exec qemu-system-aarch64 \
             -M virt \
             -cpu cortex-a53 \
@@ -81,7 +83,7 @@ case "${TARGET}" in
             -append "${APPEND}" \
             -drive file="${ROOTFS}",if=none,format=raw,id=hd0 \
             -device virtio-blk-device,drive=hd0 \
-            -netdev user,id=net0,hostfwd=tcp::2222-:22 \
+            -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::${SETUP_HTTP_HOST_PORT}-:8080 \
             -device virtio-net-device,netdev=net0
         ;;
     *)

@@ -1,0 +1,16 @@
+[Unit]
+Description=bunzo headless setup HTTP frontend
+Documentation=https://github.com/tjpaddle/bunzo
+Requires=bunzo-setup-http.socket
+After=bunzo-setup-http.socket systemd-tmpfiles-setup.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bunzo-setup-httpd
+Restart=on-failure
+RestartSec=2s
+MemoryHigh=32M
+MemoryMax=64M
+
+# No [Install] section on purpose: the service is started by
+# bunzo-setup-http.socket when a browser or curl client connects.

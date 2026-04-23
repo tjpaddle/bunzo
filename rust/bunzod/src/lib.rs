@@ -5,5 +5,6 @@ pub mod policy;
 pub mod provisioning;
 pub mod runtime;
 pub mod scheduler;
+pub mod setup_http;
 pub mod skills;
 pub mod store;

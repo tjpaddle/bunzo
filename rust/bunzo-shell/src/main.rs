@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use bunzo_proto::{
     read_frame, write_frame, ClientMessage, ConversationSummary, Envelope, PolicySummary,
-    ProvisionClientMessage, ProvisionServerFrame, ProvisionServerMessage, ProvisioningStatus,
-    ScheduledJobSummary, ServerFrame, ServerMessage, TaskSummary,
+    ProvisionClientMessage, ProvisionServerFrame, ProvisionServerMessage, ProvisioningSetupInput,
+    ProvisioningStatus, ScheduledJobSummary, ServerFrame, ServerMessage, TaskSummary,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -1346,10 +1346,14 @@ fn apply_local_openai_setup(
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
-    let req = Envelope::new(ProvisionClientMessage::ApplyLocalSetup {
+    let req = Envelope::new(ProvisionClientMessage::ApplySetup {
         id: id.clone(),
-        device_name,
-        api_key,
+        setup: ProvisioningSetupInput {
+            device_name,
+            connectivity_kind: Some("existing_network".into()),
+            provider_kind: Some("openai".into()),
+            api_key,
+        },
     });
     write_frame(&mut stream, &req)
         .map_err(|e| ProvisioningRoundTripError::Protocol(e.to_string()))?;

@@ -15,7 +15,8 @@ The QEMU development loop has completed the core runtime foundations:
 - M6 runtime policy
 - M8 scheduler slice 1
 
-The next major milestone is M7 provisioning. M8 is started but not complete.
+The current milestone focus is finishing M7 beyond the local/default network
+boundary. M8 is started but not complete.
 
 ## Completed milestones
 
@@ -54,14 +55,17 @@ Open work:
 - [x] Reconcile rendered runtime config from canonical `/var/lib/bunzo/` state
   on restart/boot
 - [x] Validate provider credentials before declaring setup complete
-- [ ] Add the headless phone/browser setup frontend
+- [x] Add the headless phone/browser setup frontend
+- [ ] Broaden hostname/network activation beyond the current
+  `existing_network` slice boundary
 
-**Current status:** the local-shell provisioning engine is now hardened and
-QEMU-verified. `bunzo-provisiond` persists canonical state under
-`/var/lib/bunzo/`, `/setup` talks to its socket API, provider credentials are
-live-validated before `ready`, and canonical provisioning state re-renders
-`/etc/bunzo/bunzod.toml` on restart/boot. The remaining M7 work is the
-headless frontend plus broader hostname/network activation.
+**Current status:** QEMU-verified. `bunzo-provisiond` persists canonical state
+under `/var/lib/bunzo/`, `/setup` talks to its socket API, provider
+credentials are live-validated before `ready`, canonical provisioning state
+re-renders `/etc/bunzo/bunzod.toml` on restart/boot, and a new
+`bunzo-setup-httpd` frontend now exposes the same setup/status flow over the
+QEMU/dev network path. The remaining M7 work is broader hostname/network
+activation beyond the current `existing_network` default.
 
 **Definition of done:** a user can complete setup locally or from a phone, both
 paths end in the same persisted config, and `/setup` is just one frontend to
