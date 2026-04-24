@@ -18,6 +18,17 @@ The QEMU development loop has completed the core runtime foundations:
 The current milestone focus is finishing M7 beyond the hard-coded/default
 network boundary. M8 is started but not complete.
 
+Before adding broader skills, multi-agent behavior, or more autonomous
+proactive work, the next implementation slice should harden the runtime
+capability boundary:
+
+- keep `/var/lib/bunzo/secrets/` outside normal skill read access
+- make local-file policy decisions resource-aware enough to distinguish
+  approved audit/state reads from secret reads
+- preserve the rule that skill manifests are hard capability ceilings and
+  runtime policy can only narrow or approve within those ceilings
+- keep dev-only SSH access out of any future user-facing image profile
+
 ## Completed milestones
 
 - **M1 — Hello, bunzo**
