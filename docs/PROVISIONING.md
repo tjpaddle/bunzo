@@ -4,7 +4,7 @@ Load this file only for M7 provisioning work.
 
 ## Current slice
 
-The first three M7 provisioning slices are now landed:
+The first five M7 provisioning slices are now landed:
 
 - `bunzo-provisiond` exists as the provisioning owner
 - local-shell `/setup` calls the provisioning socket API instead of writing
@@ -20,10 +20,13 @@ The first three M7 provisioning slices are now landed:
   canonical provisioning state
 - the current `existing_network` path now renders and reconciles
   `/etc/network/interfaces` from canonical provisioning state
+- the current `existing_network` path now persists an explicit interface name
+  in canonical state instead of assuming `eth0`
 
 Still open:
 
-- broader connectivity beyond the current `existing_network` slice
+- additional connectivity modes beyond the current explicit-interface
+  `existing_network` slice
 
 ## Required outcome
 
@@ -80,12 +83,14 @@ In the current landed slice set, the engine seeds:
 
 - device name from the current hostname unless a frontend overrides it, then
   applies it as the live + persistent system hostname
-- connectivity as `existing_network`, rendered into the current
-  `/etc/network/interfaces` runtime output
+- connectivity as `existing_network` with an explicit interface name,
+  defaulting to the current canonical value or `eth0` when a frontend does not
+  override it, rendered into the current `/etc/network/interfaces` runtime
+  output
 - provider as OpenAI with the current GPT-5.4-family restriction
 
 That keeps the state machine and durable ownership real while leaving broader
-connectivity work for the next slice.
+connectivity modes for the next slice.
 
 ## Frontends
 
@@ -95,8 +100,8 @@ For devices with local I/O:
 
 - `bunzo-shell` detects unprovisioned state
 - `/setup` enters the provisioning flow
-- the current slice persists current hostname/current network defaults and
-  collects the provider credential locally
+- the current slice persists device name plus explicit `existing_network`
+  interface selection and collects the provider credential locally
 
 ### Headless setup
 
@@ -110,8 +115,8 @@ Current implementation:
 
 - `bunzo-setup-httpd` is the thin HTTP frontend
 - it talks to `bunzo-provisiond` over the provisioning socket API
-- it shows status plus submits device name, `existing_network`, OpenAI, and
-  the API key
+- it shows status plus submits device name, `existing_network`, an explicit
+  interface name, OpenAI, and the API key
 - in the QEMU/dev loop it is reachable on guest port `8080` and forwarded from
   host port `8080`
 
@@ -135,14 +140,15 @@ Then a renderer/activation step materializes runtime-facing files such as:
 - `/etc/bunzo/bunzod.toml`
 
 The current slice now renders all three of those runtime-facing outputs, but
-the connectivity side is still intentionally narrow to the `existing_network`
-path.
+the connectivity side is still intentionally narrow to the explicit-interface
+`existing_network` path.
 
 Boot-time reconciliation is currently handled by
 `bunzo-provisioning-reconcile.service`, while `bunzo-provisiond` and `bunzod`
 also re-check canonical state on startup for defense in depth. That
 reconciliation now re-applies the runtime hostname, the current
-`existing_network` interfaces file, and `/etc/bunzo/bunzod.toml`.
+`existing_network` interfaces file for the chosen interface, and
+`/etc/bunzo/bunzod.toml`.
 
 ## Handoff into normal runtime
 
@@ -182,6 +188,8 @@ Status:
 
 - Steps 1 through 5 are now live for the current OpenAI path, including
   live provider validation, boot-time runtime hostname/network/config
-  reconciliation, and the first browser-accessible headless frontend
-- The remaining provisioning work is broader connectivity beyond
-  `existing_network`
+  reconciliation, the first browser-accessible headless frontend, and explicit
+  `existing_network` interface ownership across shell, HTTP, status, and
+  reconciliation
+- The remaining provisioning work is additional connectivity modes beyond the
+  current explicit-interface `existing_network` slice

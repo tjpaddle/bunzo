@@ -22,7 +22,9 @@ use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::time::timeout;
 
 use crate::config::RECOMMENDED_OPENAI_MODEL;
-use crate::provisioning::SOCKET_PATH as PROVISIOND_SOCKET;
+use crate::provisioning::{
+    DEFAULT_RUNTIME_NETWORK_INTERFACES_PATH, SOCKET_PATH as PROVISIOND_SOCKET,
+};
 
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 pub const DEFAULT_GUEST_PORT: u16 = 8080;
@@ -141,8 +143,13 @@ async fn route_request(request: HttpRequest) -> HttpResponse {
                     Some(&FlashMessage {
                         kind: FlashKind::Success,
                         text: format!(
-                            "validated OpenAI access for {}, applied the hostname, and rendered {} for {}",
+                            "validated OpenAI access for {}, applied the hostname, rendered {} for {}, and rendered {} for {}",
                             status.device_name.as_deref().unwrap_or("this device"),
+                            DEFAULT_RUNTIME_NETWORK_INTERFACES_PATH,
+                            status
+                                .existing_network_interface
+                                .as_deref()
+                                .unwrap_or("eth0"),
                             status
                                 .rendered_config_path
                                 .as_deref()
@@ -425,6 +432,7 @@ fn parse_setup_form(request: &HttpRequest) -> Result<ProvisioningSetupInput> {
     Ok(ProvisioningSetupInput {
         device_name: non_empty(form.get("device_name").cloned()),
         connectivity_kind: non_empty(form.get("connectivity_kind").cloned()),
+        existing_network_interface: non_empty(form.get("existing_network_interface").cloned()),
         provider_kind: non_empty(form.get("provider_kind").cloned()),
         api_key: form.get("api_key").cloned().unwrap_or_default(),
     })
@@ -513,6 +521,9 @@ fn render_page(
     let connectivity = status
         .and_then(|status| status.connectivity_kind.as_deref())
         .unwrap_or("existing_network");
+    let existing_network_interface = status
+        .and_then(|status| status.existing_network_interface.as_deref())
+        .unwrap_or("eth0");
     let provider = status
         .and_then(|status| status.provider_kind.as_deref())
         .unwrap_or("openai");
@@ -601,6 +612,7 @@ fn render_page(
             "<div class=\"metric\"><label>Readiness</label><strong>{ready_text}</strong></div>",
             "<div class=\"metric\"><label>Device</label><strong>{device_name}</strong></div>",
             "<div class=\"metric\"><label>Connectivity</label><strong>{connectivity}</strong></div>",
+            "<div class=\"metric\"><label>Interface</label><strong>{existing_network_interface}</strong></div>",
             "<div class=\"metric\"><label>Backend</label><strong>{provider}</strong></div>",
             "<div class=\"metric\"><label>Model</label><strong>{model}</strong></div>",
             "<div class=\"metric\"><label>Rendered Config</label><strong>{rendered_config}</strong></div>",
@@ -611,11 +623,12 @@ fn render_page(
             "<form method=\"post\" action=\"/setup\">",
             "<div class=\"field\"><label for=\"device_name\">Device name</label><input id=\"device_name\" name=\"device_name\" type=\"text\" value=\"{device_name_value}\" placeholder=\"bunzo\" autocomplete=\"off\"></div>",
             "<div class=\"field\"><label for=\"connectivity_kind\">Connectivity mode</label><select id=\"connectivity_kind\" name=\"connectivity_kind\"><option value=\"existing_network\">existing_network</option></select></div>",
+            "<div class=\"field\"><label for=\"existing_network_interface\">Existing network interface</label><input id=\"existing_network_interface\" name=\"existing_network_interface\" type=\"text\" value=\"{existing_network_interface_value}\" placeholder=\"eth0\" autocomplete=\"off\"></div>",
             "<div class=\"field\"><label for=\"provider_kind\">Provider</label><select id=\"provider_kind\" name=\"provider_kind\"><option value=\"openai\">openai ({recommended_model})</option></select></div>",
             "<div class=\"field\"><label for=\"api_key\">OpenAI API key</label><input id=\"api_key\" name=\"api_key\" type=\"password\" placeholder=\"sk-...\" autocomplete=\"off\"></div>",
             "<button type=\"submit\">Validate and Provision</button>",
             "</form>",
-            "<p class=\"footnote\">The chosen device name becomes the live and persistent system hostname. This slice intentionally keeps networking narrow: the frontend only supports <code>existing_network</code>, and the backend remains pinned to the GPT-5.4 family with <code>{recommended_model}</code> as the current setup default.</p>",
+            "<p class=\"footnote\">The chosen device name becomes the live and persistent system hostname. This slice still keeps networking narrow to <code>existing_network</code>, but the interface is now an explicit canonical setup input rendered into <code>{runtime_network_interfaces_path}</code>. The backend remains pinned to the GPT-5.4 family with <code>{recommended_model}</code> as the current setup default.</p>",
             "<p class=\"footnote\">Need machine-readable status for smoke tests? Use <a href=\"/status\">/status</a>.</p>",
             "</section>",
             "</main></body></html>"
@@ -632,11 +645,14 @@ fn render_page(
             device_name
         }),
         connectivity = escape_html(connectivity),
+        existing_network_interface = escape_html(existing_network_interface),
         provider = escape_html(provider),
         model = escape_html(model),
         rendered_config = escape_html(rendered_config),
         detail = escape_html(detail),
         device_name_value = escape_html(device_name),
+        existing_network_interface_value = escape_html(existing_network_interface),
+        runtime_network_interfaces_path = escape_html(DEFAULT_RUNTIME_NETWORK_INTERFACES_PATH),
         recommended_model = escape_html(RECOMMENDED_OPENAI_MODEL),
     )
 }
@@ -716,5 +732,25 @@ mod tests {
     #[test]
     fn html_escape_handles_special_characters() {
         assert_eq!(escape_html("<bunzo>&\"'"), "&lt;bunzo&gt;&amp;&quot;&#39;");
+    }
+
+    #[test]
+    fn setup_form_parses_existing_network_interface() {
+        let request = HttpRequest {
+            method: "POST".into(),
+            path: "/setup".into(),
+            headers: HashMap::from([(
+                "content-type".into(),
+                "application/x-www-form-urlencoded".into(),
+            )]),
+            body: b"device_name=bunzo-qemu&connectivity_kind=existing_network&existing_network_interface=enp0s1&provider_kind=openai&api_key=sk-test".to_vec(),
+        };
+
+        let setup = parse_setup_form(&request).unwrap();
+        assert_eq!(setup.device_name.as_deref(), Some("bunzo-qemu"));
+        assert_eq!(setup.connectivity_kind.as_deref(), Some("existing_network"));
+        assert_eq!(setup.existing_network_interface.as_deref(), Some("enp0s1"));
+        assert_eq!(setup.provider_kind.as_deref(), Some("openai"));
+        assert_eq!(setup.api_key, "sk-test");
     }
 }

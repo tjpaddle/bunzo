@@ -32,6 +32,7 @@ const MIN_LINES: u16 = 10;
 const BUNZOD_SOCKET: &str = "/run/bunzod.sock";
 const PROVISIOND_SOCKET: &str = "/run/bunzo-provisiond.sock";
 const BUNZOD_CONFIG_PATH: &str = "/etc/bunzo/bunzod.toml";
+const RUNTIME_NETWORK_INTERFACES_PATH: &str = "/etc/network/interfaces";
 const DEFAULT_REMOTE_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_POLICY_SUBJECT: &str = "shell_request";
 const SCHEDULED_JOB_POLICY_SUBJECT: &str = "scheduled_job";
@@ -1339,6 +1340,7 @@ fn request_provisioning_status(
 fn apply_local_openai_setup(
     id: String,
     device_name: Option<String>,
+    existing_network_interface: Option<String>,
     api_key: String,
 ) -> Result<ProvisioningStatus, ProvisioningRoundTripError> {
     let mut stream = UnixStream::connect(PROVISIOND_SOCKET)
@@ -1351,6 +1353,7 @@ fn apply_local_openai_setup(
         setup: ProvisioningSetupInput {
             device_name,
             connectivity_kind: Some("existing_network".into()),
+            existing_network_interface,
             provider_kind: Some("openai".into()),
             api_key,
         },
@@ -1880,6 +1883,10 @@ fn run_openai_setup(
         .as_ref()
         .and_then(|status| status.device_name.as_deref())
         .unwrap_or("bunzo");
+    let current_existing_network_interface = current_status
+        .as_ref()
+        .and_then(|status| status.existing_network_interface.as_deref())
+        .unwrap_or("eth0");
 
     writeln!(stdout)?;
     writeln!(
@@ -1894,8 +1901,8 @@ fn run_openai_setup(
         stdout,
         "{}",
         format!(
-            "Choose the device name to use as the system hostname, then paste your OpenAI API key. bunzo will persist canonical state under /var/lib/bunzo/ and render {} for {}.",
-            BUNZOD_CONFIG_PATH, DEFAULT_REMOTE_MODEL
+            "Choose the device name to use as the system hostname, choose the existing-network interface to own explicitly, then paste your OpenAI API key. bunzo will persist canonical state under /var/lib/bunzo/ and render {} plus {} for {}.",
+            RUNTIME_NETWORK_INTERFACES_PATH, BUNZOD_CONFIG_PATH, DEFAULT_REMOTE_MODEL
         )
         .dark_grey()
     )?;
@@ -1907,6 +1914,17 @@ fn run_openai_setup(
     write!(stdout, "{} ", "device name>".cyan().bold())?;
     stdout.flush()?;
     let requested_device_name = read_line(stdin)?;
+    writeln!(
+        stdout,
+        "{}",
+        format!(
+            "Press Enter to keep the current existing-network interface ({current_existing_network_interface})."
+        )
+        .dark_grey()
+    )?;
+    write!(stdout, "{} ", "network interface>".cyan().bold())?;
+    stdout.flush()?;
+    let requested_existing_network_interface = read_line(stdin)?;
     writeln!(
         stdout,
         "{}",
@@ -1922,9 +1940,20 @@ fn run_openai_setup(
     }
 
     let device_name = (!requested_device_name.trim().is_empty()).then_some(requested_device_name);
-    match apply_local_openai_setup("setup-apply".into(), device_name, key) {
+    let existing_network_interface = (!requested_existing_network_interface.trim().is_empty())
+        .then_some(requested_existing_network_interface);
+    match apply_local_openai_setup(
+        "setup-apply".into(),
+        device_name,
+        existing_network_interface,
+        key,
+    ) {
         Ok(status) => {
             let device_name = status.device_name.as_deref().unwrap_or("this device");
+            let existing_network_interface = status
+                .existing_network_interface
+                .as_deref()
+                .unwrap_or("eth0");
             let rendered_path = status
                 .rendered_config_path
                 .as_deref()
@@ -1933,7 +1962,7 @@ fn run_openai_setup(
                 stdout,
                 "{}",
                 format!(
-                    "validated OpenAI access for {device_name}, applied the hostname, and rendered {rendered_path} for {}",
+                    "validated OpenAI access for {device_name}, applied the hostname, rendered {RUNTIME_NETWORK_INTERFACES_PATH} for {existing_network_interface}, and rendered {rendered_path} for {}",
                     status.model.as_deref().unwrap_or(DEFAULT_REMOTE_MODEL)
                 )
                 .green()
@@ -2166,6 +2195,7 @@ mod tests {
             ready: false,
             device_name: Some("bunzo-qemu".into()),
             connectivity_kind: Some("existing_network".into()),
+            existing_network_interface: Some("eth0".into()),
             provider_kind: Some("openai".into()),
             model: Some(DEFAULT_REMOTE_MODEL.into()),
             rendered_config_path: Some(BUNZOD_CONFIG_PATH.into()),

@@ -77,6 +77,8 @@ pub struct ProvisioningStatus {
     pub ready: bool,
     pub device_name: Option<String>,
     pub connectivity_kind: Option<String>,
+    #[serde(default)]
+    pub existing_network_interface: Option<String>,
     pub provider_kind: Option<String>,
     pub model: Option<String>,
     pub rendered_config_path: Option<String>,
@@ -91,6 +93,8 @@ pub struct ProvisioningSetupInput {
     pub device_name: Option<String>,
     #[serde(default)]
     pub connectivity_kind: Option<String>,
+    #[serde(default)]
+    pub existing_network_interface: Option<String>,
     #[serde(default)]
     pub provider_kind: Option<String>,
     pub api_key: String,
@@ -608,6 +612,7 @@ mod tests {
             ready: true,
             device_name: Some("bunzo-qemu".into()),
             connectivity_kind: Some("existing_network".into()),
+            existing_network_interface: Some("eth0".into()),
             provider_kind: Some("openai".into()),
             model: Some("gpt-5.4-mini".into()),
             rendered_config_path: Some("/etc/bunzo/bunzod.toml".into()),
@@ -623,6 +628,7 @@ mod tests {
                 setup: ProvisioningSetupInput {
                     device_name: Some("bunzo-qemu".into()),
                     connectivity_kind: Some("existing_network".into()),
+                    existing_network_interface: Some("eth0".into()),
                     provider_kind: Some("openai".into()),
                     api_key: "sk-test".into(),
                 },

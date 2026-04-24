@@ -129,6 +129,7 @@ struct ProvisioningStateRecord {
     phase: ProvisioningPhase,
     device_name: Option<String>,
     connectivity_kind: Option<String>,
+    existing_network_interface: Option<String>,
     provider_kind: Option<String>,
     model: Option<String>,
     rendered_config_path: Option<String>,
@@ -143,6 +144,7 @@ impl Default for ProvisioningStateRecord {
             phase: ProvisioningPhase::Unprovisioned,
             device_name: None,
             connectivity_kind: None,
+            existing_network_interface: None,
             provider_kind: None,
             model: None,
             rendered_config_path: None,
@@ -341,6 +343,7 @@ impl ProvisioningEngine {
         self.apply_setup_async(&ProvisioningSetupInput {
             device_name: requested_device_name.map(str::to_string),
             connectivity_kind: None,
+            existing_network_interface: None,
             provider_kind: None,
             api_key: api_key.to_string(),
         })
@@ -390,13 +393,23 @@ impl ProvisioningEngine {
             self.write_failed_state(&state, &format!("{err:#}"))?;
             return Err(err);
         }
+        let existing_network_interface = match self
+            .resolve_existing_network_interface(setup.existing_network_interface.as_deref())
+        {
+            Ok(existing_network_interface) => existing_network_interface,
+            Err(err) => {
+                self.write_failed_state(&state, &format!("{err:#}"))?;
+                return Err(err);
+            }
+        };
 
         let network_cfg = NetworkConfig {
             kind: connectivity_kind.into(),
             source: FRONTEND_SOURCE_SHARED.into(),
-            interface_name: default_existing_network_interface(),
+            interface_name: existing_network_interface.clone(),
         };
         state.connectivity_kind = Some(connectivity_kind.into());
+        state.existing_network_interface = Some(existing_network_interface);
         self.write_state_checkpoint(&mut state, ProvisioningPhase::Connectivity)?;
         self.write_toml_atomic(&self.paths.network_config_path(), &network_cfg, 0o600)?;
 
@@ -475,6 +488,7 @@ impl ProvisioningEngine {
             self.read_optional_toml::<NetworkConfig>(&self.paths.network_config_path())?;
         if let Some(network) = &network_cfg {
             state.connectivity_kind = Some(network.kind.clone());
+            state.existing_network_interface = Some(network.interface_name.clone());
         }
 
         let provider_cfg =
@@ -528,6 +542,7 @@ impl ProvisioningEngine {
             ready,
             device_name: state.device_name.clone(),
             connectivity_kind: state.connectivity_kind.clone(),
+            existing_network_interface: state.existing_network_interface.clone(),
             provider_kind: state.provider_kind.clone(),
             model: state.model.clone(),
             rendered_config_path: state.rendered_config_path.clone(),
@@ -594,6 +609,24 @@ impl ProvisioningEngine {
             .or_else(|| std::env::var("HOSTNAME").ok())
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "bunzo".into())
+    }
+
+    fn resolve_existing_network_interface(
+        &self,
+        requested_existing_network_interface: Option<&str>,
+    ) -> Result<String> {
+        if let Some(requested) = requested_existing_network_interface {
+            return normalize_network_interface_name(requested);
+        }
+
+        let existing = self
+            .read_toml::<NetworkConfig>(&self.paths.network_config_path())
+            .ok()
+            .filter(|cfg| cfg.kind == CONNECTIVITY_KIND_EXISTING_NETWORK)
+            .map(|cfg| normalize_network_interface_name(&cfg.interface_name))
+            .transpose()?
+            .unwrap_or_else(default_existing_network_interface);
+        Ok(existing)
     }
 
     fn reconcile_runtime_outputs(
@@ -1126,6 +1159,7 @@ mod tests {
         assert!(status.ready);
         assert_eq!(status.phase, "ready");
         assert_eq!(status.device_name.as_deref(), Some("bunzo-qemu"));
+        assert_eq!(status.existing_network_interface.as_deref(), Some("eth0"));
         assert_eq!(status.provider_kind.as_deref(), Some("openai"));
         assert_eq!(status.model.as_deref(), Some("gpt-5.4-mini"));
 
@@ -1184,6 +1218,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn explicit_existing_network_interface_is_persisted_and_rendered() {
+        let tmp = TempDir::new().unwrap();
+        let activator = StubRuntimeActivator::success();
+        let engine = test_engine(&tmp, StubValidator::success(), activator.clone());
+
+        let status = engine
+            .apply_setup_async(&ProvisioningSetupInput {
+                device_name: Some("bunzo-qemu".into()),
+                connectivity_kind: Some(CONNECTIVITY_KIND_EXISTING_NETWORK.into()),
+                existing_network_interface: Some("enp0s1".into()),
+                provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
+                api_key: "sk-test".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(status.ready);
+        assert_eq!(status.existing_network_interface.as_deref(), Some("enp0s1"));
+
+        let network: NetworkConfig = engine
+            .read_toml(&engine.paths.network_config_path())
+            .expect("network config");
+        assert_eq!(network.interface_name, "enp0s1");
+
+        let interfaces = fs::read_to_string(&engine.paths.runtime_network_interfaces_path).unwrap();
+        assert!(interfaces.contains("auto enp0s1"));
+        assert!(interfaces.contains("iface enp0s1 inet dhcp"));
+        assert_eq!(activator.network_restart_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn invalid_device_name_stays_non_ready_with_detail() {
         let tmp = TempDir::new().unwrap();
         let engine = test_engine(
@@ -1206,6 +1271,37 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("must contain only ASCII letters, digits, or hyphens"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_existing_network_interface_stays_non_ready_with_detail() {
+        let tmp = TempDir::new().unwrap();
+        let engine = test_engine(
+            &tmp,
+            StubValidator::success(),
+            StubRuntimeActivator::success(),
+        );
+
+        let err = engine
+            .apply_setup_async(&ProvisioningSetupInput {
+                device_name: Some("bunzo-qemu".into()),
+                connectivity_kind: Some(CONNECTIVITY_KIND_EXISTING_NETWORK.into()),
+                existing_network_interface: Some("eth 0".into()),
+                provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
+                api_key: "sk-test".into(),
+            })
+            .await
+            .expect_err("interface name should fail");
+        assert!(format!("{err:#}").contains("contains unsupported characters"));
+
+        let status = engine.status().unwrap();
+        assert!(!status.ready);
+        assert_eq!(status.phase, "failed_recoverable");
+        assert!(status
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("contains unsupported characters"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -74,7 +74,7 @@ Responsibilities:
 - own canonical secrets under `/var/lib/bunzo/secrets/`
 - render `/etc/hostname` from canonical device state
 - render `/etc/network/interfaces` from canonical connectivity state for the
-  current `existing_network` slice
+  current explicit-interface `existing_network` slice
 - render `/etc/bunzo/bunzod.toml` from canonical provisioning state
 - apply the live system hostname from canonical device state
 - validate provider credentials before provisioning reaches `ready`
@@ -85,7 +85,7 @@ Responsibilities:
 
 Current scope covers both the local-shell path and the first headless browser
 path. Connectivity activation is still intentionally narrow to the
-`existing_network` path.
+explicit-interface `existing_network` path.
 
 ### `bunzo-setup-httpd`
 
@@ -127,7 +127,8 @@ loop, `run-qemu.sh` forwards host port `8080` to that guest port.
 
 `/etc/hostname`, `/etc/network/interfaces`, and `/etc/bunzo/bunzod.toml` are
 rendered runtime outputs. The source of truth for setup lives under
-`/var/lib/bunzo/`.
+`/var/lib/bunzo/`. In the current slice, `network.toml` owns both the
+`existing_network` kind and its explicit interface name.
 
 ## Current runtime model
 
@@ -140,9 +141,9 @@ evaluation → skill/model execution → task events/state updates
 
 `bunzo-shell /setup` or `bunzo-setup-httpd` → `bunzo-provisiond` → canonical
 `/var/lib/bunzo/` state/config/secrets → rendered `/etc/hostname`,
-`/etc/network/interfaces`, and `/etc/bunzo/bunzod.toml` → live hostname
-application + provider validation → normal `bunzod` request path on the next
-shell request
+`/etc/network/interfaces` for the chosen interface, and
+`/etc/bunzo/bunzod.toml` → live hostname application + provider validation →
+normal `bunzod` request path on the next shell request
 
 ### Provisioning reconciliation path
 
@@ -175,7 +176,8 @@ runtime/task/policy path as interactive work
 
 ### Next
 
-- broader connectivity beyond the current `existing_network` slice
+- additional connectivity modes beyond the current explicit-interface
+  `existing_network` slice
 - scheduler hardening beyond interval-only slice 1
 
 ### Later

@@ -15,8 +15,8 @@ The QEMU development loop has completed the core runtime foundations:
 - M6 runtime policy
 - M8 scheduler slice 1
 
-The current milestone focus is finishing M7 beyond the local/default network
-boundary. M8 is started but not complete.
+The current milestone focus is finishing M7 beyond the hard-coded/default
+network boundary. M8 is started but not complete.
 
 ## Completed milestones
 
@@ -60,8 +60,10 @@ Open work:
   restart/boot
 - [x] Make the current `existing_network` path render and reconcile explicit
   runtime-facing network config from canonical provisioning state
-- [ ] Broaden connectivity beyond the current `existing_network` slice
-  boundary
+- [x] Make the current `existing_network` path take an explicit interface name
+  instead of assuming `eth0`
+- [ ] Add at least one additional connectivity mode beyond the current
+  explicit-interface `existing_network` slice boundary
 
 **Current status:** QEMU-verified. `bunzo-provisiond` persists canonical state
 under `/var/lib/bunzo/`, `/setup` talks to its socket API, provider
@@ -69,8 +71,10 @@ credentials are live-validated before `ready`, canonical provisioning state
 now re-renders `/etc/hostname`, `/etc/network/interfaces`, and
 `/etc/bunzo/bunzod.toml` on restart/boot, and `bunzo-setup-httpd` exposes the
 same setup/status flow over the QEMU/dev network path. Device name is now a
-real live + persistent hostname, while connectivity remains intentionally
-narrow to the explicit `existing_network` path.
+real live + persistent hostname, and both frontends now carry an explicit
+`existing_network` interface name through canonical state, status, and
+reconciliation instead of assuming `eth0`, while connectivity remains
+intentionally narrow to that explicit `existing_network` path.
 
 **Definition of done:** a user can complete setup locally or from a phone, both
 paths end in the same persisted config, and `/setup` is just one frontend to
