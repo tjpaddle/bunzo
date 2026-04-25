@@ -1,6 +1,7 @@
 [Unit]
 Description=bunzo provisioning reconciliation
 Documentation=https://github.com/tjpaddle/bunzo
+DefaultDependencies=no
 After=local-fs.target systemd-tmpfiles-setup.service
 Before=network.service network.target network-online.target sockets.target bunzo-shell.service bunzo-schedulerd.service
 
