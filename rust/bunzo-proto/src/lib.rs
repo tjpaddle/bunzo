@@ -79,6 +79,16 @@ pub struct ProvisioningStatus {
     pub connectivity_kind: Option<String>,
     #[serde(default)]
     pub existing_network_interface: Option<String>,
+    #[serde(default)]
+    pub static_ipv4_interface: Option<String>,
+    #[serde(default)]
+    pub static_ipv4_address: Option<String>,
+    #[serde(default)]
+    pub static_ipv4_prefix_len: Option<u8>,
+    #[serde(default)]
+    pub static_ipv4_gateway: Option<String>,
+    #[serde(default)]
+    pub static_ipv4_dns_servers: Vec<String>,
     pub provider_kind: Option<String>,
     pub model: Option<String>,
     pub rendered_config_path: Option<String>,
@@ -95,6 +105,16 @@ pub struct ProvisioningSetupInput {
     pub connectivity_kind: Option<String>,
     #[serde(default)]
     pub existing_network_interface: Option<String>,
+    #[serde(default)]
+    pub static_ipv4_interface: Option<String>,
+    #[serde(default)]
+    pub static_ipv4_address: Option<String>,
+    #[serde(default)]
+    pub static_ipv4_prefix_len: Option<u8>,
+    #[serde(default)]
+    pub static_ipv4_gateway: Option<String>,
+    #[serde(default)]
+    pub static_ipv4_dns_servers: Vec<String>,
     #[serde(default)]
     pub provider_kind: Option<String>,
     pub api_key: String,
@@ -613,6 +633,11 @@ mod tests {
             device_name: Some("bunzo-qemu".into()),
             connectivity_kind: Some("existing_network".into()),
             existing_network_interface: Some("eth0".into()),
+            static_ipv4_interface: None,
+            static_ipv4_address: None,
+            static_ipv4_prefix_len: None,
+            static_ipv4_gateway: None,
+            static_ipv4_dns_servers: Vec::new(),
             provider_kind: Some("openai".into()),
             model: Some("gpt-5.4-mini".into()),
             rendered_config_path: Some("/etc/bunzo/bunzod.toml".into()),
@@ -629,6 +654,11 @@ mod tests {
                     device_name: Some("bunzo-qemu".into()),
                     connectivity_kind: Some("existing_network".into()),
                     existing_network_interface: Some("eth0".into()),
+                    static_ipv4_interface: None,
+                    static_ipv4_address: None,
+                    static_ipv4_prefix_len: None,
+                    static_ipv4_gateway: None,
+                    static_ipv4_dns_servers: Vec::new(),
                     provider_kind: Some("openai".into()),
                     api_key: "sk-test".into(),
                 },

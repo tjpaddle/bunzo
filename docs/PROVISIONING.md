@@ -4,7 +4,7 @@ Load this file only for M7 provisioning work.
 
 ## Current slice
 
-The first five M7 provisioning slices are now landed:
+The first six M7 provisioning slices are now landed:
 
 - `bunzo-provisiond` exists as the provisioning owner
 - local-shell `/setup` calls the provisioning socket API instead of writing
@@ -22,11 +22,14 @@ The first five M7 provisioning slices are now landed:
   `/etc/network/interfaces` from canonical provisioning state
 - the current `existing_network` path now persists an explicit interface name
   in canonical state instead of assuming `eth0`
+- `static_ipv4` now persists interface/address/prefix/gateway/DNS under
+  `/var/lib/bunzo/config/network.toml` and renders a static ifupdown stanza
+  into `/etc/network/interfaces`
 
 Still open:
 
-- additional connectivity modes beyond the current explicit-interface
-  `existing_network` slice
+- QEMU replay for the `static_ipv4` path
+- broader connectivity modes such as Wi-Fi/captive-portal setup
 
 ## Required outcome
 
@@ -87,10 +90,13 @@ In the current landed slice set, the engine seeds:
   defaulting to the current canonical value or `eth0` when a frontend does not
   override it, rendered into the current `/etc/network/interfaces` runtime
   output
+- connectivity can alternatively be `static_ipv4`, with interface,
+  address/prefix, optional gateway, and optional DNS servers persisted in the
+  same canonical `network.toml` and rendered into `/etc/network/interfaces`
 - provider as OpenAI with the current GPT-5.4-family restriction
 
 That keeps the state machine and durable ownership real while leaving broader
-connectivity modes for the next slice.
+Wi-Fi/AP connectivity modes for later slices.
 
 ## Frontends
 
@@ -100,8 +106,9 @@ For devices with local I/O:
 
 - `bunzo-shell` detects unprovisioned state
 - `/setup` enters the provisioning flow
-- the current slice persists device name plus explicit `existing_network`
-  interface selection and collects the provider credential locally
+- the current slice persists device name plus either explicit
+  `existing_network` interface selection or `static_ipv4` interface/address
+  fields, then collects the provider credential locally
 
 ### Headless setup
 
@@ -115,8 +122,8 @@ Current implementation:
 
 - `bunzo-setup-httpd` is the thin HTTP frontend
 - it talks to `bunzo-provisiond` over the provisioning socket API
-- it shows status plus submits device name, `existing_network`, an explicit
-  interface name, OpenAI, and the API key
+- it shows status plus submits device name, `existing_network` or
+  `static_ipv4`, the mode-specific network fields, OpenAI, and the API key
 - in the QEMU/dev loop it is reachable on guest port `8080` and forwarded from
   host port `8080`
 
@@ -139,15 +146,16 @@ Then a renderer/activation step materializes runtime-facing files such as:
 - `/etc/network/interfaces`
 - `/etc/bunzo/bunzod.toml`
 
-The current slice now renders all three of those runtime-facing outputs, but
-the connectivity side is still intentionally narrow to the explicit-interface
-`existing_network` path.
+The current slice now renders all three of those runtime-facing outputs.
+Connectivity is intentionally still ifupdown-based, but it now covers both
+explicit-interface DHCP through `existing_network` and static IPv4 through
+`static_ipv4`.
 
 Boot-time reconciliation is currently handled by
 `bunzo-provisioning-reconcile.service`, while `bunzo-provisiond` and `bunzod`
 also re-check canonical state on startup for defense in depth. That
 reconciliation now re-applies the runtime hostname, the current
-`existing_network` interfaces file for the chosen interface, and
+network interfaces file for the chosen connectivity mode, and
 `/etc/bunzo/bunzod.toml`.
 
 ## Handoff into normal runtime
@@ -188,8 +196,8 @@ Status:
 
 - Steps 1 through 5 are now live for the current OpenAI path, including
   live provider validation, boot-time runtime hostname/network/config
-  reconciliation, the first browser-accessible headless frontend, and explicit
+  reconciliation, the first browser-accessible headless frontend, explicit
   `existing_network` interface ownership across shell, HTTP, status, and
-  reconciliation
-- The remaining provisioning work is additional connectivity modes beyond the
-  current explicit-interface `existing_network` slice
+  reconciliation, and the first additional `static_ipv4` connectivity mode
+- The remaining provisioning work is QEMU replay for `static_ipv4` and broader
+  connectivity modes such as Wi-Fi/captive-portal setup

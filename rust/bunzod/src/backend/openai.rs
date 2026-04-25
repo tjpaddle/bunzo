@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use super::{Backend, BackendEvent, Message, Role};
 use crate::config::OpenAiConfig;
-use crate::policy::{Decision as PolicyDecision, ToolPolicyContext};
+use crate::policy::{skill_invocation_resource, Decision as PolicyDecision, ToolPolicyContext};
 use crate::skills::Registry;
 
 const MAX_TOOL_HOPS: u32 = 3;
@@ -231,11 +231,24 @@ impl Backend for OpenAiBackend {
             oai_msgs.push(assistant_msg.into());
 
             for call in &pending_tool_calls {
-                let evaluation = match policy.evaluate_skill_invocation(&call.name) {
-                    Ok(evaluation) => evaluation,
-                    Err(e) => {
-                        let _ = tx.send(BackendEvent::Error(e)).await;
-                        return Ok(());
+                let resource = skill_invocation_resource(&call.name, &call.arguments);
+                let evaluation = if let Some(detail) =
+                    registry.capability_denial_for_invocation(&call.name, &call.arguments)
+                {
+                    match policy.deny_skill_resource_by_capability(&resource, detail) {
+                        Ok(evaluation) => evaluation,
+                        Err(e) => {
+                            let _ = tx.send(BackendEvent::Error(e)).await;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    match policy.evaluate_skill_resource(&resource) {
+                        Ok(evaluation) => evaluation,
+                        Err(e) => {
+                            let _ = tx.send(BackendEvent::Error(e)).await;
+                            return Ok(());
+                        }
                     }
                 };
                 if evaluation.decision != PolicyDecision::Allow

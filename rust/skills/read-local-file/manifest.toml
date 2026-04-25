@@ -1,6 +1,6 @@
 name = "read-local-file"
 version = "0.0.1"
-description = "Read a whitelisted local file on the bunzo device and return its contents. Use this for device-specific questions such as OS/version (/etc/os-release), hostname (/etc/hostname), MOTD (/etc/motd), uptime (/proc/uptime), load (/proc/loadavg), memory (/proc/meminfo), and bunzo ledger files under /var/lib/bunzo/."
+description = "Read a whitelisted local file on the bunzo device and return its contents. Use this for device-specific questions such as OS/version (/etc/os-release), hostname (/etc/hostname), MOTD (/etc/motd), uptime (/proc/uptime), load (/proc/loadavg), memory (/proc/meminfo), the bunzo audit ledger, and non-secret canonical bunzo config/provisioning state."
 entry = "run"
 
 # JSON Schema describing the skill's input, passed verbatim to the LLM as the
@@ -25,5 +25,7 @@ fs_read = [
     "/proc/meminfo",
     "/proc/uptime",
     "/proc/loadavg",
-    "/var/lib/bunzo/",
+    "/var/lib/bunzo/ledger.jsonl",
+    "/var/lib/bunzo/config/",
+    "/var/lib/bunzo/provisioning/",
 ]

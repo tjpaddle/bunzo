@@ -161,6 +161,13 @@ runtime/task/policy path as interactive work
 - Skill manifest = hard capability ceiling
 - Runtime policy = durable allow/deny/require-approval layer
 - Default unmatched tool use = `require_approval` / `once`
+- Policy `resource` names should identify the concrete object, not just the
+  skill. Filesystem reads use `skill-name:fs-read:/absolute/path`; for example,
+  approving `read-local-file:fs-read:/etc/os-release` does not approve
+  `read-local-file:fs-read:/var/lib/bunzo/secrets/openai.key`.
+- Runtime policy can approve or narrow only inside the skill manifest ceiling;
+  out-of-manifest file reads are denied before a runtime approval can make them
+  executable.
 
 ## Product surfaces
 

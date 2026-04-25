@@ -73,19 +73,21 @@ Open work:
   runtime-facing network config from canonical provisioning state
 - [x] Make the current `existing_network` path take an explicit interface name
   instead of assuming `eth0`
-- [ ] Add at least one additional connectivity mode beyond the current
+- [x] Add at least one additional connectivity mode beyond the current
   explicit-interface `existing_network` slice boundary
 
-**Current status:** QEMU-verified. `bunzo-provisiond` persists canonical state
-under `/var/lib/bunzo/`, `/setup` talks to its socket API, provider
-credentials are live-validated before `ready`, canonical provisioning state
-now re-renders `/etc/hostname`, `/etc/network/interfaces`, and
-`/etc/bunzo/bunzod.toml` on restart/boot, and `bunzo-setup-httpd` exposes the
-same setup/status flow over the QEMU/dev network path. Device name is now a
-real live + persistent hostname, and both frontends now carry an explicit
-`existing_network` interface name through canonical state, status, and
-reconciliation instead of assuming `eth0`, while connectivity remains
-intentionally narrow to that explicit `existing_network` path.
+**Current status:** Implemented and Rust-tested; latest full QEMU replay is
+from the explicit-interface `existing_network` slice. `bunzo-provisiond`
+persists canonical state under `/var/lib/bunzo/`, `/setup` talks to its socket
+API, provider credentials are live-validated before `ready`, canonical
+provisioning state now re-renders `/etc/hostname`, `/etc/network/interfaces`,
+and `/etc/bunzo/bunzod.toml` on restart/boot, and `bunzo-setup-httpd` exposes
+the same setup/status flow over the QEMU/dev network path. Device name is a
+real live + persistent hostname, both frontends carry explicit
+`existing_network` interface selection, and `static_ipv4` is now an additional
+provisioning-owned connectivity mode that persists address/prefix/gateway/DNS
+under `/var/lib/bunzo/config/network.toml` and renders the ifupdown static
+stanza from that state.
 
 **Definition of done:** a user can complete setup locally or from a phone, both
 paths end in the same persisted config, and `/setup` is just one frontend to

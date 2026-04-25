@@ -14,6 +14,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 
+use crate::policy::{read_local_file_path, READ_LOCAL_FILE_SKILL};
+
 pub use host::SkillHost;
 pub use manifest::Manifest;
 
@@ -121,13 +123,29 @@ impl Registry {
     /// Invoke a skill by name with JSON args. Blocking — call from
     /// `spawn_blocking` to keep the tokio reactor responsive.
     pub fn invoke_sync(&self, name: &str, args_json: &str) -> Result<String> {
-        let skill = self
-            .inner
+        let skill = self.find_skill(name)?;
+        self.inner.host.invoke(&skill.skill, args_json)
+    }
+
+    pub fn capability_denial_for_invocation(&self, name: &str, args_json: &str) -> Option<String> {
+        let skill = self.find_skill(name).ok()?;
+        if skill.manifest.name == READ_LOCAL_FILE_SKILL {
+            let path = read_local_file_path(args_json)?;
+            if !skill.manifest.capabilities.allows_read(&path) {
+                return Some(format!(
+                    "skill manifest denies {READ_LOCAL_FILE_SKILL} fs_read for {path}"
+                ));
+            }
+        }
+        None
+    }
+
+    fn find_skill(&self, name: &str) -> Result<&LoadedSkill> {
+        self.inner
             .skills
             .iter()
             .find(|s| s.manifest.name == name)
-            .ok_or_else(|| anyhow!("unknown skill: {name}"))?;
-        self.inner.host.invoke(&skill.skill, args_json)
+            .ok_or_else(|| anyhow!("unknown skill: {name}"))
     }
 }
 

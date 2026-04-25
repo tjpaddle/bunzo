@@ -34,6 +34,8 @@ const PROVISIOND_SOCKET: &str = "/run/bunzo-provisiond.sock";
 const BUNZOD_CONFIG_PATH: &str = "/etc/bunzo/bunzod.toml";
 const RUNTIME_NETWORK_INTERFACES_PATH: &str = "/etc/network/interfaces";
 const DEFAULT_REMOTE_MODEL: &str = "gpt-5.4-mini";
+const CONNECTIVITY_EXISTING_NETWORK: &str = "existing_network";
+const CONNECTIVITY_STATIC_IPV4: &str = "static_ipv4";
 const DEFAULT_POLICY_SUBJECT: &str = "shell_request";
 const SCHEDULED_JOB_POLICY_SUBJECT: &str = "scheduled_job";
 const RECENT_CONVERSATION_LIMIT: u32 = 12;
@@ -1339,8 +1341,7 @@ fn request_provisioning_status(
 
 fn apply_local_openai_setup(
     id: String,
-    device_name: Option<String>,
-    existing_network_interface: Option<String>,
+    setup: ProvisioningSetupInput,
     api_key: String,
 ) -> Result<ProvisioningStatus, ProvisioningRoundTripError> {
     let mut stream = UnixStream::connect(PROVISIOND_SOCKET)
@@ -1351,11 +1352,9 @@ fn apply_local_openai_setup(
     let req = Envelope::new(ProvisionClientMessage::ApplySetup {
         id: id.clone(),
         setup: ProvisioningSetupInput {
-            device_name,
-            connectivity_kind: Some("existing_network".into()),
-            existing_network_interface,
             provider_kind: Some("openai".into()),
             api_key,
+            ..setup
         },
     });
     write_frame(&mut stream, &req)
@@ -1887,6 +1886,30 @@ fn run_openai_setup(
         .as_ref()
         .and_then(|status| status.existing_network_interface.as_deref())
         .unwrap_or("eth0");
+    let current_connectivity_kind = current_status
+        .as_ref()
+        .and_then(|status| status.connectivity_kind.as_deref())
+        .unwrap_or(CONNECTIVITY_EXISTING_NETWORK);
+    let current_static_ipv4_interface = current_status
+        .as_ref()
+        .and_then(|status| status.static_ipv4_interface.as_deref())
+        .unwrap_or(current_existing_network_interface);
+    let current_static_ipv4_address = current_status
+        .as_ref()
+        .and_then(|status| status.static_ipv4_address.as_deref())
+        .unwrap_or("");
+    let current_static_ipv4_prefix_len = current_status
+        .as_ref()
+        .and_then(|status| status.static_ipv4_prefix_len)
+        .unwrap_or(24);
+    let current_static_ipv4_gateway = current_status
+        .as_ref()
+        .and_then(|status| status.static_ipv4_gateway.as_deref())
+        .unwrap_or("");
+    let current_static_ipv4_dns_servers = current_status
+        .as_ref()
+        .map(|status| status.static_ipv4_dns_servers.join(", "))
+        .unwrap_or_default();
 
     writeln!(stdout)?;
     writeln!(
@@ -1901,7 +1924,7 @@ fn run_openai_setup(
         stdout,
         "{}",
         format!(
-            "Choose the device name to use as the system hostname, choose the existing-network interface to own explicitly, then paste your OpenAI API key. bunzo will persist canonical state under /var/lib/bunzo/ and render {} plus {} for {}.",
+            "Choose the device name, choose connectivity ({CONNECTIVITY_EXISTING_NETWORK} or {CONNECTIVITY_STATIC_IPV4}), then paste your OpenAI API key. bunzo will persist canonical state under /var/lib/bunzo/ and render {} plus {} for {}.",
             RUNTIME_NETWORK_INTERFACES_PATH, BUNZOD_CONFIG_PATH, DEFAULT_REMOTE_MODEL
         )
         .dark_grey()
@@ -1917,14 +1940,151 @@ fn run_openai_setup(
     writeln!(
         stdout,
         "{}",
-        format!(
-            "Press Enter to keep the current existing-network interface ({current_existing_network_interface})."
-        )
-        .dark_grey()
+        format!("Press Enter to keep the current connectivity mode ({current_connectivity_kind}).")
+            .dark_grey()
     )?;
-    write!(stdout, "{} ", "network interface>".cyan().bold())?;
+    write!(stdout, "{} ", "connectivity>".cyan().bold())?;
     stdout.flush()?;
-    let requested_existing_network_interface = read_line(stdin)?;
+    let requested_connectivity_kind = read_line(stdin)?;
+    let connectivity_kind = if requested_connectivity_kind.trim().is_empty() {
+        current_connectivity_kind.to_string()
+    } else {
+        requested_connectivity_kind.trim().to_string()
+    };
+
+    let device_name = (!requested_device_name.trim().is_empty()).then_some(requested_device_name);
+    let mut setup = ProvisioningSetupInput {
+        device_name,
+        connectivity_kind: Some(connectivity_kind.clone()),
+        existing_network_interface: None,
+        static_ipv4_interface: None,
+        static_ipv4_address: None,
+        static_ipv4_prefix_len: None,
+        static_ipv4_gateway: None,
+        static_ipv4_dns_servers: Vec::new(),
+        provider_kind: Some("openai".into()),
+        api_key: String::new(),
+    };
+
+    match connectivity_kind.as_str() {
+        CONNECTIVITY_EXISTING_NETWORK => {
+            writeln!(
+                stdout,
+                "{}",
+                format!(
+                    "Press Enter to keep the current existing-network interface ({current_existing_network_interface})."
+                )
+                .dark_grey()
+            )?;
+            write!(stdout, "{} ", "network interface>".cyan().bold())?;
+            stdout.flush()?;
+            let requested_existing_network_interface = read_line(stdin)?;
+            setup.existing_network_interface =
+                (!requested_existing_network_interface.trim().is_empty())
+                    .then_some(requested_existing_network_interface);
+        }
+        CONNECTIVITY_STATIC_IPV4 => {
+            writeln!(
+                stdout,
+                "{}",
+                format!(
+                    "Press Enter to keep the current static IPv4 interface ({current_static_ipv4_interface})."
+                )
+                .dark_grey()
+            )?;
+            write!(stdout, "{} ", "static interface>".cyan().bold())?;
+            stdout.flush()?;
+            let requested_static_interface = read_line(stdin)?;
+            setup.static_ipv4_interface = (!requested_static_interface.trim().is_empty())
+                .then_some(requested_static_interface);
+
+            let address_hint = if current_static_ipv4_address.is_empty() {
+                "required for static IPv4".to_string()
+            } else {
+                format!("current: {current_static_ipv4_address}")
+            };
+            writeln!(
+                stdout,
+                "{}",
+                format!("Static IPv4 address ({address_hint}).").dark_grey()
+            )?;
+            write!(stdout, "{} ", "static address>".cyan().bold())?;
+            stdout.flush()?;
+            let requested_static_address = read_line(stdin)?;
+            setup.static_ipv4_address =
+                (!requested_static_address.trim().is_empty()).then_some(requested_static_address);
+
+            writeln!(
+                stdout,
+                "{}",
+                format!("Press Enter to keep the static prefix length ({current_static_ipv4_prefix_len}).")
+                    .dark_grey()
+            )?;
+            write!(stdout, "{} ", "static prefix>".cyan().bold())?;
+            stdout.flush()?;
+            let requested_static_prefix = read_line(stdin)?;
+            if !requested_static_prefix.trim().is_empty() {
+                match requested_static_prefix.trim().parse::<u8>() {
+                    Ok(prefix_len) => setup.static_ipv4_prefix_len = Some(prefix_len),
+                    Err(_) => {
+                        writeln!(
+                            stdout,
+                            "{}",
+                            format!(
+                                "setup failed: static prefix '{}' is not a number between 1 and 32",
+                                requested_static_prefix.trim()
+                            )
+                            .red()
+                        )?;
+                        return Ok(false);
+                    }
+                }
+            }
+
+            let gateway_hint = if current_static_ipv4_gateway.is_empty() {
+                "optional".to_string()
+            } else {
+                format!("current: {current_static_ipv4_gateway}")
+            };
+            writeln!(
+                stdout,
+                "{}",
+                format!("Static IPv4 gateway ({gateway_hint}).").dark_grey()
+            )?;
+            write!(stdout, "{} ", "static gateway>".cyan().bold())?;
+            stdout.flush()?;
+            let requested_static_gateway = read_line(stdin)?;
+            setup.static_ipv4_gateway =
+                (!requested_static_gateway.trim().is_empty()).then_some(requested_static_gateway);
+
+            let dns_hint = if current_static_ipv4_dns_servers.is_empty() {
+                "optional, comma-separated".to_string()
+            } else {
+                format!("current: {current_static_ipv4_dns_servers}")
+            };
+            writeln!(
+                stdout,
+                "{}",
+                format!("Static IPv4 DNS servers ({dns_hint}).").dark_grey()
+            )?;
+            write!(stdout, "{} ", "static dns>".cyan().bold())?;
+            stdout.flush()?;
+            let requested_static_dns = read_line(stdin)?;
+            setup.static_ipv4_dns_servers = parse_address_list(&requested_static_dns);
+        }
+        other => {
+            writeln!(
+                stdout,
+                "{}",
+                format!(
+                    "setup failed: unsupported connectivity mode '{other}' (use {CONNECTIVITY_EXISTING_NETWORK} or {CONNECTIVITY_STATIC_IPV4})"
+                )
+                .red()
+            )?;
+            return Ok(false);
+        }
+    }
+
     writeln!(
         stdout,
         "{}",
@@ -1939,21 +2099,10 @@ fn run_openai_setup(
         return Ok(false);
     }
 
-    let device_name = (!requested_device_name.trim().is_empty()).then_some(requested_device_name);
-    let existing_network_interface = (!requested_existing_network_interface.trim().is_empty())
-        .then_some(requested_existing_network_interface);
-    match apply_local_openai_setup(
-        "setup-apply".into(),
-        device_name,
-        existing_network_interface,
-        key,
-    ) {
+    match apply_local_openai_setup("setup-apply".into(), setup, key) {
         Ok(status) => {
             let device_name = status.device_name.as_deref().unwrap_or("this device");
-            let existing_network_interface = status
-                .existing_network_interface
-                .as_deref()
-                .unwrap_or("eth0");
+            let connectivity = provisioning_connectivity_summary(&status);
             let rendered_path = status
                 .rendered_config_path
                 .as_deref()
@@ -1962,7 +2111,7 @@ fn run_openai_setup(
                 stdout,
                 "{}",
                 format!(
-                    "validated OpenAI access for {device_name}, applied the hostname, rendered {RUNTIME_NETWORK_INTERFACES_PATH} for {existing_network_interface}, and rendered {rendered_path} for {}",
+                    "validated OpenAI access for {device_name}, applied the hostname, rendered {RUNTIME_NETWORK_INTERFACES_PATH} for {connectivity}, and rendered {rendered_path} for {}",
                     status.model.as_deref().unwrap_or(DEFAULT_REMOTE_MODEL)
                 )
                 .green()
@@ -1992,12 +2141,45 @@ fn read_line(stdin: &mut impl BufRead) -> io::Result<String> {
     Ok(line.trim().to_string())
 }
 
+fn parse_address_list(input: &str) -> Vec<String> {
+    input
+        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn read_secret_line(stdin: &mut impl BufRead, stdout: &mut Stdout) -> io::Result<String> {
     let _echo_guard = StdinEchoGuard::hide().ok();
     let value = read_line(stdin)?;
     writeln!(stdout)?;
     stdout.flush()?;
     Ok(value)
+}
+
+fn provisioning_connectivity_summary(status: &ProvisioningStatus) -> String {
+    match status.connectivity_kind.as_deref() {
+        Some(CONNECTIVITY_STATIC_IPV4) => {
+            let interface = status.static_ipv4_interface.as_deref().unwrap_or("eth0");
+            match (
+                status.static_ipv4_address.as_deref(),
+                status.static_ipv4_prefix_len,
+            ) {
+                (Some(address), Some(prefix_len)) => {
+                    format!("static IPv4 {address}/{prefix_len} on {interface}")
+                }
+                _ => format!("static IPv4 on {interface}"),
+            }
+        }
+        _ => format!(
+            "existing-network DHCP on {}",
+            status
+                .existing_network_interface
+                .as_deref()
+                .unwrap_or("eth0")
+        ),
+    }
 }
 
 fn provisioning_issue_text(status: &ProvisioningStatus) -> String {
@@ -2196,6 +2378,11 @@ mod tests {
             device_name: Some("bunzo-qemu".into()),
             connectivity_kind: Some("existing_network".into()),
             existing_network_interface: Some("eth0".into()),
+            static_ipv4_interface: None,
+            static_ipv4_address: None,
+            static_ipv4_prefix_len: None,
+            static_ipv4_gateway: None,
+            static_ipv4_dns_servers: Vec::new(),
             provider_kind: Some("openai".into()),
             model: Some(DEFAULT_REMOTE_MODEL.into()),
             rendered_config_path: Some(BUNZOD_CONFIG_PATH.into()),

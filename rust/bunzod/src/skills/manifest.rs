@@ -108,4 +108,19 @@ mod tests {
         };
         assert!(!caps.allows_read("/etc/../root/.ssh/id_rsa"));
     }
+
+    #[test]
+    fn bunzo_state_capability_can_exclude_secrets() {
+        let caps = Capabilities {
+            fs_read: vec![
+                "/var/lib/bunzo/ledger.jsonl".into(),
+                "/var/lib/bunzo/config/".into(),
+                "/var/lib/bunzo/provisioning/".into(),
+            ],
+        };
+        assert!(caps.allows_read("/var/lib/bunzo/ledger.jsonl"));
+        assert!(caps.allows_read("/var/lib/bunzo/config/provider.toml"));
+        assert!(caps.allows_read("/var/lib/bunzo/provisioning/state.toml"));
+        assert!(!caps.allows_read("/var/lib/bunzo/secrets/openai.key"));
+    }
 }

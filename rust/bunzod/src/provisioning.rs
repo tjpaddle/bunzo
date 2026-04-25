@@ -6,6 +6,7 @@
 //! remains rendered runtime output rather than source of truth.
 
 use std::fs;
+use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,7 +44,9 @@ const PROVIDER_CONFIG_NAME: &str = "provider.toml";
 const STATE_FILE_NAME: &str = "state.toml";
 const OPENAI_SECRET_NAME: &str = "openai.key";
 const CONNECTIVITY_KIND_EXISTING_NETWORK: &str = "existing_network";
+const CONNECTIVITY_KIND_STATIC_IPV4: &str = "static_ipv4";
 const EXISTING_NETWORK_INTERFACE: &str = "eth0";
+const DEFAULT_STATIC_IPV4_PREFIX_LEN: u8 = 24;
 const PROVIDER_KIND_OPENAI: &str = "openai";
 const FRONTEND_SOURCE_SHARED: &str = "provisioning_frontend";
 const NETWORK_SERVICE_NAME: &str = "network.service";
@@ -130,6 +133,16 @@ struct ProvisioningStateRecord {
     device_name: Option<String>,
     connectivity_kind: Option<String>,
     existing_network_interface: Option<String>,
+    #[serde(default)]
+    static_ipv4_interface: Option<String>,
+    #[serde(default)]
+    static_ipv4_address: Option<String>,
+    #[serde(default)]
+    static_ipv4_prefix_len: Option<u8>,
+    #[serde(default)]
+    static_ipv4_gateway: Option<String>,
+    #[serde(default)]
+    static_ipv4_dns_servers: Vec<String>,
     provider_kind: Option<String>,
     model: Option<String>,
     rendered_config_path: Option<String>,
@@ -145,6 +158,11 @@ impl Default for ProvisioningStateRecord {
             device_name: None,
             connectivity_kind: None,
             existing_network_interface: None,
+            static_ipv4_interface: None,
+            static_ipv4_address: None,
+            static_ipv4_prefix_len: None,
+            static_ipv4_gateway: None,
+            static_ipv4_dns_servers: Vec::new(),
             provider_kind: None,
             model: None,
             rendered_config_path: None,
@@ -166,6 +184,19 @@ struct NetworkConfig {
     source: String,
     #[serde(default = "default_existing_network_interface")]
     interface_name: String,
+    #[serde(default)]
+    static_ipv4: Option<StaticIpv4Config>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StaticIpv4Config {
+    address: String,
+    #[serde(default = "default_static_ipv4_prefix_len")]
+    prefix_len: u8,
+    #[serde(default)]
+    gateway: Option<String>,
+    #[serde(default)]
+    dns_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +375,11 @@ impl ProvisioningEngine {
             device_name: requested_device_name.map(str::to_string),
             connectivity_kind: None,
             existing_network_interface: None,
+            static_ipv4_interface: None,
+            static_ipv4_address: None,
+            static_ipv4_prefix_len: None,
+            static_ipv4_gateway: None,
+            static_ipv4_dns_servers: Vec::new(),
             provider_kind: None,
             api_key: api_key.to_string(),
         })
@@ -386,30 +422,25 @@ impl ProvisioningEngine {
             .map(str::trim)
             .filter(|kind| !kind.is_empty())
             .unwrap_or(CONNECTIVITY_KIND_EXISTING_NETWORK);
-        if connectivity_kind != CONNECTIVITY_KIND_EXISTING_NETWORK {
+        if !matches!(
+            connectivity_kind,
+            CONNECTIVITY_KIND_EXISTING_NETWORK | CONNECTIVITY_KIND_STATIC_IPV4
+        ) {
             let err = anyhow!(
-                "unsupported connectivity kind '{connectivity_kind}'; this slice only supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}'"
+                "unsupported connectivity kind '{connectivity_kind}'; this slice supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}' and '{CONNECTIVITY_KIND_STATIC_IPV4}'"
             );
             self.write_failed_state(&state, &format!("{err:#}"))?;
             return Err(err);
         }
-        let existing_network_interface = match self
-            .resolve_existing_network_interface(setup.existing_network_interface.as_deref())
-        {
-            Ok(existing_network_interface) => existing_network_interface,
+
+        let network_cfg = match self.resolve_network_config(connectivity_kind, setup) {
+            Ok(network_cfg) => network_cfg,
             Err(err) => {
                 self.write_failed_state(&state, &format!("{err:#}"))?;
                 return Err(err);
             }
         };
-
-        let network_cfg = NetworkConfig {
-            kind: connectivity_kind.into(),
-            source: FRONTEND_SOURCE_SHARED.into(),
-            interface_name: existing_network_interface.clone(),
-        };
-        state.connectivity_kind = Some(connectivity_kind.into());
-        state.existing_network_interface = Some(existing_network_interface);
+        self.apply_network_metadata(&mut state, &network_cfg);
         self.write_state_checkpoint(&mut state, ProvisioningPhase::Connectivity)?;
         self.write_toml_atomic(&self.paths.network_config_path(), &network_cfg, 0o600)?;
 
@@ -487,8 +518,7 @@ impl ProvisioningEngine {
         let network_cfg =
             self.read_optional_toml::<NetworkConfig>(&self.paths.network_config_path())?;
         if let Some(network) = &network_cfg {
-            state.connectivity_kind = Some(network.kind.clone());
-            state.existing_network_interface = Some(network.interface_name.clone());
+            self.apply_network_metadata(&mut state, network);
         }
 
         let provider_cfg =
@@ -543,6 +573,11 @@ impl ProvisioningEngine {
             device_name: state.device_name.clone(),
             connectivity_kind: state.connectivity_kind.clone(),
             existing_network_interface: state.existing_network_interface.clone(),
+            static_ipv4_interface: state.static_ipv4_interface.clone(),
+            static_ipv4_address: state.static_ipv4_address.clone(),
+            static_ipv4_prefix_len: state.static_ipv4_prefix_len,
+            static_ipv4_gateway: state.static_ipv4_gateway.clone(),
+            static_ipv4_dns_servers: state.static_ipv4_dns_servers.clone(),
             provider_kind: state.provider_kind.clone(),
             model: state.model.clone(),
             rendered_config_path: state.rendered_config_path.clone(),
@@ -589,6 +624,32 @@ impl ProvisioningEngine {
         }
     }
 
+    fn apply_network_metadata(&self, state: &mut ProvisioningStateRecord, network: &NetworkConfig) {
+        state.connectivity_kind = Some(network.kind.clone());
+        state.existing_network_interface = None;
+        state.static_ipv4_interface = None;
+        state.static_ipv4_address = None;
+        state.static_ipv4_prefix_len = None;
+        state.static_ipv4_gateway = None;
+        state.static_ipv4_dns_servers.clear();
+
+        match network.kind.as_str() {
+            CONNECTIVITY_KIND_EXISTING_NETWORK => {
+                state.existing_network_interface = Some(network.interface_name.clone());
+            }
+            CONNECTIVITY_KIND_STATIC_IPV4 => {
+                state.static_ipv4_interface = Some(network.interface_name.clone());
+                if let Some(static_ipv4) = &network.static_ipv4 {
+                    state.static_ipv4_address = Some(static_ipv4.address.clone());
+                    state.static_ipv4_prefix_len = Some(static_ipv4.prefix_len);
+                    state.static_ipv4_gateway = static_ipv4.gateway.clone();
+                    state.static_ipv4_dns_servers = static_ipv4.dns_servers.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn resolve_device_name(&self, requested_device_name: Option<&str>) -> Result<String> {
         if let Some(requested) = requested_device_name {
             return normalize_device_name(requested);
@@ -629,6 +690,102 @@ impl ProvisioningEngine {
         Ok(existing)
     }
 
+    fn resolve_network_config(
+        &self,
+        connectivity_kind: &str,
+        setup: &ProvisioningSetupInput,
+    ) -> Result<NetworkConfig> {
+        match connectivity_kind {
+            CONNECTIVITY_KIND_EXISTING_NETWORK => {
+                let interface_name = self.resolve_existing_network_interface(
+                    setup.existing_network_interface.as_deref(),
+                )?;
+                Ok(NetworkConfig {
+                    kind: CONNECTIVITY_KIND_EXISTING_NETWORK.into(),
+                    source: FRONTEND_SOURCE_SHARED.into(),
+                    interface_name,
+                    static_ipv4: None,
+                })
+            }
+            CONNECTIVITY_KIND_STATIC_IPV4 => {
+                let (interface_name, static_ipv4) = self.resolve_static_ipv4_config(setup)?;
+                Ok(NetworkConfig {
+                    kind: CONNECTIVITY_KIND_STATIC_IPV4.into(),
+                    source: FRONTEND_SOURCE_SHARED.into(),
+                    interface_name,
+                    static_ipv4: Some(static_ipv4),
+                })
+            }
+            _ => bail!(
+                "unsupported connectivity kind '{connectivity_kind}'; this slice supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}' and '{CONNECTIVITY_KIND_STATIC_IPV4}'"
+            ),
+        }
+    }
+
+    fn resolve_static_ipv4_config(
+        &self,
+        setup: &ProvisioningSetupInput,
+    ) -> Result<(String, StaticIpv4Config)> {
+        let existing = self
+            .read_toml::<NetworkConfig>(&self.paths.network_config_path())
+            .ok()
+            .filter(|cfg| cfg.kind == CONNECTIVITY_KIND_STATIC_IPV4);
+
+        let interface_name = match setup
+            .static_ipv4_interface
+            .as_deref()
+            .or(setup.existing_network_interface.as_deref())
+        {
+            Some(requested) => normalize_network_interface_name(requested)?,
+            None => existing
+                .as_ref()
+                .map(|cfg| normalize_network_interface_name(&cfg.interface_name))
+                .transpose()?
+                .unwrap_or_else(default_existing_network_interface),
+        };
+
+        let existing_static = existing.as_ref().and_then(|cfg| cfg.static_ipv4.as_ref());
+        let address = match setup.static_ipv4_address.as_deref() {
+            Some(raw) => normalize_ipv4_address(raw, "static IPv4 address")?,
+            None => existing_static
+                .map(|cfg| normalize_ipv4_address(&cfg.address, "static IPv4 address"))
+                .transpose()?
+                .ok_or_else(|| anyhow!("static IPv4 mode requires an IPv4 address"))?,
+        };
+        let prefix_len = match setup.static_ipv4_prefix_len {
+            Some(prefix_len) => normalize_ipv4_prefix_len(prefix_len)?,
+            None => existing_static
+                .map(|cfg| normalize_ipv4_prefix_len(cfg.prefix_len))
+                .transpose()?
+                .unwrap_or(DEFAULT_STATIC_IPV4_PREFIX_LEN),
+        };
+        let gateway = match setup.static_ipv4_gateway.as_deref() {
+            Some(raw) => Some(normalize_ipv4_address(raw, "static IPv4 gateway")?),
+            None => existing_static
+                .and_then(|cfg| cfg.gateway.as_deref())
+                .map(|gateway| normalize_ipv4_address(gateway, "static IPv4 gateway"))
+                .transpose()?,
+        };
+        let dns_servers = if setup.static_ipv4_dns_servers.is_empty() {
+            existing_static
+                .map(|cfg| normalize_ipv4_addresses(&cfg.dns_servers, "static IPv4 DNS server"))
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            normalize_ipv4_addresses(&setup.static_ipv4_dns_servers, "static IPv4 DNS server")?
+        };
+
+        Ok((
+            interface_name,
+            StaticIpv4Config {
+                address,
+                prefix_len,
+                gateway,
+                dns_servers,
+            },
+        ))
+    }
+
     fn reconcile_runtime_outputs(
         &self,
         device_cfg: Option<&DeviceConfig>,
@@ -656,15 +813,22 @@ impl ProvisioningEngine {
     }
 
     fn apply_runtime_network(&self, network_cfg: &NetworkConfig) -> Result<()> {
-        if network_cfg.kind != CONNECTIVITY_KIND_EXISTING_NETWORK {
-            bail!(
-                "unsupported connectivity kind '{}'; this slice only supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}'",
-                network_cfg.kind
-            );
-        }
-
         let interface_name = normalize_network_interface_name(&network_cfg.interface_name)?;
-        let body = render_existing_network_interfaces(&interface_name);
+        let body = match network_cfg.kind.as_str() {
+            CONNECTIVITY_KIND_EXISTING_NETWORK => render_existing_network_interfaces(&interface_name),
+            CONNECTIVITY_KIND_STATIC_IPV4 => {
+                let static_ipv4 = network_cfg
+                    .static_ipv4
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("static IPv4 network config is missing address data"))?;
+                let static_ipv4 = normalize_static_ipv4_config(static_ipv4)?;
+                render_static_ipv4_interfaces(&interface_name, &static_ipv4)
+            }
+            _ => bail!(
+                "unsupported connectivity kind '{}'; this slice supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}' and '{CONNECTIVITY_KIND_STATIC_IPV4}'",
+                network_cfg.kind
+            ),
+        };
         let changed = self.write_string_if_changed(
             &self.paths.runtime_network_interfaces_path,
             &body,
@@ -959,6 +1123,10 @@ fn default_existing_network_interface() -> String {
     EXISTING_NETWORK_INTERFACE.into()
 }
 
+fn default_static_ipv4_prefix_len() -> u8 {
+    DEFAULT_STATIC_IPV4_PREFIX_LEN
+}
+
 fn normalize_device_name(input: &str) -> Result<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -994,6 +1162,57 @@ fn normalize_network_interface_name(input: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+fn normalize_static_ipv4_config(input: &StaticIpv4Config) -> Result<StaticIpv4Config> {
+    Ok(StaticIpv4Config {
+        address: normalize_ipv4_address(&input.address, "static IPv4 address")?,
+        prefix_len: normalize_ipv4_prefix_len(input.prefix_len)?,
+        gateway: input
+            .gateway
+            .as_deref()
+            .map(|gateway| normalize_ipv4_address(gateway, "static IPv4 gateway"))
+            .transpose()?,
+        dns_servers: normalize_ipv4_addresses(&input.dns_servers, "static IPv4 DNS server")?,
+    })
+}
+
+fn normalize_ipv4_address(input: &str, label: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    trimmed
+        .parse::<Ipv4Addr>()
+        .map(|addr| addr.to_string())
+        .with_context(|| format!("{label} '{trimmed}' is not a valid IPv4 address"))
+}
+
+fn normalize_ipv4_addresses(inputs: &[String], label: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for input in inputs {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        out.push(normalize_ipv4_address(trimmed, label)?);
+    }
+    Ok(out)
+}
+
+fn normalize_ipv4_prefix_len(prefix_len: u8) -> Result<u8> {
+    if !(1..=32).contains(&prefix_len) {
+        bail!("static IPv4 prefix length {prefix_len} must be between 1 and 32");
+    }
+    Ok(prefix_len)
+}
+
+fn prefix_len_to_netmask(prefix_len: u8) -> Result<Ipv4Addr> {
+    let prefix_len = normalize_ipv4_prefix_len(prefix_len)?;
+    let mask = u32::MAX
+        .checked_shl(u32::from(32 - prefix_len))
+        .unwrap_or(0);
+    Ok(Ipv4Addr::from(mask))
+}
+
 fn render_existing_network_interfaces(interface_name: &str) -> String {
     format!(
         concat!(
@@ -1009,6 +1228,43 @@ fn render_existing_network_interfaces(interface_name: &str) -> String {
             "  hostname $(hostname)\n"
         ),
         interface_name = interface_name
+    )
+}
+
+fn render_static_ipv4_interfaces(interface_name: &str, static_ipv4: &StaticIpv4Config) -> String {
+    let netmask = prefix_len_to_netmask(static_ipv4.prefix_len)
+        .expect("static IPv4 prefix was validated before rendering");
+    let gateway = static_ipv4
+        .gateway
+        .as_ref()
+        .map(|gateway| format!("  gateway {gateway}\n"))
+        .unwrap_or_default();
+    let dns_servers = if static_ipv4.dns_servers.is_empty() {
+        String::new()
+    } else {
+        format!("  dns-nameservers {}\n", static_ipv4.dns_servers.join(" "))
+    };
+
+    format!(
+        concat!(
+            "# interface file auto-generated by buildroot\n",
+            "\n",
+            "auto lo\n",
+            "iface lo inet loopback\n",
+            "\n",
+            "auto {interface_name}\n",
+            "iface {interface_name} inet static\n",
+            "  address {address}\n",
+            "  netmask {netmask}\n",
+            "{gateway}",
+            "{dns_servers}",
+            "  pre-up /etc/network/nfs_check\n"
+        ),
+        interface_name = interface_name,
+        address = static_ipv4.address,
+        netmask = netmask,
+        gateway = gateway,
+        dns_servers = dns_servers
     )
 }
 
@@ -1228,6 +1484,11 @@ mod tests {
                 device_name: Some("bunzo-qemu".into()),
                 connectivity_kind: Some(CONNECTIVITY_KIND_EXISTING_NETWORK.into()),
                 existing_network_interface: Some("enp0s1".into()),
+                static_ipv4_interface: None,
+                static_ipv4_address: None,
+                static_ipv4_prefix_len: None,
+                static_ipv4_gateway: None,
+                static_ipv4_dns_servers: Vec::new(),
                 provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
                 api_key: "sk-test".into(),
             })
@@ -1245,6 +1506,58 @@ mod tests {
         let interfaces = fs::read_to_string(&engine.paths.runtime_network_interfaces_path).unwrap();
         assert!(interfaces.contains("auto enp0s1"));
         assert!(interfaces.contains("iface enp0s1 inet dhcp"));
+        assert_eq!(activator.network_restart_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn static_ipv4_is_persisted_and_rendered() {
+        let tmp = TempDir::new().unwrap();
+        let activator = StubRuntimeActivator::success();
+        let engine = test_engine(&tmp, StubValidator::success(), activator.clone());
+
+        let status = engine
+            .apply_setup_async(&ProvisioningSetupInput {
+                device_name: Some("bunzo-qemu".into()),
+                connectivity_kind: Some(CONNECTIVITY_KIND_STATIC_IPV4.into()),
+                existing_network_interface: None,
+                static_ipv4_interface: Some("enp0s1".into()),
+                static_ipv4_address: Some("192.168.50.10".into()),
+                static_ipv4_prefix_len: Some(24),
+                static_ipv4_gateway: Some("192.168.50.1".into()),
+                static_ipv4_dns_servers: vec!["1.1.1.1".into(), "8.8.8.8".into()],
+                provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
+                api_key: "sk-test".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(status.ready);
+        assert_eq!(status.connectivity_kind.as_deref(), Some("static_ipv4"));
+        assert_eq!(status.existing_network_interface, None);
+        assert_eq!(status.static_ipv4_interface.as_deref(), Some("enp0s1"));
+        assert_eq!(status.static_ipv4_address.as_deref(), Some("192.168.50.10"));
+        assert_eq!(status.static_ipv4_prefix_len, Some(24));
+        assert_eq!(status.static_ipv4_gateway.as_deref(), Some("192.168.50.1"));
+        assert_eq!(status.static_ipv4_dns_servers, vec!["1.1.1.1", "8.8.8.8"]);
+
+        let network: NetworkConfig = engine
+            .read_toml(&engine.paths.network_config_path())
+            .expect("network config");
+        assert_eq!(network.kind, "static_ipv4");
+        assert_eq!(network.interface_name, "enp0s1");
+        let static_ipv4 = network.static_ipv4.expect("static IPv4 config");
+        assert_eq!(static_ipv4.address, "192.168.50.10");
+        assert_eq!(static_ipv4.prefix_len, 24);
+        assert_eq!(static_ipv4.gateway.as_deref(), Some("192.168.50.1"));
+        assert_eq!(static_ipv4.dns_servers, vec!["1.1.1.1", "8.8.8.8"]);
+
+        let interfaces = fs::read_to_string(&engine.paths.runtime_network_interfaces_path).unwrap();
+        assert!(interfaces.contains("auto enp0s1"));
+        assert!(interfaces.contains("iface enp0s1 inet static"));
+        assert!(interfaces.contains("address 192.168.50.10"));
+        assert!(interfaces.contains("netmask 255.255.255.0"));
+        assert!(interfaces.contains("gateway 192.168.50.1"));
+        assert!(interfaces.contains("dns-nameservers 1.1.1.1 8.8.8.8"));
         assert_eq!(activator.network_restart_calls.load(Ordering::Relaxed), 1);
     }
 
@@ -1287,6 +1600,11 @@ mod tests {
                 device_name: Some("bunzo-qemu".into()),
                 connectivity_kind: Some(CONNECTIVITY_KIND_EXISTING_NETWORK.into()),
                 existing_network_interface: Some("eth 0".into()),
+                static_ipv4_interface: None,
+                static_ipv4_address: None,
+                static_ipv4_prefix_len: None,
+                static_ipv4_gateway: None,
+                static_ipv4_dns_servers: Vec::new(),
                 provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
                 api_key: "sk-test".into(),
             })
@@ -1302,6 +1620,42 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("contains unsupported characters"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_static_ipv4_address_stays_non_ready_with_detail() {
+        let tmp = TempDir::new().unwrap();
+        let engine = test_engine(
+            &tmp,
+            StubValidator::success(),
+            StubRuntimeActivator::success(),
+        );
+
+        let err = engine
+            .apply_setup_async(&ProvisioningSetupInput {
+                device_name: Some("bunzo-qemu".into()),
+                connectivity_kind: Some(CONNECTIVITY_KIND_STATIC_IPV4.into()),
+                existing_network_interface: None,
+                static_ipv4_interface: Some("eth0".into()),
+                static_ipv4_address: Some("not-an-ip".into()),
+                static_ipv4_prefix_len: Some(24),
+                static_ipv4_gateway: Some("192.168.50.1".into()),
+                static_ipv4_dns_servers: vec!["1.1.1.1".into()],
+                provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
+                api_key: "sk-test".into(),
+            })
+            .await
+            .expect_err("static address should fail");
+        assert!(format!("{err:#}").contains("static IPv4 address 'not-an-ip'"));
+
+        let status = engine.status().unwrap();
+        assert!(!status.ready);
+        assert_eq!(status.phase, "failed_recoverable");
+        assert!(status
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("static IPv4 address 'not-an-ip'"));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1531,28 +1531,26 @@ impl RuntimeStore {
             .context("starting runtime policy evaluation transaction")?;
         let evaluation = select_policy_evaluation(&tx, request, subject, action, resource)?;
 
-        insert_event(
-            &tx,
-            &request.conversation_id,
-            Some(&request.task_id),
-            Some(&request.task_run_id),
-            "policy.decision",
-            json!({
-                "policy_id": evaluation.policy_id.clone(),
-                "source": evaluation.source.as_str(),
-                "subject": evaluation.subject.clone(),
-                "action": evaluation.action.clone(),
-                "resource": evaluation.resource.clone(),
-                "decision": evaluation.decision.as_str(),
-                "grant_scope": evaluation.grant_scope.as_str(),
-                "detail": evaluation.detail.clone(),
-            }),
-            now_ms_i64(),
-        )?;
+        insert_policy_decision_event(&tx, request, &evaluation, now_ms_i64())?;
 
         tx.commit()
             .context("committing runtime policy evaluation transaction")?;
         Ok(evaluation)
+    }
+
+    pub fn record_policy_evaluation(
+        &self,
+        request: &PreparedRequest,
+        evaluation: &PolicyEvaluation,
+    ) -> Result<()> {
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction()
+            .context("starting runtime policy event transaction")?;
+        insert_policy_decision_event(&tx, request, evaluation, now_ms_i64())?;
+        tx.commit()
+            .context("committing runtime policy event transaction")?;
+        Ok(())
     }
 
     fn record_event(
@@ -2096,6 +2094,32 @@ fn insert_event(
     Ok(())
 }
 
+fn insert_policy_decision_event(
+    tx: &Transaction<'_>,
+    request: &PreparedRequest,
+    evaluation: &PolicyEvaluation,
+    created_at_ms: i64,
+) -> Result<()> {
+    insert_event(
+        tx,
+        &request.conversation_id,
+        Some(&request.task_id),
+        Some(&request.task_run_id),
+        "policy.decision",
+        json!({
+            "policy_id": evaluation.policy_id.clone(),
+            "source": evaluation.source.as_str(),
+            "subject": evaluation.subject.clone(),
+            "action": evaluation.action.clone(),
+            "resource": evaluation.resource.clone(),
+            "decision": evaluation.decision.as_str(),
+            "grant_scope": evaluation.grant_scope.as_str(),
+            "detail": evaluation.detail.clone(),
+        }),
+        created_at_ms,
+    )
+}
+
 fn sync_scheduled_job_run_state(
     tx: &Transaction<'_>,
     request: &PreparedRequest,
@@ -2269,6 +2293,7 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{local_file_read_resource, ToolPolicyContext};
 
     fn temp_store() -> (tempfile::TempDir, RuntimeStore) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2677,6 +2702,84 @@ mod tests {
         assert_eq!(payload["decision"], "deny");
         assert_eq!(payload["grant_scope"], "task");
         assert_eq!(payload["resource"], "read-local-file");
+    }
+
+    #[test]
+    fn local_file_resource_policy_does_not_approve_other_paths() {
+        let (_dir, store) = temp_store();
+        let request = store
+            .prepare_shell_request("u1", None, "what OS is this?")
+            .expect("request");
+        let safe_resource = local_file_read_resource("/etc/os-release");
+        let secret_resource = local_file_read_resource("/var/lib/bunzo/secrets/openai.key");
+
+        store
+            .insert_runtime_policy(NewRuntimePolicy {
+                subject: "shell_request".into(),
+                action: "invoke_skill".into(),
+                resource: safe_resource.clone(),
+                decision: PolicyDecision::Allow,
+                grant_scope: GrantScope::Persistent,
+                conversation_id: None,
+                task_id: None,
+                task_run_id: None,
+                note_text: Some("safe OS-release read".into()),
+            })
+            .expect("safe file policy");
+
+        let safe_evaluation = store
+            .evaluate_policy(&request, "shell_request", "invoke_skill", &safe_resource)
+            .expect("safe policy evaluation");
+        assert_eq!(safe_evaluation.decision, PolicyDecision::Allow);
+
+        let secret_evaluation = store
+            .evaluate_policy(&request, "shell_request", "invoke_skill", &secret_resource)
+            .expect("secret policy evaluation");
+        assert_eq!(secret_evaluation.source, PolicySource::Default);
+        assert_eq!(secret_evaluation.decision, PolicyDecision::RequireApproval);
+        assert_eq!(secret_evaluation.resource, secret_resource);
+    }
+
+    #[test]
+    fn capability_denial_records_secret_read_policy_event() {
+        let (_dir, store) = temp_store();
+        let request = store
+            .prepare_shell_request("u1", None, "read the OpenAI key")
+            .expect("request");
+        let resource = local_file_read_resource("/var/lib/bunzo/secrets/openai.key");
+        let policy = ToolPolicyContext::new(store.clone(), request.clone());
+
+        let evaluation = policy
+            .deny_skill_resource_by_capability(
+                &resource,
+                "skill manifest denies read-local-file fs_read for /var/lib/bunzo/secrets/openai.key"
+                    .into(),
+            )
+            .expect("capability denial");
+        assert_eq!(evaluation.source, PolicySource::Capability);
+        assert_eq!(evaluation.decision, PolicyDecision::Deny);
+        assert_eq!(evaluation.resource, resource);
+
+        let conn = store.connect().expect("connect");
+        let payload_json: String = conn
+            .query_row(
+                concat!(
+                    "SELECT payload_json FROM events ",
+                    "WHERE kind = 'policy.decision' ",
+                    "ORDER BY created_at_ms DESC, rowid DESC LIMIT 1"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("policy decision event");
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_json).expect("event payload json");
+        assert_eq!(payload["source"], "capability");
+        assert_eq!(payload["decision"], "deny");
+        assert_eq!(
+            payload["resource"],
+            "read-local-file:fs-read:/var/lib/bunzo/secrets/openai.key"
+        );
     }
 
     #[test]
