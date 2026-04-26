@@ -2,9 +2,9 @@
 
 Load this file only for M7 provisioning work.
 
-## Current slice
+## Current status
 
-The first six M7 provisioning slices are now landed:
+M7 provisioning is now landed and QEMU-verified:
 
 - `bunzo-provisiond` exists as the provisioning owner
 - local-shell `/setup` calls the provisioning socket API instead of writing
@@ -25,11 +25,18 @@ The first six M7 provisioning slices are now landed:
 - `static_ipv4` now persists interface/address/prefix/gateway/DNS under
   `/var/lib/bunzo/config/network.toml` and renders a static ifupdown stanza
   into `/etc/network/interfaces`
+- `wifi_client` now persists interface/SSID/key-secret metadata under
+  `/var/lib/bunzo/config/network.toml`, stores the WPA passphrase under
+  `/var/lib/bunzo/secrets/wifi-psk`, renders
+  `/etc/wpa_supplicant/wpa_supplicant.conf`, and renders
+  `/etc/network/interfaces` with a `wpa-conf` stanza
+- the QEMU image includes WPA client tooling (`wpa_supplicant`, `iw`, and
+  wireless regulatory data)
 
-Still open:
-
-- QEMU replay for the `static_ipv4` path
-- broader connectivity modes such as Wi-Fi/captive-portal setup
+Real AP/captive-portal bring-up and hardware-radio validation remain later
+connectivity hardening. They are not a separate provisioning engine boundary:
+any future frontend must still call `bunzo-provisiond` and write the same
+canonical `/var/lib/bunzo/` state.
 
 ## Required outcome
 
@@ -68,8 +75,8 @@ In the current landed slices:
 - `validating` performs a live OpenAI credential/model probe before `ready`
 - failed provider validation lands in `failed_recoverable` with persisted
   detail for the frontend
-- restart/boot reconciliation re-renders `/etc/bunzo/bunzod.toml` from
-  canonical state before normal runtime use
+- restart/boot reconciliation re-renders runtime outputs from canonical state
+  before normal runtime use
 
 ## What setup should ask
 
@@ -93,10 +100,14 @@ In the current landed slice set, the engine seeds:
 - connectivity can alternatively be `static_ipv4`, with interface,
   address/prefix, optional gateway, and optional DNS servers persisted in the
   same canonical `network.toml` and rendered into `/etc/network/interfaces`
+- connectivity can alternatively be `wifi_client`, with interface, SSID, and
+  WPA passphrase persisted through canonical `network.toml` plus
+  `/var/lib/bunzo/secrets/wifi-psk`, rendered into
+  `/etc/network/interfaces` and `/etc/wpa_supplicant/wpa_supplicant.conf`
 - provider as OpenAI with the current GPT-5.4-family restriction
 
-That keeps the state machine and durable ownership real while leaving broader
-Wi-Fi/AP connectivity modes for later slices.
+That keeps the state machine and durable ownership real while leaving AP and
+captive-portal UX for later connectivity hardening.
 
 ## Frontends
 
@@ -106,9 +117,9 @@ For devices with local I/O:
 
 - `bunzo-shell` detects unprovisioned state
 - `/setup` enters the provisioning flow
-- the current slice persists device name plus either explicit
-  `existing_network` interface selection or `static_ipv4` interface/address
-  fields, then collects the provider credential locally
+- the current implementation persists device name plus explicit
+  `existing_network`, `static_ipv4`, or `wifi_client` fields, then collects
+  the provider credential locally
 
 ### Headless setup
 
@@ -122,8 +133,9 @@ Current implementation:
 
 - `bunzo-setup-httpd` is the thin HTTP frontend
 - it talks to `bunzo-provisiond` over the provisioning socket API
-- it shows status plus submits device name, `existing_network` or
-  `static_ipv4`, the mode-specific network fields, OpenAI, and the API key
+- it shows status plus submits device name, `existing_network`,
+  `static_ipv4`, or `wifi_client`, the mode-specific network fields, OpenAI,
+  and the API key
 - in the QEMU/dev loop it is reachable on guest port `8080` and forwarded from
   host port `8080`
 
@@ -139,24 +151,26 @@ Suggested durable layout:
 - `/var/lib/bunzo/config/network.toml`
 - `/var/lib/bunzo/config/provider.toml`
 - `/var/lib/bunzo/secrets/<provider>.key`
+- `/var/lib/bunzo/secrets/wifi-psk` when `wifi_client` is configured
 
 Then a renderer/activation step materializes runtime-facing files such as:
 
 - `/etc/hostname`
 - `/etc/network/interfaces`
+- `/etc/wpa_supplicant/wpa_supplicant.conf`
 - `/etc/bunzo/bunzod.toml`
 
-The current slice now renders all three of those runtime-facing outputs.
-Connectivity is intentionally still ifupdown-based, but it now covers both
-explicit-interface DHCP through `existing_network` and static IPv4 through
-`static_ipv4`.
+The current implementation renders those runtime-facing outputs.
+Connectivity is intentionally still ifupdown-based, but it now covers
+explicit-interface DHCP through `existing_network`, static IPv4 through
+`static_ipv4`, and WPA client setup through `wifi_client`.
 
 Boot-time reconciliation is currently handled by
 `bunzo-provisioning-reconcile.service`, while `bunzo-provisiond` and `bunzod`
 also re-check canonical state on startup for defense in depth. That
 reconciliation now re-applies the runtime hostname, the current
-network interfaces file for the chosen connectivity mode, and
-`/etc/bunzo/bunzod.toml`.
+network interfaces file for the chosen connectivity mode, WPA client config
+when applicable, and `/etc/bunzo/bunzod.toml`.
 
 ## Handoff into normal runtime
 
@@ -168,7 +182,7 @@ When provisioning reaches `ready`:
 4. start the normal runtime mode
 5. mark provisioning complete
 
-In the current slice, step 3 is effectively a no-op because
+In the current implementation, step 3 is effectively a no-op because
 `bunzo-provisiond`, `bunzo-setup-httpd`, and `bunzod` are all socket- or
 request-activated enough that setup can stay thin while the provisioning
 boundary remains preserved: provisioning owns the canonical state and renders
@@ -198,6 +212,7 @@ Status:
   live provider validation, boot-time runtime hostname/network/config
   reconciliation, the first browser-accessible headless frontend, explicit
   `existing_network` interface ownership across shell, HTTP, status, and
-  reconciliation, and the first additional `static_ipv4` connectivity mode
-- The remaining provisioning work is QEMU replay for `static_ipv4` and broader
-  connectivity modes such as Wi-Fi/captive-portal setup
+  reconciliation, `static_ipv4`, and `wifi_client` canonical/rendered
+  connectivity modes
+- The remaining provisioning-adjacent work is AP/captive-portal UX and real
+  hardware-radio validation, using the same provisioning engine boundary

@@ -13,21 +13,14 @@ The QEMU development loop has completed the core runtime foundations:
 - M4 first skill
 - M5 durable runtime store
 - M6 runtime policy
-- M8 scheduler slices 1-3
+- M7 provisioning engine
+- M8 scheduler
 
-The current milestone focus is finishing M7 beyond the hard-coded/default
-network boundary. M8 is started but not complete.
-
-Before adding broader skills, multi-agent behavior, or more autonomous
-proactive work, the next implementation slice should harden the runtime
-capability boundary:
-
-- keep `/var/lib/bunzo/secrets/` outside normal skill read access
-- make local-file policy decisions resource-aware enough to distinguish
-  approved audit/state reads from secret reads
-- preserve the rule that skill manifests are hard capability ceilings and
-  runtime policy can only narrow or approve within those ceilings
-- keep dev-only SSH access out of any future user-facing image profile
+The current milestone focus can move to M9 phone control and later hardware
+replay. M7 and M8 are closed in the QEMU development loop, with remaining
+Wi-Fi AP/captive-portal and hardware-radio validation tracked as future
+connectivity hardening rather than blockers for the provisioning engine
+milestone.
 
 ## Completed milestones
 
@@ -47,13 +40,20 @@ capability boundary:
 - **M6 — Policy engine**
   Runtime policy is durable, shell-authorable, approval-capable, and enforced
   in front of tool use.
+- **M7 — Provisioning engine**
+  `bunzo-provisiond` owns durable config, secrets, setup state, runtime
+  rendering, and restart/boot reconciliation under `/var/lib/bunzo/` for local
+  shell and headless HTTP setup.
+- **M8 — Scheduler**
+  Proactive jobs are durable and run through the same task, policy, approval,
+  and audit path as interactive work.
 
 ## Milestone 7 — Provisioning engine
 
 **Goal:** replace the current `/setup` shortcut with a real provisioning
 service that owns durable config, secrets, and first-boot state.
 
-Open work:
+Closed work:
 
 - [x] Introduce `bunzo-provisiond`
 - [x] Persist provisioning/config state under `/var/lib/bunzo/config/`
@@ -75,19 +75,19 @@ Open work:
   instead of assuming `eth0`
 - [x] Add at least one additional connectivity mode beyond the current
   explicit-interface `existing_network` slice boundary
+- [x] Add Wi-Fi client provisioning groundwork with canonical WPA state,
+  rendered WPA runtime config, and on-image WPA tooling
 
-**Current status:** Implemented and QEMU-verified through the `static_ipv4`
-connectivity slice. `bunzo-provisiond`
-persists canonical state under `/var/lib/bunzo/`, `/setup` talks to its socket
-API, provider credentials are live-validated before `ready`, canonical
-provisioning state now re-renders `/etc/hostname`, `/etc/network/interfaces`,
-and `/etc/bunzo/bunzod.toml` on restart/boot, and `bunzo-setup-httpd` exposes
-the same setup/status flow over the QEMU/dev network path. Device name is a
-real live + persistent hostname, both frontends carry explicit
-`existing_network` interface selection, and `static_ipv4` is now an additional
-provisioning-owned connectivity mode that persists address/prefix/gateway/DNS
-under `/var/lib/bunzo/config/network.toml` and renders the ifupdown static
-stanza from that state.
+**Current status:** Complete and QEMU-verified. `bunzo-provisiond` persists
+canonical state under `/var/lib/bunzo/`, `/setup` talks to its socket API,
+provider credentials are live-validated before `ready`, canonical provisioning
+state re-renders `/etc/hostname`, `/etc/network/interfaces`,
+`/etc/wpa_supplicant/wpa_supplicant.conf`, and `/etc/bunzo/bunzod.toml` on
+restart/boot, and `bunzo-setup-httpd` exposes the same setup/status flow over
+the QEMU/dev network path. Device name is a real live + persistent hostname,
+both frontends carry explicit `existing_network`, `static_ipv4`, and
+`wifi_client` fields, and connectivity state remains canonical under
+`/var/lib/bunzo/config/network.toml`.
 
 **Definition of done:** a user can complete setup locally or from a phone, both
 paths end in the same persisted config, and `/setup` is just one frontend to
@@ -106,6 +106,7 @@ Done so far:
 - [x] Durable job store
 - [x] Time-based recurring interval triggers
 - [x] One-shot delayed triggers
+- [x] Daily triggers
 - [x] Safe due-job claiming and job-run history
 - [x] Normal `scheduled_job` task runs
 - [x] Same runtime policy path as interactive work
@@ -115,20 +116,20 @@ Done so far:
 - [x] Bounded retry claims for failed interval runs
 - [x] Shell retry/backoff flags and pending retry display
 - [x] Shell one-shot command and completed one-shot display
+- [x] Shell job details, pause/resume, and edit commands
 
-Still open:
+Closed work:
 
-- [ ] Add additional trigger shapes beyond fixed intervals and one-shot delays
-- [ ] Improve job editing/inspection surfaces as history grows
+- [x] Add additional trigger shapes beyond fixed intervals and one-shot delays
+- [x] Improve job editing/inspection surfaces as history grows
 
-**Current status:** QEMU-verified. `/jobs every 10 what OS is this?` creates
-recurring work that pauses/resumes under the same approval-first policy model
-as interactive requests. Jobs now also persist retry/backoff policy, record
+**Current status:** Complete and QEMU-verified. `/jobs every`, `/jobs in`, and
+`/jobs daily` create interval, one-shot, and daily work through the same
+scheduler/runtime/task/policy path. Jobs persist retry/backoff policy, record
 trigger kind and attempt number, show pending retry/error state in
-`/jobs list`, and clear pending retry state when deleted. `/jobs in <seconds>
-<prompt...>` creates a one-shot delayed job that runs through the same
-scheduler/runtime/task/policy path and disables itself after completion or
-retry exhaustion.
+`/jobs list`, and clear pending retry state when deleted. `/jobs show`,
+`/jobs pause`, `/jobs resume`, and `/jobs edit` provide the inspection and
+editing surface needed for the current durable scheduler.
 
 ## Milestone 9 — Phone control
 
