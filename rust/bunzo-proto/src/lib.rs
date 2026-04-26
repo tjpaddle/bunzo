@@ -109,6 +109,12 @@ pub struct ProvisioningStatus {
     pub static_ipv4_gateway: Option<String>,
     #[serde(default)]
     pub static_ipv4_dns_servers: Vec<String>,
+    #[serde(default)]
+    pub wifi_interface: Option<String>,
+    #[serde(default)]
+    pub wifi_ssid: Option<String>,
+    #[serde(default)]
+    pub wifi_key_secret_path: Option<String>,
     pub provider_kind: Option<String>,
     pub model: Option<String>,
     pub rendered_config_path: Option<String>,
@@ -135,6 +141,12 @@ pub struct ProvisioningSetupInput {
     pub static_ipv4_gateway: Option<String>,
     #[serde(default)]
     pub static_ipv4_dns_servers: Vec<String>,
+    #[serde(default)]
+    pub wifi_interface: Option<String>,
+    #[serde(default)]
+    pub wifi_ssid: Option<String>,
+    #[serde(default)]
+    pub wifi_passphrase: Option<String>,
     #[serde(default)]
     pub provider_kind: Option<String>,
     pub api_key: String,
@@ -744,6 +756,9 @@ mod tests {
             static_ipv4_prefix_len: None,
             static_ipv4_gateway: None,
             static_ipv4_dns_servers: Vec::new(),
+            wifi_interface: None,
+            wifi_ssid: None,
+            wifi_key_secret_path: None,
             provider_kind: Some("openai".into()),
             model: Some("gpt-5.4-mini".into()),
             rendered_config_path: Some("/etc/bunzo/bunzod.toml".into()),
@@ -765,6 +780,9 @@ mod tests {
                     static_ipv4_prefix_len: None,
                     static_ipv4_gateway: None,
                     static_ipv4_dns_servers: Vec::new(),
+                    wifi_interface: None,
+                    wifi_ssid: None,
+                    wifi_passphrase: None,
                     provider_kind: Some("openai".into()),
                     api_key: "sk-test".into(),
                 },

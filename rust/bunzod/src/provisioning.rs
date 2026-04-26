@@ -37,15 +37,19 @@ pub const DEFAULT_RUNTIME_CONFIG_DIR: &str = "/etc/bunzo";
 pub const DEFAULT_RUNTIME_CONFIG_PATH: &str = "/etc/bunzo/bunzod.toml";
 pub const DEFAULT_RUNTIME_HOSTNAME_PATH: &str = "/etc/hostname";
 pub const DEFAULT_RUNTIME_NETWORK_INTERFACES_PATH: &str = "/etc/network/interfaces";
+pub const DEFAULT_RUNTIME_WPA_SUPPLICANT_PATH: &str = "/etc/wpa_supplicant/wpa_supplicant.conf";
 
 const DEVICE_CONFIG_NAME: &str = "device.toml";
 const NETWORK_CONFIG_NAME: &str = "network.toml";
 const PROVIDER_CONFIG_NAME: &str = "provider.toml";
 const STATE_FILE_NAME: &str = "state.toml";
 const OPENAI_SECRET_NAME: &str = "openai.key";
+const WIFI_PSK_SECRET_NAME: &str = "wifi-psk";
 const CONNECTIVITY_KIND_EXISTING_NETWORK: &str = "existing_network";
 const CONNECTIVITY_KIND_STATIC_IPV4: &str = "static_ipv4";
+const CONNECTIVITY_KIND_WIFI_CLIENT: &str = "wifi_client";
 const EXISTING_NETWORK_INTERFACE: &str = "eth0";
+const WIFI_CLIENT_INTERFACE: &str = "wlan0";
 const DEFAULT_STATIC_IPV4_PREFIX_LEN: u8 = 24;
 const PROVIDER_KIND_OPENAI: &str = "openai";
 const FRONTEND_SOURCE_SHARED: &str = "provisioning_frontend";
@@ -62,6 +66,7 @@ pub struct ProvisioningPaths {
     pub runtime_config_path: PathBuf,
     pub runtime_hostname_path: PathBuf,
     pub runtime_network_interfaces_path: PathBuf,
+    pub runtime_wpa_supplicant_path: PathBuf,
 }
 
 impl Default for ProvisioningPaths {
@@ -75,6 +80,7 @@ impl Default for ProvisioningPaths {
             runtime_config_path: PathBuf::from(DEFAULT_RUNTIME_CONFIG_PATH),
             runtime_hostname_path: PathBuf::from(DEFAULT_RUNTIME_HOSTNAME_PATH),
             runtime_network_interfaces_path: PathBuf::from(DEFAULT_RUNTIME_NETWORK_INTERFACES_PATH),
+            runtime_wpa_supplicant_path: PathBuf::from(DEFAULT_RUNTIME_WPA_SUPPLICANT_PATH),
         }
     }
 }
@@ -98,6 +104,10 @@ impl ProvisioningPaths {
 
     fn openai_secret_path(&self) -> PathBuf {
         self.secrets_dir.join(OPENAI_SECRET_NAME)
+    }
+
+    fn wifi_psk_secret_path(&self) -> PathBuf {
+        self.secrets_dir.join(WIFI_PSK_SECRET_NAME)
     }
 }
 
@@ -143,6 +153,12 @@ struct ProvisioningStateRecord {
     static_ipv4_gateway: Option<String>,
     #[serde(default)]
     static_ipv4_dns_servers: Vec<String>,
+    #[serde(default)]
+    wifi_interface: Option<String>,
+    #[serde(default)]
+    wifi_ssid: Option<String>,
+    #[serde(default)]
+    wifi_key_secret_path: Option<String>,
     provider_kind: Option<String>,
     model: Option<String>,
     rendered_config_path: Option<String>,
@@ -163,6 +179,9 @@ impl Default for ProvisioningStateRecord {
             static_ipv4_prefix_len: None,
             static_ipv4_gateway: None,
             static_ipv4_dns_servers: Vec::new(),
+            wifi_interface: None,
+            wifi_ssid: None,
+            wifi_key_secret_path: None,
             provider_kind: None,
             model: None,
             rendered_config_path: None,
@@ -186,6 +205,8 @@ struct NetworkConfig {
     interface_name: String,
     #[serde(default)]
     static_ipv4: Option<StaticIpv4Config>,
+    #[serde(default)]
+    wifi: Option<WifiClientConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,8 +221,19 @@ struct StaticIpv4Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct WifiClientConfig {
+    ssid: String,
+    key_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderConfig {
     backend: CanonicalBackendConfig,
+}
+
+struct ResolvedNetworkConfig {
+    config: NetworkConfig,
+    wifi_passphrase: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +412,9 @@ impl ProvisioningEngine {
             static_ipv4_prefix_len: None,
             static_ipv4_gateway: None,
             static_ipv4_dns_servers: Vec::new(),
+            wifi_interface: None,
+            wifi_ssid: None,
+            wifi_passphrase: None,
             provider_kind: None,
             api_key: api_key.to_string(),
         })
@@ -424,24 +459,34 @@ impl ProvisioningEngine {
             .unwrap_or(CONNECTIVITY_KIND_EXISTING_NETWORK);
         if !matches!(
             connectivity_kind,
-            CONNECTIVITY_KIND_EXISTING_NETWORK | CONNECTIVITY_KIND_STATIC_IPV4
+            CONNECTIVITY_KIND_EXISTING_NETWORK
+                | CONNECTIVITY_KIND_STATIC_IPV4
+                | CONNECTIVITY_KIND_WIFI_CLIENT
         ) {
             let err = anyhow!(
-                "unsupported connectivity kind '{connectivity_kind}'; this slice supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}' and '{CONNECTIVITY_KIND_STATIC_IPV4}'"
+                "unsupported connectivity kind '{connectivity_kind}'; this slice supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}', '{CONNECTIVITY_KIND_STATIC_IPV4}', and '{CONNECTIVITY_KIND_WIFI_CLIENT}'"
             );
             self.write_failed_state(&state, &format!("{err:#}"))?;
             return Err(err);
         }
 
-        let network_cfg = match self.resolve_network_config(connectivity_kind, setup) {
-            Ok(network_cfg) => network_cfg,
+        let resolved_network = match self.resolve_network_config(connectivity_kind, setup) {
+            Ok(resolved_network) => resolved_network,
             Err(err) => {
                 self.write_failed_state(&state, &format!("{err:#}"))?;
                 return Err(err);
             }
         };
+        let network_cfg = resolved_network.config;
         self.apply_network_metadata(&mut state, &network_cfg);
         self.write_state_checkpoint(&mut state, ProvisioningPhase::Connectivity)?;
+        if let Some(wifi_passphrase) = resolved_network.wifi_passphrase {
+            self.write_string_atomic(
+                &self.paths.wifi_psk_secret_path(),
+                &format!("{wifi_passphrase}\n"),
+                0o600,
+            )?;
+        }
         self.write_toml_atomic(&self.paths.network_config_path(), &network_cfg, 0o600)?;
 
         let provider_kind = setup
@@ -578,6 +623,9 @@ impl ProvisioningEngine {
             static_ipv4_prefix_len: state.static_ipv4_prefix_len,
             static_ipv4_gateway: state.static_ipv4_gateway.clone(),
             static_ipv4_dns_servers: state.static_ipv4_dns_servers.clone(),
+            wifi_interface: state.wifi_interface.clone(),
+            wifi_ssid: state.wifi_ssid.clone(),
+            wifi_key_secret_path: state.wifi_key_secret_path.clone(),
             provider_kind: state.provider_kind.clone(),
             model: state.model.clone(),
             rendered_config_path: state.rendered_config_path.clone(),
@@ -632,6 +680,9 @@ impl ProvisioningEngine {
         state.static_ipv4_prefix_len = None;
         state.static_ipv4_gateway = None;
         state.static_ipv4_dns_servers.clear();
+        state.wifi_interface = None;
+        state.wifi_ssid = None;
+        state.wifi_key_secret_path = None;
 
         match network.kind.as_str() {
             CONNECTIVITY_KIND_EXISTING_NETWORK => {
@@ -644,6 +695,19 @@ impl ProvisioningEngine {
                     state.static_ipv4_prefix_len = Some(static_ipv4.prefix_len);
                     state.static_ipv4_gateway = static_ipv4.gateway.clone();
                     state.static_ipv4_dns_servers = static_ipv4.dns_servers.clone();
+                }
+            }
+            CONNECTIVITY_KIND_WIFI_CLIENT => {
+                state.wifi_interface = Some(network.interface_name.clone());
+                if let Some(wifi) = &network.wifi {
+                    state.wifi_ssid = Some(wifi.ssid.clone());
+                    state.wifi_key_secret_path = Some(
+                        self.paths
+                            .secrets_dir
+                            .join(&wifi.key_secret)
+                            .display()
+                            .to_string(),
+                    );
                 }
             }
             _ => {}
@@ -694,30 +758,52 @@ impl ProvisioningEngine {
         &self,
         connectivity_kind: &str,
         setup: &ProvisioningSetupInput,
-    ) -> Result<NetworkConfig> {
+    ) -> Result<ResolvedNetworkConfig> {
         match connectivity_kind {
             CONNECTIVITY_KIND_EXISTING_NETWORK => {
                 let interface_name = self.resolve_existing_network_interface(
                     setup.existing_network_interface.as_deref(),
                 )?;
-                Ok(NetworkConfig {
-                    kind: CONNECTIVITY_KIND_EXISTING_NETWORK.into(),
-                    source: FRONTEND_SOURCE_SHARED.into(),
-                    interface_name,
-                    static_ipv4: None,
+                Ok(ResolvedNetworkConfig {
+                    config: NetworkConfig {
+                        kind: CONNECTIVITY_KIND_EXISTING_NETWORK.into(),
+                        source: FRONTEND_SOURCE_SHARED.into(),
+                        interface_name,
+                        static_ipv4: None,
+                        wifi: None,
+                    },
+                    wifi_passphrase: None,
                 })
             }
             CONNECTIVITY_KIND_STATIC_IPV4 => {
                 let (interface_name, static_ipv4) = self.resolve_static_ipv4_config(setup)?;
-                Ok(NetworkConfig {
-                    kind: CONNECTIVITY_KIND_STATIC_IPV4.into(),
-                    source: FRONTEND_SOURCE_SHARED.into(),
-                    interface_name,
-                    static_ipv4: Some(static_ipv4),
+                Ok(ResolvedNetworkConfig {
+                    config: NetworkConfig {
+                        kind: CONNECTIVITY_KIND_STATIC_IPV4.into(),
+                        source: FRONTEND_SOURCE_SHARED.into(),
+                        interface_name,
+                        static_ipv4: Some(static_ipv4),
+                        wifi: None,
+                    },
+                    wifi_passphrase: None,
+                })
+            }
+            CONNECTIVITY_KIND_WIFI_CLIENT => {
+                let (interface_name, wifi, wifi_passphrase) =
+                    self.resolve_wifi_client_config(setup)?;
+                Ok(ResolvedNetworkConfig {
+                    config: NetworkConfig {
+                        kind: CONNECTIVITY_KIND_WIFI_CLIENT.into(),
+                        source: FRONTEND_SOURCE_SHARED.into(),
+                        interface_name,
+                        static_ipv4: None,
+                        wifi: Some(wifi),
+                    },
+                    wifi_passphrase,
                 })
             }
             _ => bail!(
-                "unsupported connectivity kind '{connectivity_kind}'; this slice supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}' and '{CONNECTIVITY_KIND_STATIC_IPV4}'"
+                "unsupported connectivity kind '{connectivity_kind}'; this slice supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}', '{CONNECTIVITY_KIND_STATIC_IPV4}', and '{CONNECTIVITY_KIND_WIFI_CLIENT}'"
             ),
         }
     }
@@ -786,6 +872,50 @@ impl ProvisioningEngine {
         ))
     }
 
+    fn resolve_wifi_client_config(
+        &self,
+        setup: &ProvisioningSetupInput,
+    ) -> Result<(String, WifiClientConfig, Option<String>)> {
+        let existing = self
+            .read_toml::<NetworkConfig>(&self.paths.network_config_path())
+            .ok()
+            .filter(|cfg| cfg.kind == CONNECTIVITY_KIND_WIFI_CLIENT);
+
+        let interface_name = match setup.wifi_interface.as_deref() {
+            Some(requested) => normalize_network_interface_name(requested)?,
+            None => existing
+                .as_ref()
+                .map(|cfg| normalize_network_interface_name(&cfg.interface_name))
+                .transpose()?
+                .unwrap_or_else(default_wifi_client_interface),
+        };
+        let existing_wifi = existing.as_ref().and_then(|cfg| cfg.wifi.as_ref());
+        let ssid = match setup.wifi_ssid.as_deref() {
+            Some(raw) => normalize_wifi_ssid(raw)?,
+            None => existing_wifi
+                .map(|cfg| normalize_wifi_ssid(&cfg.ssid))
+                .transpose()?
+                .ok_or_else(|| anyhow!("Wi-Fi client mode requires an SSID"))?,
+        };
+        let wifi_passphrase = setup
+            .wifi_passphrase
+            .as_deref()
+            .map(normalize_wifi_passphrase)
+            .transpose()?;
+        if wifi_passphrase.is_none() && !self.paths.wifi_psk_secret_path().exists() {
+            bail!("Wi-Fi client mode requires a passphrase");
+        }
+
+        Ok((
+            interface_name,
+            WifiClientConfig {
+                ssid,
+                key_secret: WIFI_PSK_SECRET_NAME.into(),
+            },
+            wifi_passphrase,
+        ))
+    }
+
     fn reconcile_runtime_outputs(
         &self,
         device_cfg: Option<&DeviceConfig>,
@@ -824,8 +954,16 @@ impl ProvisioningEngine {
                 let static_ipv4 = normalize_static_ipv4_config(static_ipv4)?;
                 render_static_ipv4_interfaces(&interface_name, &static_ipv4)
             }
+            CONNECTIVITY_KIND_WIFI_CLIENT => {
+                let wifi = network_cfg
+                    .wifi
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Wi-Fi client network config is missing SSID data"))?;
+                self.render_runtime_wpa_supplicant(wifi)?;
+                render_wifi_client_interfaces(&interface_name, &self.paths.runtime_wpa_supplicant_path)
+            }
             _ => bail!(
-                "unsupported connectivity kind '{}'; this slice supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}' and '{CONNECTIVITY_KIND_STATIC_IPV4}'",
+                "unsupported connectivity kind '{}'; this slice supports '{CONNECTIVITY_KIND_EXISTING_NETWORK}', '{CONNECTIVITY_KIND_STATIC_IPV4}', and '{CONNECTIVITY_KIND_WIFI_CLIENT}'",
                 network_cfg.kind
             ),
         };
@@ -838,6 +976,30 @@ impl ProvisioningEngine {
             self.activator.restart_network_if_active()?;
         }
         Ok(())
+    }
+
+    fn render_runtime_wpa_supplicant(&self, wifi: &WifiClientConfig) -> Result<()> {
+        let ssid = normalize_wifi_ssid(&wifi.ssid)?;
+        let secret_path = self.paths.secrets_dir.join(&wifi.key_secret);
+        let passphrase = fs::read_to_string(&secret_path)
+            .with_context(|| format!("reading Wi-Fi passphrase from {}", secret_path.display()))?;
+        let passphrase = normalize_wifi_passphrase(&passphrase)?;
+        let body = format!(
+            concat!(
+                "# Rendered by bunzo-provisiond from /var/lib/bunzo/config/network.toml.\n",
+                "ctrl_interface=/run/wpa_supplicant\n",
+                "update_config=0\n",
+                "\n",
+                "network={{\n",
+                "  ssid=\"{}\"\n",
+                "  psk=\"{}\"\n",
+                "  key_mgmt=WPA-PSK\n",
+                "}}\n"
+            ),
+            escape_wpa_value(&ssid),
+            escape_wpa_value(&passphrase)
+        );
+        self.write_string_atomic(&self.paths.runtime_wpa_supplicant_path, &body, 0o600)
     }
 
     fn render_runtime_config(&self, provider_cfg: &ProviderConfig) -> Result<()> {
@@ -1123,6 +1285,10 @@ fn default_existing_network_interface() -> String {
     EXISTING_NETWORK_INTERFACE.into()
 }
 
+fn default_wifi_client_interface() -> String {
+    WIFI_CLIENT_INTERFACE.into()
+}
+
 fn default_static_ipv4_prefix_len() -> u8 {
     DEFAULT_STATIC_IPV4_PREFIX_LEN
 }
@@ -1205,6 +1371,43 @@ fn normalize_ipv4_prefix_len(prefix_len: u8) -> Result<u8> {
     Ok(prefix_len)
 }
 
+fn normalize_wifi_ssid(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("Wi-Fi SSID cannot be empty");
+    }
+    if trimmed.as_bytes().len() > 32 {
+        bail!("Wi-Fi SSID cannot exceed 32 bytes");
+    }
+    if trimmed.chars().any(|ch| ch.is_control()) {
+        bail!("Wi-Fi SSID cannot contain control characters");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_wifi_passphrase(input: &str) -> Result<String> {
+    let trimmed = input.trim_end_matches(['\r', '\n']);
+    let len = trimmed.as_bytes().len();
+    if !(8..=63).contains(&len) {
+        bail!("Wi-Fi passphrase must be 8 to 63 bytes");
+    }
+    if trimmed.chars().any(|ch| ch.is_control()) {
+        bail!("Wi-Fi passphrase cannot contain control characters");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn escape_wpa_value(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|ch| match ch {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            _ => vec![ch],
+        })
+        .collect()
+}
+
 fn prefix_len_to_netmask(prefix_len: u8) -> Result<Ipv4Addr> {
     let prefix_len = normalize_ipv4_prefix_len(prefix_len)?;
     let mask = u32::MAX
@@ -1265,6 +1468,25 @@ fn render_static_ipv4_interfaces(interface_name: &str, static_ipv4: &StaticIpv4C
         netmask = netmask,
         gateway = gateway,
         dns_servers = dns_servers
+    )
+}
+
+fn render_wifi_client_interfaces(interface_name: &str, wpa_supplicant_path: &Path) -> String {
+    format!(
+        concat!(
+            "# interface file auto-generated by buildroot\n",
+            "\n",
+            "auto lo\n",
+            "iface lo inet loopback\n",
+            "\n",
+            "auto {interface_name}\n",
+            "iface {interface_name} inet dhcp\n",
+            "  wpa-conf {wpa_supplicant_path}\n",
+            "  wait-delay 15\n",
+            "  hostname $(hostname)\n"
+        ),
+        interface_name = interface_name,
+        wpa_supplicant_path = wpa_supplicant_path.display()
     )
 }
 
@@ -1391,6 +1613,7 @@ mod tests {
             runtime_config_path: root.join("etc/bunzo/bunzod.toml"),
             runtime_hostname_path: runtime_root.join("hostname"),
             runtime_network_interfaces_path: runtime_root.join("network/interfaces"),
+            runtime_wpa_supplicant_path: runtime_root.join("wpa_supplicant/wpa_supplicant.conf"),
         }
     }
 
@@ -1489,6 +1712,9 @@ mod tests {
                 static_ipv4_prefix_len: None,
                 static_ipv4_gateway: None,
                 static_ipv4_dns_servers: Vec::new(),
+                wifi_interface: None,
+                wifi_ssid: None,
+                wifi_passphrase: None,
                 provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
                 api_key: "sk-test".into(),
             })
@@ -1525,6 +1751,9 @@ mod tests {
                 static_ipv4_prefix_len: Some(24),
                 static_ipv4_gateway: Some("192.168.50.1".into()),
                 static_ipv4_dns_servers: vec!["1.1.1.1".into(), "8.8.8.8".into()],
+                wifi_interface: None,
+                wifi_ssid: None,
+                wifi_passphrase: None,
                 provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
                 api_key: "sk-test".into(),
             })
@@ -1559,6 +1788,182 @@ mod tests {
         assert!(interfaces.contains("gateway 192.168.50.1"));
         assert!(interfaces.contains("dns-nameservers 1.1.1.1 8.8.8.8"));
         assert_eq!(activator.network_restart_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wifi_client_is_persisted_and_rendered() {
+        let tmp = TempDir::new().unwrap();
+        let activator = StubRuntimeActivator::success();
+        let engine = test_engine(&tmp, StubValidator::success(), activator.clone());
+
+        let status = engine
+            .apply_setup_async(&ProvisioningSetupInput {
+                device_name: Some("bunzo-qemu".into()),
+                connectivity_kind: Some(CONNECTIVITY_KIND_WIFI_CLIENT.into()),
+                existing_network_interface: None,
+                static_ipv4_interface: None,
+                static_ipv4_address: None,
+                static_ipv4_prefix_len: None,
+                static_ipv4_gateway: None,
+                static_ipv4_dns_servers: Vec::new(),
+                wifi_interface: Some("wlan1".into()),
+                wifi_ssid: Some("BunzoNet".into()),
+                wifi_passphrase: Some("correcthorsebattery".into()),
+                provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
+                api_key: "sk-test".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(status.ready);
+        assert_eq!(status.connectivity_kind.as_deref(), Some("wifi_client"));
+        assert_eq!(status.existing_network_interface, None);
+        assert_eq!(status.static_ipv4_interface, None);
+        assert_eq!(status.wifi_interface.as_deref(), Some("wlan1"));
+        assert_eq!(status.wifi_ssid.as_deref(), Some("BunzoNet"));
+        assert_eq!(
+            status.wifi_key_secret_path.as_deref(),
+            Some(
+                engine
+                    .paths
+                    .wifi_psk_secret_path()
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
+
+        let network: NetworkConfig = engine
+            .read_toml(&engine.paths.network_config_path())
+            .expect("network config");
+        assert_eq!(network.kind, "wifi_client");
+        assert_eq!(network.interface_name, "wlan1");
+        let wifi = network.wifi.expect("Wi-Fi config");
+        assert_eq!(wifi.ssid, "BunzoNet");
+        assert_eq!(wifi.key_secret, WIFI_PSK_SECRET_NAME);
+
+        let secret_path = engine.paths.wifi_psk_secret_path();
+        let secret = fs::read_to_string(&secret_path).unwrap();
+        assert_eq!(secret.trim_end(), "correcthorsebattery");
+        let secret_mode = fs::metadata(&secret_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(secret_mode, 0o600);
+
+        let interfaces = fs::read_to_string(&engine.paths.runtime_network_interfaces_path).unwrap();
+        assert!(interfaces.contains("auto wlan1"));
+        assert!(interfaces.contains("iface wlan1 inet dhcp"));
+        assert!(interfaces.contains(
+            format!(
+                "wpa-conf {}",
+                engine.paths.runtime_wpa_supplicant_path.display()
+            )
+            .as_str()
+        ));
+
+        let wpa = fs::read_to_string(&engine.paths.runtime_wpa_supplicant_path).unwrap();
+        assert!(wpa.contains("ssid=\"BunzoNet\""));
+        assert!(wpa.contains("psk=\"correcthorsebattery\""));
+        let wpa_mode = fs::metadata(&engine.paths.runtime_wpa_supplicant_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(wpa_mode, 0o600);
+        assert_eq!(activator.network_restart_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wifi_client_requires_ssid_and_passphrase() {
+        let tmp = TempDir::new().unwrap();
+        let engine = test_engine(
+            &tmp,
+            StubValidator::success(),
+            StubRuntimeActivator::success(),
+        );
+
+        let missing_ssid = engine
+            .apply_setup_async(&ProvisioningSetupInput {
+                device_name: Some("bunzo-qemu".into()),
+                connectivity_kind: Some(CONNECTIVITY_KIND_WIFI_CLIENT.into()),
+                existing_network_interface: None,
+                static_ipv4_interface: None,
+                static_ipv4_address: None,
+                static_ipv4_prefix_len: None,
+                static_ipv4_gateway: None,
+                static_ipv4_dns_servers: Vec::new(),
+                wifi_interface: Some("wlan0".into()),
+                wifi_ssid: None,
+                wifi_passphrase: Some("correcthorsebattery".into()),
+                provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
+                api_key: "sk-test".into(),
+            })
+            .await
+            .expect_err("SSID should be required");
+        assert!(format!("{missing_ssid:#}").contains("requires an SSID"));
+
+        let missing_passphrase = engine
+            .apply_setup_async(&ProvisioningSetupInput {
+                device_name: Some("bunzo-qemu".into()),
+                connectivity_kind: Some(CONNECTIVITY_KIND_WIFI_CLIENT.into()),
+                existing_network_interface: None,
+                static_ipv4_interface: None,
+                static_ipv4_address: None,
+                static_ipv4_prefix_len: None,
+                static_ipv4_gateway: None,
+                static_ipv4_dns_servers: Vec::new(),
+                wifi_interface: Some("wlan0".into()),
+                wifi_ssid: Some("BunzoNet".into()),
+                wifi_passphrase: None,
+                provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
+                api_key: "sk-test".into(),
+            })
+            .await
+            .expect_err("passphrase should be required before a secret exists");
+        assert!(format!("{missing_passphrase:#}").contains("requires a passphrase"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wifi_client_reconcile_restores_rendered_outputs_from_canonical_state() {
+        let tmp = TempDir::new().unwrap();
+        let activator = StubRuntimeActivator::success();
+        let engine = test_engine(&tmp, StubValidator::success(), activator.clone());
+
+        engine
+            .apply_setup_async(&ProvisioningSetupInput {
+                device_name: Some("bunzo-qemu".into()),
+                connectivity_kind: Some(CONNECTIVITY_KIND_WIFI_CLIENT.into()),
+                existing_network_interface: None,
+                static_ipv4_interface: None,
+                static_ipv4_address: None,
+                static_ipv4_prefix_len: None,
+                static_ipv4_gateway: None,
+                static_ipv4_dns_servers: Vec::new(),
+                wifi_interface: Some("wlan0".into()),
+                wifi_ssid: Some("BunzoNet".into()),
+                wifi_passphrase: Some("correcthorsebattery".into()),
+                provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
+                api_key: "sk-test".into(),
+            })
+            .await
+            .unwrap();
+
+        fs::write(&engine.paths.runtime_network_interfaces_path, "drifted\n").unwrap();
+        fs::write(&engine.paths.runtime_wpa_supplicant_path, "drifted\n").unwrap();
+
+        engine.reconcile_runtime_state().unwrap();
+
+        let interfaces = fs::read_to_string(&engine.paths.runtime_network_interfaces_path).unwrap();
+        assert!(interfaces.contains("auto wlan0"));
+        assert!(interfaces.contains(
+            format!(
+                "wpa-conf {}",
+                engine.paths.runtime_wpa_supplicant_path.display()
+            )
+            .as_str()
+        ));
+        let wpa = fs::read_to_string(&engine.paths.runtime_wpa_supplicant_path).unwrap();
+        assert!(wpa.contains("ssid=\"BunzoNet\""));
+        assert!(wpa.contains("psk=\"correcthorsebattery\""));
+        assert_eq!(activator.network_restart_calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1605,6 +2010,9 @@ mod tests {
                 static_ipv4_prefix_len: None,
                 static_ipv4_gateway: None,
                 static_ipv4_dns_servers: Vec::new(),
+                wifi_interface: None,
+                wifi_ssid: None,
+                wifi_passphrase: None,
                 provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
                 api_key: "sk-test".into(),
             })
@@ -1641,6 +2049,9 @@ mod tests {
                 static_ipv4_prefix_len: Some(24),
                 static_ipv4_gateway: Some("192.168.50.1".into()),
                 static_ipv4_dns_servers: vec!["1.1.1.1".into()],
+                wifi_interface: None,
+                wifi_ssid: None,
+                wifi_passphrase: None,
                 provider_kind: Some(PROVIDER_KIND_OPENAI.into()),
                 api_key: "sk-test".into(),
             })

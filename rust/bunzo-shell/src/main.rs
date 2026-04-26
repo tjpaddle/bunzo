@@ -36,6 +36,7 @@ const RUNTIME_NETWORK_INTERFACES_PATH: &str = "/etc/network/interfaces";
 const DEFAULT_REMOTE_MODEL: &str = "gpt-5.4-mini";
 const CONNECTIVITY_EXISTING_NETWORK: &str = "existing_network";
 const CONNECTIVITY_STATIC_IPV4: &str = "static_ipv4";
+const CONNECTIVITY_WIFI_CLIENT: &str = "wifi_client";
 const DEFAULT_POLICY_SUBJECT: &str = "shell_request";
 const SCHEDULED_JOB_POLICY_SUBJECT: &str = "scheduled_job";
 const RECENT_CONVERSATION_LIMIT: u32 = 12;
@@ -2532,6 +2533,14 @@ fn run_openai_setup(
         .as_ref()
         .map(|status| status.static_ipv4_dns_servers.join(", "))
         .unwrap_or_default();
+    let current_wifi_interface = current_status
+        .as_ref()
+        .and_then(|status| status.wifi_interface.as_deref())
+        .unwrap_or("wlan0");
+    let current_wifi_ssid = current_status
+        .as_ref()
+        .and_then(|status| status.wifi_ssid.as_deref())
+        .unwrap_or("");
 
     writeln!(stdout)?;
     writeln!(
@@ -2546,7 +2555,7 @@ fn run_openai_setup(
         stdout,
         "{}",
         format!(
-            "Choose the device name, choose connectivity ({CONNECTIVITY_EXISTING_NETWORK} or {CONNECTIVITY_STATIC_IPV4}), then paste your OpenAI API key. bunzo will persist canonical state under /var/lib/bunzo/ and render {} plus {} for {}.",
+            "Choose the device name, choose connectivity ({CONNECTIVITY_EXISTING_NETWORK}, {CONNECTIVITY_STATIC_IPV4}, or {CONNECTIVITY_WIFI_CLIENT}), then paste your OpenAI API key. bunzo will persist canonical state under /var/lib/bunzo/ and render {} plus {} for {}.",
             RUNTIME_NETWORK_INTERFACES_PATH, BUNZOD_CONFIG_PATH, DEFAULT_REMOTE_MODEL
         )
         .dark_grey()
@@ -2584,6 +2593,9 @@ fn run_openai_setup(
         static_ipv4_prefix_len: None,
         static_ipv4_gateway: None,
         static_ipv4_dns_servers: Vec::new(),
+        wifi_interface: None,
+        wifi_ssid: None,
+        wifi_passphrase: None,
         provider_kind: Some("openai".into()),
         api_key: String::new(),
     };
@@ -2694,12 +2706,59 @@ fn run_openai_setup(
             let requested_static_dns = read_line(stdin)?;
             setup.static_ipv4_dns_servers = parse_address_list(&requested_static_dns);
         }
+        CONNECTIVITY_WIFI_CLIENT => {
+            writeln!(
+                stdout,
+                "{}",
+                format!(
+                    "Press Enter to keep the current Wi-Fi interface ({current_wifi_interface})."
+                )
+                .dark_grey()
+            )?;
+            write!(stdout, "{} ", "wifi interface>".cyan().bold())?;
+            stdout.flush()?;
+            let requested_wifi_interface = read_line(stdin)?;
+            setup.wifi_interface =
+                (!requested_wifi_interface.trim().is_empty()).then_some(requested_wifi_interface);
+
+            let ssid_hint = if current_wifi_ssid.is_empty() {
+                "required for Wi-Fi client mode".to_string()
+            } else {
+                format!("current: {current_wifi_ssid}")
+            };
+            writeln!(
+                stdout,
+                "{}",
+                format!("Wi-Fi SSID ({ssid_hint}).").dark_grey()
+            )?;
+            write!(stdout, "{} ", "wifi ssid>".cyan().bold())?;
+            stdout.flush()?;
+            let requested_wifi_ssid = read_line(stdin)?;
+            setup.wifi_ssid =
+                (!requested_wifi_ssid.trim().is_empty()).then_some(requested_wifi_ssid);
+
+            let passphrase_hint = if current_wifi_ssid.is_empty() {
+                "required, will be stored under /var/lib/bunzo/secrets/".to_string()
+            } else {
+                "leave blank to keep the existing stored passphrase".to_string()
+            };
+            writeln!(
+                stdout,
+                "{}",
+                format!("Wi-Fi passphrase ({passphrase_hint}).").dark_grey()
+            )?;
+            write!(stdout, "{} ", "wifi passphrase>".cyan().bold())?;
+            stdout.flush()?;
+            let requested_wifi_passphrase = read_secret_line(stdin, stdout)?;
+            setup.wifi_passphrase =
+                (!requested_wifi_passphrase.trim().is_empty()).then_some(requested_wifi_passphrase);
+        }
         other => {
             writeln!(
                 stdout,
                 "{}",
                 format!(
-                    "setup failed: unsupported connectivity mode '{other}' (use {CONNECTIVITY_EXISTING_NETWORK} or {CONNECTIVITY_STATIC_IPV4})"
+                    "setup failed: unsupported connectivity mode '{other}' (use {CONNECTIVITY_EXISTING_NETWORK}, {CONNECTIVITY_STATIC_IPV4}, or {CONNECTIVITY_WIFI_CLIENT})"
                 )
                 .red()
             )?;
@@ -2792,6 +2851,13 @@ fn provisioning_connectivity_summary(status: &ProvisioningStatus) -> String {
                     format!("static IPv4 {address}/{prefix_len} on {interface}")
                 }
                 _ => format!("static IPv4 on {interface}"),
+            }
+        }
+        Some(CONNECTIVITY_WIFI_CLIENT) => {
+            let interface = status.wifi_interface.as_deref().unwrap_or("wlan0");
+            match status.wifi_ssid.as_deref() {
+                Some(ssid) => format!("Wi-Fi client '{ssid}' on {interface}"),
+                None => format!("Wi-Fi client on {interface}"),
             }
         }
         _ => format!(
@@ -3005,6 +3071,9 @@ mod tests {
             static_ipv4_prefix_len: None,
             static_ipv4_gateway: None,
             static_ipv4_dns_servers: Vec::new(),
+            wifi_interface: None,
+            wifi_ssid: None,
+            wifi_key_secret_path: None,
             provider_kind: Some("openai".into()),
             model: Some(DEFAULT_REMOTE_MODEL.into()),
             rendered_config_path: Some(BUNZOD_CONFIG_PATH.into()),
