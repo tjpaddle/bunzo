@@ -1105,7 +1105,11 @@ impl RuntimeStore {
             "job",
         )?;
         tx.execute(
-            "UPDATE scheduled_jobs SET enabled = 0, updated_at_ms = ?2 WHERE id = ?1",
+            concat!(
+                "UPDATE scheduled_jobs SET ",
+                "enabled = 0, retry_due_at_ms = NULL, retry_attempt = 0, updated_at_ms = ?2 ",
+                "WHERE id = ?1"
+            ),
             params![&job_id, now_ms_i64()],
         )
         .map_err(anyhow::Error::from)
@@ -2733,6 +2737,48 @@ mod tests {
         assert_eq!(retry.job_id, created.job_id);
         assert_eq!(retry.trigger_kind, SCHEDULED_JOB_TRIGGER_RETRY);
         assert_eq!(retry.attempt, 1);
+    }
+
+    #[test]
+    fn deleting_scheduled_job_clears_pending_retry() {
+        let (_dir, store) = temp_store();
+
+        let created = store
+            .create_scheduled_job(NewScheduledJob {
+                name: "check os".into(),
+                prompt: "what OS is this?".into(),
+                interval_seconds: 60 * 60,
+                retry_max_attempts: 2,
+                retry_initial_backoff_seconds: 5,
+                retry_max_backoff_seconds: 20,
+            })
+            .expect("create job");
+        let conn = store.connect().expect("connect");
+        conn.execute(
+            "UPDATE scheduled_jobs SET next_run_at_ms = 0 WHERE id = ?1",
+            params![&created.job_id],
+        )
+        .expect("force due");
+
+        let claim = store
+            .claim_due_scheduled_job("worker-1", Duration::from_secs(30))
+            .expect("claim due job")
+            .expect("job should be due");
+        store
+            .fail_claimed_scheduled_job_run(&claim.job_run_id, "temporary backend error")
+            .expect("fail claimed run");
+        assert!(store.list_scheduled_jobs(10).unwrap()[0]
+            .pending_retry_at_ms
+            .is_some());
+
+        let deleted = store
+            .delete_scheduled_job(&created.job_id[..8])
+            .expect("delete job");
+        assert_eq!(deleted, created.job_id);
+        let jobs = store.list_scheduled_jobs(10).expect("list jobs");
+        assert!(!jobs[0].enabled);
+        assert_eq!(jobs[0].pending_retry_at_ms, None);
+        assert_eq!(jobs[0].pending_retry_attempt, None);
     }
 
     #[test]
