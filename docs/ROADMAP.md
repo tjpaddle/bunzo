@@ -13,7 +13,7 @@ The QEMU development loop has completed the core runtime foundations:
 - M4 first skill
 - M5 durable runtime store
 - M6 runtime policy
-- M8 scheduler slice 1
+- M8 scheduler slices 1-2
 
 The current milestone focus is finishing M7 beyond the hard-coded/default
 network boundary. M8 is started but not complete.
@@ -76,8 +76,8 @@ Open work:
 - [x] Add at least one additional connectivity mode beyond the current
   explicit-interface `existing_network` slice boundary
 
-**Current status:** Implemented and Rust-tested; latest full QEMU replay is
-from the explicit-interface `existing_network` slice. `bunzo-provisiond`
+**Current status:** Implemented and QEMU-verified through the `static_ipv4`
+connectivity slice. `bunzo-provisiond`
 persists canonical state under `/var/lib/bunzo/`, `/setup` talks to its socket
 API, provider credentials are live-validated before `ready`, canonical
 provisioning state now re-renders `/etc/hostname`, `/etc/network/interfaces`,
@@ -110,16 +110,20 @@ Done in slice 1:
 - [x] Same runtime policy path as interactive work
 - [x] Shell job commands
 - [x] Persisted job-run failure state
+- [x] Persist retry/backoff policy
+- [x] Bounded retry claims for failed interval runs
+- [x] Shell retry/backoff flags and pending retry display
 
 Still open:
 
-- [ ] Persist retry/backoff policy
 - [ ] Add richer trigger shapes beyond fixed intervals
 - [ ] Improve job editing/inspection surfaces as history grows
 
-**Current status:** QEMU-verified. `/jobs every 10 what OS is this?` now
-creates recurring work that pauses/resumes under the same approval-first policy
-model as interactive requests.
+**Current status:** QEMU-verified. `/jobs every 10 what OS is this?` creates
+recurring work that pauses/resumes under the same approval-first policy model
+as interactive requests. Jobs now also persist retry/backoff policy, record
+trigger kind and attempt number, show pending retry/error state in
+`/jobs list`, and clear pending retry state when deleted.
 
 ## Milestone 9 — Phone control
 
