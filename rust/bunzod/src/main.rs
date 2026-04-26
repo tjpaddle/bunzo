@@ -160,7 +160,9 @@ async fn handle_connection(
                 id,
                 name,
                 prompt,
+                trigger_kind,
                 interval_seconds,
+                run_at_ms,
                 retry_max_attempts,
                 retry_initial_backoff_seconds,
                 retry_max_backoff_seconds,
@@ -170,7 +172,9 @@ async fn handle_connection(
                     &id,
                     &name,
                     &prompt,
+                    &trigger_kind,
                     interval_seconds,
+                    run_at_ms,
                     retry_max_attempts,
                     retry_initial_backoff_seconds,
                     retry_max_backoff_seconds,
@@ -680,7 +684,9 @@ async fn handle_create_scheduled_job<W>(
     id: &str,
     name: &str,
     prompt: &str,
+    trigger_kind: &str,
     interval_seconds: u64,
+    run_at_ms: Option<u64>,
     retry_max_attempts: u32,
     retry_initial_backoff_seconds: u64,
     retry_max_backoff_seconds: u64,
@@ -699,10 +705,22 @@ where
         return Ok(());
     }
 
+    if !matches!(trigger_kind, "" | "interval" | "once") {
+        let err = Envelope::new(ServerMessage::Error {
+            id: id.into(),
+            code: "invalid_job_trigger".into(),
+            text: format!("unsupported scheduled job trigger '{trigger_kind}'"),
+        });
+        write_frame_async(w, &err).await?;
+        return Ok(());
+    }
+
     match store.create_scheduled_job(bunzod::store::NewScheduledJob {
         name: name.to_string(),
         prompt: prompt.to_string(),
+        trigger_kind: trigger_kind.to_string(),
         interval_seconds,
+        run_at_ms,
         retry_max_attempts,
         retry_initial_backoff_seconds,
         retry_max_backoff_seconds,

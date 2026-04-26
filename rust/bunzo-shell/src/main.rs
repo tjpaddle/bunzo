@@ -979,7 +979,50 @@ fn handle_jobs_command(args: &str, msg_counter: &mut u64, stdout: &mut Stdout) -
                 next_control_id(msg_counter),
                 name,
                 prompt,
+                "interval".into(),
                 interval_seconds,
+                None,
+                options.retry_max_attempts,
+                options.retry_initial_backoff_seconds,
+                options.retry_max_backoff_seconds,
+            ) {
+                Ok(job) => render_scheduled_job_mutation(stdout, &job)?,
+                Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+            }
+        }
+        "in" => {
+            let Some(delay_text) = parts.next() else {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            };
+            let delay_seconds = match parse_job_delay_seconds(delay_text) {
+                Ok(seconds) => seconds,
+                Err(reason) => {
+                    writeln!(stdout, "{}", reason.red())?;
+                    return Ok(());
+                }
+            };
+            let rest = parts.collect::<Vec<_>>();
+            let (options, prompt) = match parse_job_create_options(&rest) {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    writeln!(stdout, "{}", reason.red())?;
+                    return Ok(());
+                }
+            };
+            if prompt.trim().is_empty() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            let name = truncate_text(prompt.trim(), 48);
+            let run_at_ms = now_ms().saturating_add(delay_seconds.saturating_mul(1000));
+            match request_create_scheduled_job(
+                next_control_id(msg_counter),
+                name,
+                prompt,
+                "once".into(),
+                0,
+                Some(run_at_ms),
                 options.retry_max_attempts,
                 options.retry_initial_backoff_seconds,
                 options.retry_max_backoff_seconds,
@@ -1143,15 +1186,14 @@ fn render_scheduled_jobs(stdout: &mut Stdout, jobs: &[ScheduledJobSummary]) -> i
 
     writeln!(stdout, "{}", "scheduled jobs".bold().cyan())?;
     for job in jobs {
-        let enabled = if job.enabled { "active" } else { "deleted" };
+        let enabled = scheduled_job_state_label(job);
         let last_status = job.last_run_status.as_deref().unwrap_or("never-run");
         writeln!(
             stdout,
-            "{} [{} every {} {} retry {}/{}] {}",
+            "{} [{} {} retry {}/{}] {}",
             short_id(&job.job_id),
             enabled,
-            format_job_interval(job.interval_seconds),
-            format_next_due(job.next_run_at_ms),
+            format_job_schedule(job),
             job.retry_max_attempts,
             format_job_interval(job.retry_initial_backoff_seconds),
             job.name
@@ -1212,10 +1254,9 @@ fn render_scheduled_job_mutation(stdout: &mut Stdout, job: &ScheduledJobSummary)
         stdout,
         "{}",
         format!(
-            "created job {} [every {} {} retry {}/{}] {}",
+            "created job {} [{} retry {}/{}] {}",
             short_id(&job.job_id),
-            format_job_interval(job.interval_seconds),
-            format_next_due(job.next_run_at_ms),
+            format_job_schedule(job),
             job.retry_max_attempts,
             format_job_interval(job.retry_initial_backoff_seconds),
             job.name
@@ -1250,7 +1291,7 @@ fn policy_usage() -> &'static str {
 }
 
 fn jobs_usage() -> &'static str {
-    "usage: /jobs list | /jobs every <seconds> [--retries n] [--backoff seconds] [--max-backoff seconds] <prompt...> | /jobs delete <job-id-prefix>"
+    "usage: /jobs list | /jobs every <seconds> [--retries n] [--backoff seconds] [--max-backoff seconds] <prompt...> | /jobs in <seconds> [--retries n] [--backoff seconds] [--max-backoff seconds] <prompt...> | /jobs delete <job-id-prefix>"
 }
 
 fn approve_usage() -> &'static str {
@@ -1519,7 +1560,9 @@ fn request_create_scheduled_job(
     id: String,
     name: String,
     prompt: String,
+    trigger_kind: String,
     interval_seconds: u64,
+    run_at_ms: Option<u64>,
     retry_max_attempts: u32,
     retry_initial_backoff_seconds: u64,
     retry_max_backoff_seconds: u64,
@@ -1533,7 +1576,9 @@ fn request_create_scheduled_job(
         id: id.clone(),
         name,
         prompt,
+        trigger_kind,
         interval_seconds,
+        run_at_ms,
         retry_max_attempts,
         retry_initial_backoff_seconds,
         retry_max_backoff_seconds,
@@ -1852,6 +1897,16 @@ fn parse_job_interval_seconds(input: &str) -> Result<u64, String> {
     Ok(seconds)
 }
 
+fn parse_job_delay_seconds(input: &str) -> Result<u64, String> {
+    let seconds = input
+        .parse::<u64>()
+        .map_err(|_| format!("job delay '{input}' must be an integer number of seconds"))?;
+    if seconds < 5 {
+        return Err("job delay must be at least 5 seconds".into());
+    }
+    Ok(seconds)
+}
+
 fn parse_job_create_options(tokens: &[&str]) -> Result<(JobCreateOptions, String), String> {
     let mut options = JobCreateOptions::default();
     let mut saw_max_backoff = false;
@@ -1970,6 +2025,32 @@ fn format_job_interval(seconds: u64) -> String {
         format!("{}m", seconds / 60)
     } else {
         format!("{seconds}s")
+    }
+}
+
+fn scheduled_job_state_label(job: &ScheduledJobSummary) -> &'static str {
+    if job.enabled {
+        return "active";
+    }
+    match job.last_run_status.as_deref() {
+        Some("completed") => "done",
+        Some("failed") => "failed",
+        _ => "deleted",
+    }
+}
+
+fn format_job_schedule(job: &ScheduledJobSummary) -> String {
+    if job.trigger_kind == "once" {
+        if !job.enabled {
+            return "once".into();
+        }
+        format!("once {}", format_next_due(job.next_run_at_ms))
+    } else {
+        format!(
+            "every {} {}",
+            format_job_interval(job.interval_seconds),
+            format_next_due(job.next_run_at_ms)
+        )
     }
 }
 
@@ -2641,5 +2722,12 @@ mod tests {
         assert_eq!(options.retry_initial_backoff_seconds, 600);
         assert_eq!(options.retry_max_backoff_seconds, 600);
         assert_eq!(prompt, "prompt");
+    }
+
+    #[test]
+    fn parse_job_delay_seconds_accepts_one_shot_delay() {
+        assert_eq!(parse_job_delay_seconds("5").unwrap(), 5);
+        let err = parse_job_delay_seconds("4").unwrap_err();
+        assert!(err.contains("at least 5 seconds"));
     }
 }

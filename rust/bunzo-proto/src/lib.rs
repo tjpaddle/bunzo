@@ -61,6 +61,8 @@ pub struct ScheduledJobSummary {
     pub job_id: String,
     pub name: String,
     pub prompt_preview: String,
+    #[serde(default = "default_scheduled_job_trigger_kind")]
+    pub trigger_kind: String,
     pub interval_seconds: u64,
     #[serde(default)]
     pub retry_max_attempts: u32,
@@ -195,7 +197,11 @@ pub enum ClientMessage {
         id: String,
         name: String,
         prompt: String,
+        #[serde(default = "default_scheduled_job_trigger_kind")]
+        trigger_kind: String,
         interval_seconds: u64,
+        #[serde(default)]
+        run_at_ms: Option<u64>,
         #[serde(default = "default_job_retry_max_attempts")]
         retry_max_attempts: u32,
         #[serde(default = "default_job_retry_initial_backoff_seconds")]
@@ -324,6 +330,10 @@ fn default_list_limit() -> u32 {
 
 fn default_task_kind() -> String {
     "shell_request".into()
+}
+
+fn default_scheduled_job_trigger_kind() -> String {
+    "interval".into()
 }
 
 fn default_job_retry_max_attempts() -> u32 {
@@ -549,6 +559,7 @@ mod tests {
                     job_id: "job1".into(),
                     name: "check os".into(),
                     prompt_preview: "what OS is this?".into(),
+                    trigger_kind: "interval".into(),
                     interval_seconds: 60,
                     retry_max_attempts: 2,
                     retry_initial_backoff_seconds: 30,
@@ -594,6 +605,7 @@ mod tests {
                     job_id: "job1".into(),
                     name: "check os".into(),
                     prompt_preview: "what OS is this?".into(),
+                    trigger_kind: "interval".into(),
                     interval_seconds: 60,
                     retry_max_attempts: 2,
                     retry_initial_backoff_seconds: 30,
@@ -660,7 +672,9 @@ mod tests {
                 id: "ctl5".into(),
                 name: "check os".into(),
                 prompt: "what OS is this?".into(),
+                trigger_kind: "interval".into(),
                 interval_seconds: 60,
+                run_at_ms: None,
                 retry_max_attempts: 2,
                 retry_initial_backoff_seconds: 30,
                 retry_max_backoff_seconds: 300,
