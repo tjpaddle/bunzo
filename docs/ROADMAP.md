@@ -13,7 +13,7 @@ The QEMU development loop has completed the core runtime foundations:
 - M4 first skill
 - M5 durable runtime store
 - M6 runtime policy
-- M8 scheduler slices 1-2
+- M8 scheduler slices 1-3
 
 The current milestone focus is finishing M7 beyond the hard-coded/default
 network boundary. M8 is started but not complete.
@@ -101,10 +101,11 @@ state machine.
 **Goal:** proactive jobs run through the same task, policy, and audit path as
 interactive work.
 
-Done in slice 1:
+Done so far:
 
 - [x] Durable job store
 - [x] Time-based recurring interval triggers
+- [x] One-shot delayed triggers
 - [x] Safe due-job claiming and job-run history
 - [x] Normal `scheduled_job` task runs
 - [x] Same runtime policy path as interactive work
@@ -113,17 +114,21 @@ Done in slice 1:
 - [x] Persist retry/backoff policy
 - [x] Bounded retry claims for failed interval runs
 - [x] Shell retry/backoff flags and pending retry display
+- [x] Shell one-shot command and completed one-shot display
 
 Still open:
 
-- [ ] Add richer trigger shapes beyond fixed intervals
+- [ ] Add additional trigger shapes beyond fixed intervals and one-shot delays
 - [ ] Improve job editing/inspection surfaces as history grows
 
 **Current status:** QEMU-verified. `/jobs every 10 what OS is this?` creates
 recurring work that pauses/resumes under the same approval-first policy model
 as interactive requests. Jobs now also persist retry/backoff policy, record
 trigger kind and attempt number, show pending retry/error state in
-`/jobs list`, and clear pending retry state when deleted.
+`/jobs list`, and clear pending retry state when deleted. `/jobs in <seconds>
+<prompt...>` creates a one-shot delayed job that runs through the same
+scheduler/runtime/task/policy path and disables itself after completion or
+retry exhaustion.
 
 ## Milestone 9 — Phone control
 
