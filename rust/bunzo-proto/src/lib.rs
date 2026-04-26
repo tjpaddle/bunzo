@@ -62,12 +62,28 @@ pub struct ScheduledJobSummary {
     pub name: String,
     pub prompt_preview: String,
     pub interval_seconds: u64,
+    #[serde(default)]
+    pub retry_max_attempts: u32,
+    #[serde(default)]
+    pub retry_initial_backoff_seconds: u64,
+    #[serde(default)]
+    pub retry_max_backoff_seconds: u64,
     pub enabled: bool,
     pub next_run_at_ms: u64,
+    #[serde(default)]
+    pub pending_retry_at_ms: Option<u64>,
+    #[serde(default)]
+    pub pending_retry_attempt: Option<u32>,
     pub conversation_id: Option<String>,
     pub last_run_status: Option<String>,
+    #[serde(default)]
+    pub last_run_trigger: Option<String>,
+    #[serde(default)]
+    pub last_run_attempt: Option<u32>,
     pub last_task_id: Option<String>,
     pub last_task_run_id: Option<String>,
+    #[serde(default)]
+    pub last_error_text: Option<String>,
     pub updated_at_ms: u64,
 }
 
@@ -180,6 +196,12 @@ pub enum ClientMessage {
         name: String,
         prompt: String,
         interval_seconds: u64,
+        #[serde(default = "default_job_retry_max_attempts")]
+        retry_max_attempts: u32,
+        #[serde(default = "default_job_retry_initial_backoff_seconds")]
+        retry_initial_backoff_seconds: u64,
+        #[serde(default = "default_job_retry_max_backoff_seconds")]
+        retry_max_backoff_seconds: u64,
     },
     DeleteScheduledJob {
         id: String,
@@ -302,6 +324,18 @@ fn default_list_limit() -> u32 {
 
 fn default_task_kind() -> String {
     "shell_request".into()
+}
+
+fn default_job_retry_max_attempts() -> u32 {
+    2
+}
+
+fn default_job_retry_initial_backoff_seconds() -> u64 {
+    30
+}
+
+fn default_job_retry_max_backoff_seconds() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,12 +550,20 @@ mod tests {
                     name: "check os".into(),
                     prompt_preview: "what OS is this?".into(),
                     interval_seconds: 60,
+                    retry_max_attempts: 2,
+                    retry_initial_backoff_seconds: 30,
+                    retry_max_backoff_seconds: 300,
                     enabled: true,
                     next_run_at_ms: 1,
+                    pending_retry_at_ms: None,
+                    pending_retry_attempt: None,
                     conversation_id: Some("c1".into()),
                     last_run_status: Some("completed".into()),
+                    last_run_trigger: Some("interval".into()),
+                    last_run_attempt: Some(0),
                     last_task_id: Some("t1".into()),
                     last_task_run_id: Some("tr1".into()),
+                    last_error_text: None,
                     updated_at_ms: 1,
                 }],
             },
@@ -553,12 +595,20 @@ mod tests {
                     name: "check os".into(),
                     prompt_preview: "what OS is this?".into(),
                     interval_seconds: 60,
+                    retry_max_attempts: 2,
+                    retry_initial_backoff_seconds: 30,
+                    retry_max_backoff_seconds: 300,
                     enabled: true,
                     next_run_at_ms: 1,
+                    pending_retry_at_ms: None,
+                    pending_retry_attempt: None,
                     conversation_id: Some("c1".into()),
                     last_run_status: None,
+                    last_run_trigger: None,
+                    last_run_attempt: None,
                     last_task_id: None,
                     last_task_run_id: None,
+                    last_error_text: None,
                     updated_at_ms: 1,
                 },
             },
@@ -611,6 +661,9 @@ mod tests {
                 name: "check os".into(),
                 prompt: "what OS is this?".into(),
                 interval_seconds: 60,
+                retry_max_attempts: 2,
+                retry_initial_backoff_seconds: 30,
+                retry_max_backoff_seconds: 300,
             },
             ClientMessage::DeleteScheduledJob {
                 id: "ctl6".into(),

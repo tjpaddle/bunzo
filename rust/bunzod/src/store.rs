@@ -25,8 +25,13 @@ pub const DEFAULT_STATE_DIR: &str = "/var/lib/bunzo/state";
 pub const DEFAULT_DB_NAME: &str = "runtime.sqlite3";
 pub const TASK_KIND_SHELL_REQUEST: &str = "shell_request";
 pub const TASK_KIND_SCHEDULED_JOB: &str = "scheduled_job";
+pub const DEFAULT_SCHEDULED_JOB_RETRY_MAX_ATTEMPTS: u32 = 2;
+pub const DEFAULT_SCHEDULED_JOB_RETRY_INITIAL_BACKOFF_SECONDS: u64 = 30;
+pub const DEFAULT_SCHEDULED_JOB_RETRY_MAX_BACKOFF_SECONDS: u64 = 300;
 const SHELL_REQUEST_WAITING_SNAPSHOT_KIND: &str = "shell_request_waiting_v1";
 const SCHEDULED_JOB_WAITING_SNAPSHOT_KIND: &str = "scheduled_job_waiting_v1";
+const SCHEDULED_JOB_TRIGGER_INTERVAL: &str = "interval";
+const SCHEDULED_JOB_TRIGGER_RETRY: &str = "retry";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeStore {
@@ -53,6 +58,9 @@ pub struct NewScheduledJob {
     pub name: String,
     pub prompt: String,
     pub interval_seconds: u64,
+    pub retry_max_attempts: u32,
+    pub retry_initial_backoff_seconds: u64,
+    pub retry_max_backoff_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +71,8 @@ pub struct ScheduledJobClaim {
     pub prompt: String,
     pub conversation_id: Option<String>,
     pub scheduled_for_ms: u64,
+    pub trigger_kind: String,
+    pub attempt: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -956,11 +966,22 @@ impl RuntimeStore {
         let capped_limit = i64::from(limit.clamp(1, 100));
         let mut stmt = conn.prepare(concat!(
             "SELECT ",
-            "  j.id, j.name, j.prompt_text, j.interval_seconds, j.enabled, ",
-            "  j.next_run_at_ms, j.conversation_id, j.updated_at_ms, ",
+            "  j.id, j.name, j.prompt_text, j.interval_seconds, ",
+            "  j.retry_max_attempts, j.retry_initial_backoff_seconds, j.retry_max_backoff_seconds, ",
+            "  j.enabled, j.next_run_at_ms, j.retry_due_at_ms, j.retry_attempt, ",
+            "  j.conversation_id, j.updated_at_ms, ",
             "  (SELECT r.status FROM scheduled_job_runs r ",
             "   WHERE r.job_id = j.id ",
             "   ORDER BY r.scheduled_for_ms DESC, r.rowid DESC LIMIT 1) AS last_run_status, ",
+            "  (SELECT r.trigger_kind FROM scheduled_job_runs r ",
+            "   WHERE r.job_id = j.id ",
+            "   ORDER BY r.scheduled_for_ms DESC, r.rowid DESC LIMIT 1) AS last_run_trigger, ",
+            "  (SELECT r.attempt FROM scheduled_job_runs r ",
+            "   WHERE r.job_id = j.id ",
+            "   ORDER BY r.scheduled_for_ms DESC, r.rowid DESC LIMIT 1) AS last_run_attempt, ",
+            "  (SELECT r.error_text FROM scheduled_job_runs r ",
+            "   WHERE r.job_id = j.id ",
+            "   ORDER BY r.scheduled_for_ms DESC, r.rowid DESC LIMIT 1) AS last_error_text, ",
             "  (SELECT r.task_id FROM scheduled_job_runs r ",
             "   WHERE r.job_id = j.id ",
             "   ORDER BY r.scheduled_for_ms DESC, r.rowid DESC LIMIT 1) AS last_task_id, ",
@@ -973,21 +994,36 @@ impl RuntimeStore {
         ))?;
         let rows = stmt.query_map(params![capped_limit], |row| {
             let interval_seconds: i64 = row.get(3)?;
-            let next_run_at_ms: i64 = row.get(5)?;
-            let updated_at_ms: i64 = row.get(7)?;
-            let enabled: i64 = row.get(4)?;
+            let retry_max_attempts: i64 = row.get(4)?;
+            let retry_initial_backoff_seconds: i64 = row.get(5)?;
+            let retry_max_backoff_seconds: i64 = row.get(6)?;
+            let enabled: i64 = row.get(7)?;
+            let next_run_at_ms: i64 = row.get(8)?;
+            let pending_retry_at_ms: Option<i64> = row.get(9)?;
+            let pending_retry_attempt: i64 = row.get(10)?;
+            let updated_at_ms: i64 = row.get(12)?;
             let prompt_text: String = row.get(2)?;
+            let last_run_attempt: Option<i64> = row.get(15)?;
             Ok(ScheduledJobSummary {
                 job_id: row.get(0)?,
                 name: row.get(1)?,
                 prompt_preview: truncate_preview(&prompt_text, 72),
                 interval_seconds: interval_seconds.max(0) as u64,
+                retry_max_attempts: retry_max_attempts.max(0) as u32,
+                retry_initial_backoff_seconds: retry_initial_backoff_seconds.max(0) as u64,
+                retry_max_backoff_seconds: retry_max_backoff_seconds.max(0) as u64,
                 enabled: enabled != 0,
                 next_run_at_ms: next_run_at_ms.max(0) as u64,
-                conversation_id: row.get(6)?,
-                last_run_status: row.get(8)?,
-                last_task_id: row.get(9)?,
-                last_task_run_id: row.get(10)?,
+                pending_retry_at_ms: pending_retry_at_ms.map(|value| value.max(0) as u64),
+                pending_retry_attempt: pending_retry_at_ms
+                    .map(|_| pending_retry_attempt.max(0) as u32),
+                conversation_id: row.get(11)?,
+                last_run_status: row.get(13)?,
+                last_run_trigger: row.get(14)?,
+                last_run_attempt: last_run_attempt.map(|value| value.max(0) as u32),
+                last_task_id: row.get(17)?,
+                last_task_run_id: row.get(18)?,
+                last_error_text: row.get(16)?,
                 updated_at_ms: updated_at_ms.max(0) as u64,
             })
         })?;
@@ -1005,6 +1041,15 @@ impl RuntimeStore {
             .context("starting scheduled job create transaction")?;
         let now = now_ms_i64();
         let interval_seconds = job.interval_seconds.clamp(5, 7 * 24 * 60 * 60);
+        let retry_max_attempts = job.retry_max_attempts.min(10);
+        let retry_initial_backoff_seconds = normalize_retry_backoff_seconds(
+            job.retry_initial_backoff_seconds,
+            DEFAULT_SCHEDULED_JOB_RETRY_INITIAL_BACKOFF_SECONDS,
+        );
+        let retry_max_backoff_seconds = normalize_retry_max_backoff_seconds(
+            job.retry_max_backoff_seconds,
+            retry_initial_backoff_seconds,
+        );
         let job_id = new_id();
         let name = if job.name.trim().is_empty() {
             truncate_preview(&job.prompt, 48)
@@ -1014,15 +1059,23 @@ impl RuntimeStore {
         tx.execute(
             concat!(
                 "INSERT INTO scheduled_jobs (",
-                "id, name, prompt_text, interval_seconds, enabled, conversation_id, next_run_at_ms, created_at_ms, updated_at_ms",
-                ") VALUES (?1, ?2, ?3, ?4, 1, NULL, ?5, ?6, ?7)"
+                "id, name, prompt_text, interval_seconds, retry_max_attempts, ",
+                "retry_initial_backoff_seconds, retry_max_backoff_seconds, enabled, ",
+                "conversation_id, next_run_at_ms, retry_due_at_ms, retry_attempt, ",
+                "created_at_ms, updated_at_ms",
+                ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, NULL, ?8, NULL, 0, ?9, ?10)"
             ),
             params![
                 &job_id,
                 &name,
                 &job.prompt,
                 i64::try_from(interval_seconds).unwrap_or(i64::MAX),
-                now.saturating_add(i64::try_from(interval_seconds.saturating_mul(1000)).unwrap_or(i64::MAX)),
+                i64::from(retry_max_attempts),
+                i64::try_from(retry_initial_backoff_seconds).unwrap_or(i64::MAX),
+                i64::try_from(retry_max_backoff_seconds).unwrap_or(i64::MAX),
+                now.saturating_add(
+                    i64::try_from(interval_seconds.saturating_mul(1000)).unwrap_or(i64::MAX)
+                ),
                 now,
                 now
             ],
@@ -1077,10 +1130,19 @@ impl RuntimeStore {
         let claim = tx
             .query_row(
                 concat!(
-                    "SELECT id, name, prompt_text, interval_seconds, conversation_id, next_run_at_ms ",
+                    "SELECT id, name, prompt_text, interval_seconds, conversation_id, ",
+                    "  CASE ",
+                    "    WHEN retry_due_at_ms IS NOT NULL AND retry_due_at_ms <= next_run_at_ms ",
+                    "    THEN retry_due_at_ms ELSE next_run_at_ms END AS scheduled_for_ms, ",
+                    "  CASE ",
+                    "    WHEN retry_due_at_ms IS NOT NULL AND retry_due_at_ms <= next_run_at_ms ",
+                    "    THEN 'retry' ELSE 'interval' END AS trigger_kind, ",
+                    "  CASE ",
+                    "    WHEN retry_due_at_ms IS NOT NULL AND retry_due_at_ms <= next_run_at_ms ",
+                    "    THEN retry_attempt ELSE 0 END AS attempt ",
                     "FROM scheduled_jobs j ",
                     "WHERE j.enabled = 1 ",
-                    "  AND j.next_run_at_ms <= ?1 ",
+                    "  AND (j.next_run_at_ms <= ?1 OR (j.retry_due_at_ms IS NOT NULL AND j.retry_due_at_ms <= ?1)) ",
                     "  AND NOT EXISTS (",
                     "    SELECT 1 FROM scheduled_job_runs r ",
                     "    WHERE r.job_id = j.id AND (",
@@ -1088,7 +1150,7 @@ impl RuntimeStore {
                     "      (r.status = 'claimed' AND COALESCE(r.lease_expires_at_ms, 0) > ?1)",
                     "    )",
                     "  ) ",
-                    "ORDER BY j.next_run_at_ms ASC, j.rowid ASC ",
+                    "ORDER BY scheduled_for_ms ASC, j.rowid ASC ",
                     "LIMIT 1"
                 ),
                 params![now],
@@ -1100,14 +1162,24 @@ impl RuntimeStore {
                         row.get::<_, i64>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
                     ))
                 },
             )
             .optional()
             .context("selecting due scheduled job")?;
 
-        let Some((job_id, name, prompt, interval_seconds, conversation_id, scheduled_for_ms)) =
-            claim
+        let Some((
+            job_id,
+            name,
+            prompt,
+            interval_seconds,
+            conversation_id,
+            scheduled_for_ms,
+            trigger_kind,
+            attempt,
+        )) = claim
         else {
             tx.commit()
                 .context("committing scheduled job claim transaction")?;
@@ -1120,14 +1192,18 @@ impl RuntimeStore {
         tx.execute(
             concat!(
                 "INSERT INTO scheduled_job_runs (",
-                "id, job_id, task_id, task_run_id, status, worker_id, scheduled_for_ms, claimed_at_ms, started_at_ms, finished_at_ms, lease_expires_at_ms, error_text, created_at_ms, updated_at_ms",
-                ") VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, ?6, NULL, NULL, ?7, NULL, ?8, ?9)"
+                "id, job_id, task_id, task_run_id, status, worker_id, trigger_kind, attempt, ",
+                "scheduled_for_ms, claimed_at_ms, started_at_ms, finished_at_ms, ",
+                "lease_expires_at_ms, error_text, created_at_ms, updated_at_ms",
+                ") VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, NULL, ?10, ?11)"
             ),
             params![
                 &job_run_id,
                 &job_id,
                 ScheduledJobRunState::Claimed.as_str(),
                 worker_id,
+                &trigger_kind,
+                attempt.max(0),
                 scheduled_for_ms,
                 now,
                 now.saturating_add(lease_ms),
@@ -1136,11 +1212,28 @@ impl RuntimeStore {
             ],
         )
         .context("inserting scheduled job run claim")?;
-        tx.execute(
-            "UPDATE scheduled_jobs SET next_run_at_ms = ?2, updated_at_ms = ?3 WHERE id = ?1",
-            params![&job_id, next_run_at_ms, now],
-        )
-        .context("updating scheduled job next run")?;
+        if trigger_kind == SCHEDULED_JOB_TRIGGER_RETRY {
+            tx.execute(
+                concat!(
+                    "UPDATE scheduled_jobs SET ",
+                    "retry_due_at_ms = NULL, retry_attempt = 0, updated_at_ms = ?2 ",
+                    "WHERE id = ?1"
+                ),
+                params![&job_id, now],
+            )
+            .context("clearing claimed scheduled job retry")?;
+        } else {
+            debug_assert_eq!(trigger_kind, SCHEDULED_JOB_TRIGGER_INTERVAL);
+            tx.execute(
+                concat!(
+                    "UPDATE scheduled_jobs SET ",
+                    "next_run_at_ms = ?2, retry_due_at_ms = NULL, retry_attempt = 0, updated_at_ms = ?3 ",
+                    "WHERE id = ?1"
+                ),
+                params![&job_id, next_run_at_ms, now],
+            )
+            .context("updating scheduled job next run")?;
+        }
 
         tx.commit()
             .context("committing scheduled job claim transaction")?;
@@ -1151,6 +1244,8 @@ impl RuntimeStore {
             prompt,
             conversation_id,
             scheduled_for_ms: scheduled_for_ms.max(0) as u64,
+            trigger_kind,
+            attempt: attempt.max(0) as u32,
         }))
     }
 
@@ -1175,6 +1270,7 @@ impl RuntimeStore {
             ],
         )
         .context("marking claimed scheduled job run failed")?;
+        schedule_retry_after_failure(&tx, job_run_id, now)?;
         tx.commit()
             .context("committing scheduled job failure transaction")?;
         Ok(())
@@ -1695,15 +1791,22 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         "  name TEXT NOT NULL,",
         "  prompt_text TEXT NOT NULL,",
         "  interval_seconds INTEGER NOT NULL,",
+        "  retry_max_attempts INTEGER NOT NULL DEFAULT 2,",
+        "  retry_initial_backoff_seconds INTEGER NOT NULL DEFAULT 30,",
+        "  retry_max_backoff_seconds INTEGER NOT NULL DEFAULT 300,",
         "  enabled INTEGER NOT NULL DEFAULT 1,",
         "  conversation_id TEXT,",
         "  next_run_at_ms INTEGER NOT NULL,",
+        "  retry_due_at_ms INTEGER,",
+        "  retry_attempt INTEGER NOT NULL DEFAULT 0,",
         "  created_at_ms INTEGER NOT NULL,",
         "  updated_at_ms INTEGER NOT NULL,",
         "  FOREIGN KEY(conversation_id) REFERENCES conversations(id)",
         ");",
         "CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due ",
         "  ON scheduled_jobs(enabled, next_run_at_ms, updated_at_ms DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_retry_due ",
+        "  ON scheduled_jobs(enabled, retry_due_at_ms, updated_at_ms DESC);",
         "CREATE TABLE IF NOT EXISTS scheduled_job_runs (",
         "  id TEXT PRIMARY KEY,",
         "  job_id TEXT NOT NULL,",
@@ -1711,6 +1814,8 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         "  task_run_id TEXT,",
         "  status TEXT NOT NULL,",
         "  worker_id TEXT,",
+        "  trigger_kind TEXT NOT NULL DEFAULT 'interval',",
+        "  attempt INTEGER NOT NULL DEFAULT 0,",
         "  scheduled_for_ms INTEGER NOT NULL,",
         "  claimed_at_ms INTEGER,",
         "  started_at_ms INTEGER,",
@@ -1749,6 +1854,43 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
     ensure_column_exists(conn, "task_runs", "state_reason_text", "TEXT")?;
     ensure_column_exists(conn, "tasks", "scheduled_job_id", "TEXT")?;
     ensure_column_exists(conn, "task_runs", "scheduled_job_run_id", "TEXT")?;
+    ensure_column_exists(
+        conn,
+        "scheduled_jobs",
+        "retry_max_attempts",
+        "INTEGER NOT NULL DEFAULT 2",
+    )?;
+    ensure_column_exists(
+        conn,
+        "scheduled_jobs",
+        "retry_initial_backoff_seconds",
+        "INTEGER NOT NULL DEFAULT 30",
+    )?;
+    ensure_column_exists(
+        conn,
+        "scheduled_jobs",
+        "retry_max_backoff_seconds",
+        "INTEGER NOT NULL DEFAULT 300",
+    )?;
+    ensure_column_exists(conn, "scheduled_jobs", "retry_due_at_ms", "INTEGER")?;
+    ensure_column_exists(
+        conn,
+        "scheduled_jobs",
+        "retry_attempt",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column_exists(
+        conn,
+        "scheduled_job_runs",
+        "trigger_kind",
+        "TEXT NOT NULL DEFAULT 'interval'",
+    )?;
+    ensure_column_exists(
+        conn,
+        "scheduled_job_runs",
+        "attempt",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 
@@ -1813,11 +1955,22 @@ fn load_scheduled_job_summary(
     tx.query_row(
         concat!(
             "SELECT ",
-            "  j.id, j.name, j.prompt_text, j.interval_seconds, j.enabled, ",
-            "  j.next_run_at_ms, j.conversation_id, j.updated_at_ms, ",
+            "  j.id, j.name, j.prompt_text, j.interval_seconds, ",
+            "  j.retry_max_attempts, j.retry_initial_backoff_seconds, j.retry_max_backoff_seconds, ",
+            "  j.enabled, j.next_run_at_ms, j.retry_due_at_ms, j.retry_attempt, ",
+            "  j.conversation_id, j.updated_at_ms, ",
             "  (SELECT r.status FROM scheduled_job_runs r ",
             "   WHERE r.job_id = j.id ",
             "   ORDER BY r.scheduled_for_ms DESC, r.rowid DESC LIMIT 1) AS last_run_status, ",
+            "  (SELECT r.trigger_kind FROM scheduled_job_runs r ",
+            "   WHERE r.job_id = j.id ",
+            "   ORDER BY r.scheduled_for_ms DESC, r.rowid DESC LIMIT 1) AS last_run_trigger, ",
+            "  (SELECT r.attempt FROM scheduled_job_runs r ",
+            "   WHERE r.job_id = j.id ",
+            "   ORDER BY r.scheduled_for_ms DESC, r.rowid DESC LIMIT 1) AS last_run_attempt, ",
+            "  (SELECT r.error_text FROM scheduled_job_runs r ",
+            "   WHERE r.job_id = j.id ",
+            "   ORDER BY r.scheduled_for_ms DESC, r.rowid DESC LIMIT 1) AS last_error_text, ",
             "  (SELECT r.task_id FROM scheduled_job_runs r ",
             "   WHERE r.job_id = j.id ",
             "   ORDER BY r.scheduled_for_ms DESC, r.rowid DESC LIMIT 1) AS last_task_id, ",
@@ -1829,21 +1982,36 @@ fn load_scheduled_job_summary(
         params![job_id],
         |row| {
             let interval_seconds: i64 = row.get(3)?;
-            let enabled: i64 = row.get(4)?;
-            let next_run_at_ms: i64 = row.get(5)?;
-            let updated_at_ms: i64 = row.get(7)?;
+            let retry_max_attempts: i64 = row.get(4)?;
+            let retry_initial_backoff_seconds: i64 = row.get(5)?;
+            let retry_max_backoff_seconds: i64 = row.get(6)?;
+            let enabled: i64 = row.get(7)?;
+            let next_run_at_ms: i64 = row.get(8)?;
+            let pending_retry_at_ms: Option<i64> = row.get(9)?;
+            let pending_retry_attempt: i64 = row.get(10)?;
+            let updated_at_ms: i64 = row.get(12)?;
             let prompt_text: String = row.get(2)?;
+            let last_run_attempt: Option<i64> = row.get(15)?;
             Ok(ScheduledJobSummary {
                 job_id: row.get(0)?,
                 name: row.get(1)?,
                 prompt_preview: truncate_preview(&prompt_text, 72),
                 interval_seconds: interval_seconds.max(0) as u64,
+                retry_max_attempts: retry_max_attempts.max(0) as u32,
+                retry_initial_backoff_seconds: retry_initial_backoff_seconds.max(0) as u64,
+                retry_max_backoff_seconds: retry_max_backoff_seconds.max(0) as u64,
                 enabled: enabled != 0,
                 next_run_at_ms: next_run_at_ms.max(0) as u64,
-                conversation_id: row.get(6)?,
-                last_run_status: row.get(8)?,
-                last_task_id: row.get(9)?,
-                last_task_run_id: row.get(10)?,
+                pending_retry_at_ms: pending_retry_at_ms.map(|value| value.max(0) as u64),
+                pending_retry_attempt: pending_retry_at_ms
+                    .map(|_| pending_retry_attempt.max(0) as u32),
+                conversation_id: row.get(11)?,
+                last_run_status: row.get(13)?,
+                last_run_trigger: row.get(14)?,
+                last_run_attempt: last_run_attempt.map(|value| value.max(0) as u32),
+                last_task_id: row.get(17)?,
+                last_task_run_id: row.get(18)?,
+                last_error_text: row.get(16)?,
                 updated_at_ms: updated_at_ms.max(0) as u64,
             })
         },
@@ -2178,8 +2346,108 @@ fn sync_scheduled_job_run_state(
         )
         .context("touching scheduled job timestamp")?;
     }
+    if matches!(state, ScheduledJobRunState::Failed) {
+        schedule_retry_after_failure(tx, job_run_id, now)?;
+    }
 
     Ok(())
+}
+
+fn schedule_retry_after_failure(
+    tx: &Transaction<'_>,
+    scheduled_job_run_id: &str,
+    now: i64,
+) -> Result<()> {
+    let retry: Option<(String, i64, i64, i64, i64, i64)> = tx
+        .query_row(
+            concat!(
+                "SELECT j.id, j.retry_max_attempts, j.retry_initial_backoff_seconds, ",
+                "       j.retry_max_backoff_seconds, j.next_run_at_ms, r.attempt ",
+                "FROM scheduled_job_runs r ",
+                "JOIN scheduled_jobs j ON j.id = r.job_id ",
+                "WHERE r.id = ?1 AND j.enabled = 1"
+            ),
+            params![scheduled_job_run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .context("loading scheduled job retry policy")?;
+
+    let Some((
+        job_id,
+        retry_max_attempts,
+        retry_initial_backoff_seconds,
+        retry_max_backoff_seconds,
+        next_run_at_ms,
+        attempt,
+    )) = retry
+    else {
+        return Ok(());
+    };
+
+    if retry_max_attempts <= 0 || attempt >= retry_max_attempts {
+        return Ok(());
+    }
+
+    let backoff_ms = retry_backoff_ms(
+        retry_initial_backoff_seconds.max(0) as u64,
+        retry_max_backoff_seconds.max(0) as u64,
+        attempt.max(0) as u32,
+    );
+    let retry_due_at_ms = now.saturating_add(backoff_ms);
+    if retry_due_at_ms >= next_run_at_ms {
+        return Ok(());
+    }
+
+    tx.execute(
+        concat!(
+            "UPDATE scheduled_jobs SET ",
+            "retry_due_at_ms = ?2, retry_attempt = ?3, updated_at_ms = ?4 ",
+            "WHERE id = ?1"
+        ),
+        params![job_id, retry_due_at_ms, attempt.saturating_add(1), now],
+    )
+    .context("scheduling failed scheduled job retry")?;
+
+    Ok(())
+}
+
+fn retry_backoff_ms(
+    initial_backoff_seconds: u64,
+    max_backoff_seconds: u64,
+    failed_attempt: u32,
+) -> i64 {
+    let initial = normalize_retry_backoff_seconds(
+        initial_backoff_seconds,
+        DEFAULT_SCHEDULED_JOB_RETRY_INITIAL_BACKOFF_SECONDS,
+    );
+    let max_backoff = normalize_retry_max_backoff_seconds(max_backoff_seconds, initial);
+    let multiplier = 1u64.checked_shl(failed_attempt.min(31)).unwrap_or(u64::MAX);
+    let seconds = initial.saturating_mul(multiplier).min(max_backoff);
+    i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX)
+}
+
+fn normalize_retry_backoff_seconds(value: u64, default_value: u64) -> u64 {
+    let value = if value == 0 { default_value } else { value };
+    value.clamp(5, 24 * 60 * 60)
+}
+
+fn normalize_retry_max_backoff_seconds(value: u64, initial_backoff_seconds: u64) -> u64 {
+    let value = if value == 0 {
+        DEFAULT_SCHEDULED_JOB_RETRY_MAX_BACKOFF_SECONDS
+    } else {
+        value
+    };
+    value.clamp(initial_backoff_seconds, 24 * 60 * 60)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2374,6 +2642,9 @@ mod tests {
                 name: "check os".into(),
                 prompt: "what OS is this?".into(),
                 interval_seconds: 5,
+                retry_max_attempts: DEFAULT_SCHEDULED_JOB_RETRY_MAX_ATTEMPTS,
+                retry_initial_backoff_seconds: DEFAULT_SCHEDULED_JOB_RETRY_INITIAL_BACKOFF_SECONDS,
+                retry_max_backoff_seconds: DEFAULT_SCHEDULED_JOB_RETRY_MAX_BACKOFF_SECONDS,
             })
             .expect("create job");
         assert!(created.enabled);
@@ -2397,6 +2668,8 @@ mod tests {
             .expect("job should be due");
         assert_eq!(claim.job_id, created.job_id);
         assert_eq!(claim.prompt, "what OS is this?");
+        assert_eq!(claim.trigger_kind, SCHEDULED_JOB_TRIGGER_INTERVAL);
+        assert_eq!(claim.attempt, 0);
 
         let claimed_jobs = store.list_scheduled_jobs(10).expect("list after claim");
         assert!(claimed_jobs[0].next_run_at_ms > 0);
@@ -2410,6 +2683,59 @@ mod tests {
     }
 
     #[test]
+    fn failed_scheduled_job_run_schedules_bounded_retry() {
+        let (_dir, store) = temp_store();
+
+        let created = store
+            .create_scheduled_job(NewScheduledJob {
+                name: "check os".into(),
+                prompt: "what OS is this?".into(),
+                interval_seconds: 60 * 60,
+                retry_max_attempts: 2,
+                retry_initial_backoff_seconds: 5,
+                retry_max_backoff_seconds: 20,
+            })
+            .expect("create job");
+        let conn = store.connect().expect("connect");
+        conn.execute(
+            "UPDATE scheduled_jobs SET next_run_at_ms = 0 WHERE id = ?1",
+            params![&created.job_id],
+        )
+        .expect("force due");
+
+        let claim = store
+            .claim_due_scheduled_job("worker-1", Duration::from_secs(30))
+            .expect("claim due job")
+            .expect("job should be due");
+        assert_eq!(claim.trigger_kind, SCHEDULED_JOB_TRIGGER_INTERVAL);
+        assert_eq!(claim.attempt, 0);
+
+        store
+            .fail_claimed_scheduled_job_run(&claim.job_run_id, "temporary backend error")
+            .expect("fail claimed run");
+
+        let jobs = store.list_scheduled_jobs(10).expect("list jobs");
+        assert_eq!(jobs[0].last_run_status.as_deref(), Some("failed"));
+        assert_eq!(jobs[0].last_run_trigger.as_deref(), Some("interval"));
+        assert_eq!(jobs[0].last_run_attempt, Some(0));
+        assert_eq!(jobs[0].pending_retry_attempt, Some(1));
+        assert!(jobs[0].pending_retry_at_ms.is_some());
+
+        conn.execute(
+            "UPDATE scheduled_jobs SET retry_due_at_ms = 0 WHERE id = ?1",
+            params![&created.job_id],
+        )
+        .expect("force retry due");
+        let retry = store
+            .claim_due_scheduled_job("worker-1", Duration::from_secs(30))
+            .expect("claim retry")
+            .expect("retry should be due");
+        assert_eq!(retry.job_id, created.job_id);
+        assert_eq!(retry.trigger_kind, SCHEDULED_JOB_TRIGGER_RETRY);
+        assert_eq!(retry.attempt, 1);
+    }
+
+    #[test]
     fn claimed_scheduled_job_request_links_job_run_and_waiting_state() {
         let (_dir, store) = temp_store();
 
@@ -2418,6 +2744,9 @@ mod tests {
                 name: "check os".into(),
                 prompt: "what OS is this?".into(),
                 interval_seconds: 5,
+                retry_max_attempts: DEFAULT_SCHEDULED_JOB_RETRY_MAX_ATTEMPTS,
+                retry_initial_backoff_seconds: DEFAULT_SCHEDULED_JOB_RETRY_INITIAL_BACKOFF_SECONDS,
+                retry_max_backoff_seconds: DEFAULT_SCHEDULED_JOB_RETRY_MAX_BACKOFF_SECONDS,
             })
             .expect("create job");
         let conn = store.connect().expect("connect");

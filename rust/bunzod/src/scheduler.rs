@@ -39,8 +39,8 @@ pub async fn run_scheduler() -> Result<()> {
         };
 
         eprintln!(
-            "bunzo-schedulerd: claiming job {} ({}) due at {}",
-            claim.job_id, claim.name, claim.scheduled_for_ms
+            "bunzo-schedulerd: claiming job {} ({}) {} attempt {} due at {}",
+            claim.job_id, claim.name, claim.trigger_kind, claim.attempt, claim.scheduled_for_ms
         );
 
         let request_id = format!("job-{}", claim.job_run_id);

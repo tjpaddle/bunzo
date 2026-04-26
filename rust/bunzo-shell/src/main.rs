@@ -42,6 +42,9 @@ const RECENT_CONVERSATION_LIMIT: u32 = 12;
 const RECENT_TASK_LIMIT: u32 = 16;
 const RECENT_POLICY_LIMIT: u32 = 24;
 const RECENT_JOB_LIMIT: u32 = 24;
+const DEFAULT_JOB_RETRY_MAX_ATTEMPTS: u32 = 2;
+const DEFAULT_JOB_RETRY_INITIAL_BACKOFF_SECONDS: u64 = 30;
+const DEFAULT_JOB_RETRY_MAX_BACKOFF_SECONDS: u64 = 300;
 
 struct App {
     banner: String,
@@ -57,6 +60,23 @@ enum Role {
 #[derive(Default)]
 struct ShellState {
     active_conversation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobCreateOptions {
+    retry_max_attempts: u32,
+    retry_initial_backoff_seconds: u64,
+    retry_max_backoff_seconds: u64,
+}
+
+impl Default for JobCreateOptions {
+    fn default() -> Self {
+        Self {
+            retry_max_attempts: DEFAULT_JOB_RETRY_MAX_ATTEMPTS,
+            retry_initial_backoff_seconds: DEFAULT_JOB_RETRY_INITIAL_BACKOFF_SECONDS,
+            retry_max_backoff_seconds: DEFAULT_JOB_RETRY_MAX_BACKOFF_SECONDS,
+        }
+    }
 }
 
 struct RoundTripOutcome {
@@ -942,7 +962,14 @@ fn handle_jobs_command(args: &str, msg_counter: &mut u64, stdout: &mut Stdout) -
                     return Ok(());
                 }
             };
-            let prompt = parts.collect::<Vec<_>>().join(" ");
+            let rest = parts.collect::<Vec<_>>();
+            let (options, prompt) = match parse_job_create_options(&rest) {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    writeln!(stdout, "{}", reason.red())?;
+                    return Ok(());
+                }
+            };
             if prompt.trim().is_empty() {
                 writeln!(stdout, "{}", jobs_usage().dark_grey())?;
                 return Ok(());
@@ -953,6 +980,9 @@ fn handle_jobs_command(args: &str, msg_counter: &mut u64, stdout: &mut Stdout) -
                 name,
                 prompt,
                 interval_seconds,
+                options.retry_max_attempts,
+                options.retry_initial_backoff_seconds,
+                options.retry_max_backoff_seconds,
             ) {
                 Ok(job) => render_scheduled_job_mutation(stdout, &job)?,
                 Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
@@ -1117,14 +1147,49 @@ fn render_scheduled_jobs(stdout: &mut Stdout, jobs: &[ScheduledJobSummary]) -> i
         let last_status = job.last_run_status.as_deref().unwrap_or("never-run");
         writeln!(
             stdout,
-            "{} [{} every {} {}] {}",
+            "{} [{} every {} {} retry {}/{}] {}",
             short_id(&job.job_id),
             enabled,
             format_job_interval(job.interval_seconds),
             format_next_due(job.next_run_at_ms),
+            job.retry_max_attempts,
+            format_job_interval(job.retry_initial_backoff_seconds),
             job.name
         )?;
-        writeln!(stdout, "{}", format!("  last: {last_status}").dark_grey())?;
+        let last_attempt = job
+            .last_run_attempt
+            .map(|attempt| format!(" attempt {attempt}"))
+            .unwrap_or_default();
+        let last_trigger = job
+            .last_run_trigger
+            .as_deref()
+            .map(|trigger| format!(" {trigger}"))
+            .unwrap_or_default();
+        writeln!(
+            stdout,
+            "{}",
+            format!("  last: {last_status}{last_trigger}{last_attempt}").dark_grey()
+        )?;
+        if let (Some(retry_at), Some(attempt)) =
+            (job.pending_retry_at_ms, job.pending_retry_attempt)
+        {
+            writeln!(
+                stdout,
+                "{}",
+                format!("  retry: attempt {attempt} {}", format_next_due(retry_at)).dark_grey()
+            )?;
+        }
+        if let Some(error_text) = job
+            .last_error_text
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
+            writeln!(
+                stdout,
+                "{}",
+                format!("  error: {}", truncate_text(error_text, 96)).dark_grey()
+            )?;
+        }
         writeln!(
             stdout,
             "{}",
@@ -1147,10 +1212,12 @@ fn render_scheduled_job_mutation(stdout: &mut Stdout, job: &ScheduledJobSummary)
         stdout,
         "{}",
         format!(
-            "created job {} [every {} {}] {}",
+            "created job {} [every {} {} retry {}/{}] {}",
             short_id(&job.job_id),
             format_job_interval(job.interval_seconds),
             format_next_due(job.next_run_at_ms),
+            job.retry_max_attempts,
+            format_job_interval(job.retry_initial_backoff_seconds),
             job.name
         )
         .green()
@@ -1183,7 +1250,7 @@ fn policy_usage() -> &'static str {
 }
 
 fn jobs_usage() -> &'static str {
-    "usage: /jobs list | /jobs every <seconds> <prompt...> | /jobs delete <job-id-prefix>"
+    "usage: /jobs list | /jobs every <seconds> [--retries n] [--backoff seconds] [--max-backoff seconds] <prompt...> | /jobs delete <job-id-prefix>"
 }
 
 fn approve_usage() -> &'static str {
@@ -1453,6 +1520,9 @@ fn request_create_scheduled_job(
     name: String,
     prompt: String,
     interval_seconds: u64,
+    retry_max_attempts: u32,
+    retry_initial_backoff_seconds: u64,
+    retry_max_backoff_seconds: u64,
 ) -> Result<ScheduledJobSummary, RoundTripError> {
     let mut stream = UnixStream::connect(BUNZOD_SOCKET)
         .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
@@ -1464,6 +1534,9 @@ fn request_create_scheduled_job(
         name,
         prompt,
         interval_seconds,
+        retry_max_attempts,
+        retry_initial_backoff_seconds,
+        retry_max_backoff_seconds,
     });
     write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
 
@@ -1775,6 +1848,75 @@ fn parse_job_interval_seconds(input: &str) -> Result<u64, String> {
         .map_err(|_| format!("job interval '{input}' must be an integer number of seconds"))?;
     if seconds < 5 {
         return Err("job interval must be at least 5 seconds".into());
+    }
+    Ok(seconds)
+}
+
+fn parse_job_create_options(tokens: &[&str]) -> Result<(JobCreateOptions, String), String> {
+    let mut options = JobCreateOptions::default();
+    let mut saw_max_backoff = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if !token.starts_with("--") {
+            break;
+        }
+
+        let (flag, inline_value) = match token.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (token, None),
+        };
+        let value = match inline_value {
+            Some(value) => value,
+            None => {
+                i += 1;
+                tokens
+                    .get(i)
+                    .copied()
+                    .ok_or_else(|| format!("missing value for {flag}"))?
+            }
+        };
+
+        match flag {
+            "--retries" => {
+                options.retry_max_attempts = parse_job_retry_count(value)?;
+            }
+            "--backoff" => {
+                options.retry_initial_backoff_seconds = parse_job_retry_backoff(value)?;
+            }
+            "--max-backoff" => {
+                saw_max_backoff = true;
+                options.retry_max_backoff_seconds = parse_job_retry_backoff(value)?;
+            }
+            _ => return Err(format!("unsupported job option '{flag}'")),
+        }
+        i += 1;
+    }
+
+    if options.retry_max_backoff_seconds < options.retry_initial_backoff_seconds {
+        if saw_max_backoff {
+            return Err("job retry max backoff must be at least the initial backoff".into());
+        }
+        options.retry_max_backoff_seconds = options.retry_initial_backoff_seconds;
+    }
+
+    Ok((options, tokens[i..].join(" ")))
+}
+
+fn parse_job_retry_count(input: &str) -> Result<u32, String> {
+    let count = input
+        .parse::<u32>()
+        .map_err(|_| format!("job retry count '{input}' must be an integer"))?;
+    if count > 10 {
+        return Err("job retry count must be between 0 and 10".into());
+    }
+    Ok(count)
+}
+
+fn parse_job_retry_backoff(input: &str) -> Result<u64, String> {
+    let seconds = parse_job_interval_seconds(input)?;
+    if seconds > 24 * 60 * 60 {
+        return Err("job retry backoff must be at most 24 hours".into());
     }
     Ok(seconds)
 }
@@ -2462,5 +2604,42 @@ mod tests {
         let parsed = parse_policy_subject_and_resource(parts.next().unwrap(), &mut parts).unwrap();
         assert_eq!(parsed.0, "scheduled_job");
         assert_eq!(parsed.1, "read-local-file");
+    }
+
+    #[test]
+    fn parse_job_create_options_accepts_retry_flags() {
+        let args = [
+            "--retries",
+            "3",
+            "--backoff=5",
+            "--max-backoff",
+            "60",
+            "what",
+            "OS",
+            "is",
+            "this?",
+        ];
+
+        let (options, prompt) = parse_job_create_options(&args).unwrap();
+        assert_eq!(options.retry_max_attempts, 3);
+        assert_eq!(options.retry_initial_backoff_seconds, 5);
+        assert_eq!(options.retry_max_backoff_seconds, 60);
+        assert_eq!(prompt, "what OS is this?");
+    }
+
+    #[test]
+    fn parse_job_create_options_rejects_inverted_backoff() {
+        let args = ["--backoff", "60", "--max-backoff", "5", "prompt"];
+        let err = parse_job_create_options(&args).unwrap_err();
+        assert!(err.contains("max backoff"));
+    }
+
+    #[test]
+    fn parse_job_create_options_raises_default_max_backoff() {
+        let args = ["--backoff", "600", "prompt"];
+        let (options, prompt) = parse_job_create_options(&args).unwrap();
+        assert_eq!(options.retry_initial_backoff_seconds, 600);
+        assert_eq!(options.retry_max_backoff_seconds, 600);
+        assert_eq!(prompt, "prompt");
     }
 }

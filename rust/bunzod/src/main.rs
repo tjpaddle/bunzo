@@ -161,6 +161,9 @@ async fn handle_connection(
                 name,
                 prompt,
                 interval_seconds,
+                retry_max_attempts,
+                retry_initial_backoff_seconds,
+                retry_max_backoff_seconds,
             } => {
                 handle_create_scheduled_job(
                     &mut write_half,
@@ -168,6 +171,9 @@ async fn handle_connection(
                     &name,
                     &prompt,
                     interval_seconds,
+                    retry_max_attempts,
+                    retry_initial_backoff_seconds,
+                    retry_max_backoff_seconds,
                     &store,
                 )
                 .await?;
@@ -675,6 +681,9 @@ async fn handle_create_scheduled_job<W>(
     name: &str,
     prompt: &str,
     interval_seconds: u64,
+    retry_max_attempts: u32,
+    retry_initial_backoff_seconds: u64,
+    retry_max_backoff_seconds: u64,
     store: &RuntimeStore,
 ) -> Result<()>
 where
@@ -694,6 +703,9 @@ where
         name: name.to_string(),
         prompt: prompt.to_string(),
         interval_seconds,
+        retry_max_attempts,
+        retry_initial_backoff_seconds,
+        retry_max_backoff_seconds,
     }) {
         Ok(job) => {
             let frame =
