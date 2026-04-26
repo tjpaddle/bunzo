@@ -42,6 +42,7 @@ const RECENT_CONVERSATION_LIMIT: u32 = 12;
 const RECENT_TASK_LIMIT: u32 = 16;
 const RECENT_POLICY_LIMIT: u32 = 24;
 const RECENT_JOB_LIMIT: u32 = 24;
+const JOB_INSPECT_LIMIT: u32 = 100;
 const DEFAULT_JOB_RETRY_MAX_ATTEMPTS: u32 = 2;
 const DEFAULT_JOB_RETRY_INITIAL_BACKOFF_SECONDS: u64 = 30;
 const DEFAULT_JOB_RETRY_MAX_BACKOFF_SECONDS: u64 = 300;
@@ -77,6 +78,19 @@ impl Default for JobCreateOptions {
             retry_max_backoff_seconds: DEFAULT_JOB_RETRY_MAX_BACKOFF_SECONDS,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct JobUpdateRequest {
+    enabled: Option<bool>,
+    name: Option<String>,
+    prompt: Option<String>,
+    trigger_kind: Option<String>,
+    interval_seconds: Option<u64>,
+    run_at_ms: Option<u64>,
+    retry_max_attempts: Option<u32>,
+    retry_initial_backoff_seconds: Option<u64>,
+    retry_max_backoff_seconds: Option<u64>,
 }
 
 struct RoundTripOutcome {
@@ -1031,6 +1045,114 @@ fn handle_jobs_command(args: &str, msg_counter: &mut u64, stdout: &mut Stdout) -
                 Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
             }
         }
+        "daily" => {
+            let Some(time_text) = parts.next() else {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            };
+            let time_seconds = match parse_job_daily_time_seconds(time_text) {
+                Ok(seconds) => seconds,
+                Err(reason) => {
+                    writeln!(stdout, "{}", reason.red())?;
+                    return Ok(());
+                }
+            };
+            let rest = parts.collect::<Vec<_>>();
+            let (options, prompt) = match parse_job_create_options(&rest) {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    writeln!(stdout, "{}", reason.red())?;
+                    return Ok(());
+                }
+            };
+            if prompt.trim().is_empty() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            let name = truncate_text(prompt.trim(), 48);
+            match request_create_scheduled_job(
+                next_control_id(msg_counter),
+                name,
+                prompt,
+                "daily".into(),
+                time_seconds,
+                None,
+                options.retry_max_attempts,
+                options.retry_initial_backoff_seconds,
+                options.retry_max_backoff_seconds,
+            ) {
+                Ok(job) => render_scheduled_job_mutation(stdout, &job)?,
+                Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+            }
+        }
+        "show" => {
+            let Some(job_id) = parts.next() else {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            };
+            if parts.next().is_some() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            match request_scheduled_jobs(next_control_id(msg_counter), JOB_INSPECT_LIMIT).and_then(
+                |jobs| {
+                    resolve_recent_job(&jobs, job_id).cloned().map_err(|text| {
+                        RoundTripError::Remote {
+                            code: "job_lookup_failed".into(),
+                            text,
+                        }
+                    })
+                },
+            ) {
+                Ok(job) => render_scheduled_job_detail(stdout, &job)?,
+                Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+            }
+        }
+        "pause" => {
+            let Some(job_id) = parts.next() else {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            };
+            if parts.next().is_some() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            match request_update_scheduled_job(
+                next_control_id(msg_counter),
+                job_id.to_string(),
+                JobUpdateRequest {
+                    enabled: Some(false),
+                    ..JobUpdateRequest::default()
+                },
+            ) {
+                Ok(job) => render_scheduled_job_update(stdout, "paused", &job)?,
+                Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+            }
+        }
+        "resume" => {
+            let Some(job_id) = parts.next() else {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            };
+            if parts.next().is_some() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            match request_update_scheduled_job(
+                next_control_id(msg_counter),
+                job_id.to_string(),
+                JobUpdateRequest {
+                    enabled: Some(true),
+                    ..JobUpdateRequest::default()
+                },
+            ) {
+                Ok(job) => render_scheduled_job_update(stdout, "resumed", &job)?,
+                Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+            }
+        }
+        "edit" => {
+            handle_jobs_edit_command(parts.collect::<Vec<_>>(), msg_counter, stdout)?;
+        }
         "delete" | "rm" => {
             let Some(job_id) = parts.next() else {
                 writeln!(stdout, "{}", jobs_usage().dark_grey())?;
@@ -1054,6 +1176,103 @@ fn handle_jobs_command(args: &str, msg_counter: &mut u64, stdout: &mut Stdout) -
         }
     }
 
+    Ok(())
+}
+
+fn handle_jobs_edit_command(
+    tokens: Vec<&str>,
+    msg_counter: &mut u64,
+    stdout: &mut Stdout,
+) -> io::Result<()> {
+    let mut parts = tokens.into_iter();
+    let Some(job_id) = parts.next() else {
+        writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+        return Ok(());
+    };
+    let Some(field) = parts.next() else {
+        writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+        return Ok(());
+    };
+
+    let mut update = JobUpdateRequest::default();
+    let verb = match field {
+        "prompt" => {
+            let prompt = parts.collect::<Vec<_>>().join(" ");
+            if prompt.trim().is_empty() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            update.prompt = Some(prompt);
+            "updated"
+        }
+        "every" => {
+            let Some(interval_text) = parts.next() else {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            };
+            if parts.next().is_some() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            let interval_seconds = match parse_job_interval_seconds(interval_text) {
+                Ok(seconds) => seconds,
+                Err(reason) => {
+                    writeln!(stdout, "{}", reason.red())?;
+                    return Ok(());
+                }
+            };
+            update.trigger_kind = Some("interval".into());
+            update.interval_seconds = Some(interval_seconds);
+            "rescheduled"
+        }
+        "daily" => {
+            let Some(time_text) = parts.next() else {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            };
+            if parts.next().is_some() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            let time_seconds = match parse_job_daily_time_seconds(time_text) {
+                Ok(seconds) => seconds,
+                Err(reason) => {
+                    writeln!(stdout, "{}", reason.red())?;
+                    return Ok(());
+                }
+            };
+            update.trigger_kind = Some("daily".into());
+            update.interval_seconds = Some(time_seconds);
+            "rescheduled"
+        }
+        "retry" => {
+            let rest = parts.collect::<Vec<_>>();
+            let (options, trailing) = match parse_job_create_options(&rest) {
+                Ok(parsed) => parsed,
+                Err(reason) => {
+                    writeln!(stdout, "{}", reason.red())?;
+                    return Ok(());
+                }
+            };
+            if !trailing.trim().is_empty() {
+                writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+                return Ok(());
+            }
+            update.retry_max_attempts = Some(options.retry_max_attempts);
+            update.retry_initial_backoff_seconds = Some(options.retry_initial_backoff_seconds);
+            update.retry_max_backoff_seconds = Some(options.retry_max_backoff_seconds);
+            "updated"
+        }
+        _ => {
+            writeln!(stdout, "{}", jobs_usage().dark_grey())?;
+            return Ok(());
+        }
+    };
+
+    match request_update_scheduled_job(next_control_id(msg_counter), job_id.to_string(), update) {
+        Ok(job) => render_scheduled_job_update(stdout, verb, &job)?,
+        Err(err) => writeln!(stdout, "{}", round_trip_error_text(err).red())?,
+    }
     Ok(())
 }
 
@@ -1265,6 +1484,87 @@ fn render_scheduled_job_mutation(stdout: &mut Stdout, job: &ScheduledJobSummary)
     )
 }
 
+fn render_scheduled_job_update(
+    stdout: &mut Stdout,
+    verb: &str,
+    job: &ScheduledJobSummary,
+) -> io::Result<()> {
+    writeln!(
+        stdout,
+        "{}",
+        format!(
+            "{verb} job {} [{} retry {}/{}] {}",
+            short_id(&job.job_id),
+            format_job_schedule(job),
+            job.retry_max_attempts,
+            format_job_interval(job.retry_initial_backoff_seconds),
+            job.name
+        )
+        .green()
+    )
+}
+
+fn render_scheduled_job_detail(stdout: &mut Stdout, job: &ScheduledJobSummary) -> io::Result<()> {
+    writeln!(
+        stdout,
+        "{}",
+        format!("scheduled job {}", short_id(&job.job_id))
+            .bold()
+            .cyan()
+    )?;
+    writeln!(stdout, "name: {}", job.name)?;
+    writeln!(stdout, "state: {}", scheduled_job_state_label(job))?;
+    writeln!(stdout, "schedule: {}", format_job_schedule(job))?;
+    writeln!(
+        stdout,
+        "retry: {}/{} max {}",
+        job.retry_max_attempts,
+        format_job_interval(job.retry_initial_backoff_seconds),
+        format_job_interval(job.retry_max_backoff_seconds)
+    )?;
+    writeln!(
+        stdout,
+        "last: {}{}{}",
+        job.last_run_status.as_deref().unwrap_or("never-run"),
+        job.last_run_trigger
+            .as_deref()
+            .map(|trigger| format!(" {trigger}"))
+            .unwrap_or_default(),
+        job.last_run_attempt
+            .map(|attempt| format!(" attempt {attempt}"))
+            .unwrap_or_default()
+    )?;
+    if let (Some(retry_at), Some(attempt)) = (job.pending_retry_at_ms, job.pending_retry_attempt) {
+        writeln!(
+            stdout,
+            "retry due: attempt {attempt} {}",
+            format_next_due(retry_at)
+        )?;
+    }
+    if let Some(conversation_id) = job.conversation_id.as_deref() {
+        writeln!(stdout, "conversation: {}", short_id(conversation_id))?;
+    }
+    if let Some(task_run_id) = job.last_task_run_id.as_deref() {
+        writeln!(stdout, "latest run: {}", short_id(task_run_id))?;
+    }
+    if let Some(error_text) = job
+        .last_error_text
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    {
+        writeln!(stdout, "error: {}", truncate_text(error_text, 160))?;
+    }
+    writeln!(
+        stdout,
+        "prompt: {}",
+        if job.prompt_text.is_empty() {
+            &job.prompt_preview
+        } else {
+            &job.prompt_text
+        }
+    )
+}
+
 fn render_approval_resolution(
     stdout: &mut Stdout,
     policy: &PolicySummary,
@@ -1291,7 +1591,7 @@ fn policy_usage() -> &'static str {
 }
 
 fn jobs_usage() -> &'static str {
-    "usage: /jobs list | /jobs every <seconds> [--retries n] [--backoff seconds] [--max-backoff seconds] <prompt...> | /jobs in <seconds> [--retries n] [--backoff seconds] [--max-backoff seconds] <prompt...> | /jobs delete <job-id-prefix>"
+    "usage: /jobs list | /jobs show <job-id-prefix> | /jobs every <seconds> [--retries n] [--backoff seconds] [--max-backoff seconds] <prompt...> | /jobs daily <HH:MM> [--retries n] [--backoff seconds] [--max-backoff seconds] <prompt...> | /jobs in <seconds> [--retries n] [--backoff seconds] [--max-backoff seconds] <prompt...> | /jobs pause|resume|delete <job-id-prefix> | /jobs edit <job-id-prefix> <prompt|every|daily|retry> ..."
 }
 
 fn approve_usage() -> &'static str {
@@ -1614,6 +1914,60 @@ fn request_create_scheduled_job(
     }
 }
 
+fn request_update_scheduled_job(
+    id: String,
+    job_id: String,
+    update: JobUpdateRequest,
+) -> Result<ScheduledJobSummary, RoundTripError> {
+    let mut stream = UnixStream::connect(BUNZOD_SOCKET)
+        .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+    let req = Envelope::new(ClientMessage::UpdateScheduledJob {
+        id: id.clone(),
+        job_id,
+        enabled: update.enabled,
+        name: update.name,
+        prompt: update.prompt,
+        trigger_kind: update.trigger_kind,
+        interval_seconds: update.interval_seconds,
+        run_at_ms: update.run_at_ms,
+        retry_max_attempts: update.retry_max_attempts,
+        retry_initial_backoff_seconds: update.retry_initial_backoff_seconds,
+        retry_max_backoff_seconds: update.retry_max_backoff_seconds,
+    });
+    write_frame(&mut stream, &req).map_err(|e| RoundTripError::Protocol(e.to_string()))?;
+
+    loop {
+        let frame: ServerFrame = match read_frame(&mut stream) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(RoundTripError::Protocol(
+                    "bunzod closed the connection before replying".into(),
+                ));
+            }
+            Err(e) => return Err(RoundTripError::Protocol(e.to_string())),
+        };
+
+        match frame.msg {
+            ServerMessage::ScheduledJobMutationResult { id: result_id, job } if result_id == id => {
+                return Ok(job);
+            }
+            ServerMessage::ScheduledJobMutationResult { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RoundTripError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            _ => {}
+        }
+    }
+}
+
 fn request_delete_policy(id: String, policy_id: String) -> Result<String, RoundTripError> {
     let mut stream = UnixStream::connect(BUNZOD_SOCKET)
         .map_err(|e| RoundTripError::Unreachable(e.to_string()))?;
@@ -1845,6 +2199,22 @@ fn resolve_recent_conversation<'a>(
     Ok(first)
 }
 
+fn resolve_recent_job<'a>(
+    jobs: &'a [ScheduledJobSummary],
+    prefix: &str,
+) -> Result<&'a ScheduledJobSummary, String> {
+    let mut matches = jobs.iter().filter(|job| job.job_id.starts_with(prefix));
+    let first = matches
+        .next()
+        .ok_or_else(|| format!("no recent job matches '{prefix}'"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "job prefix '{prefix}' is ambiguous in the recent list"
+        ));
+    }
+    Ok(first)
+}
+
 fn is_waiting_approval(task: &TaskSummary) -> bool {
     task.state_reason_code.as_deref() == Some("policy_approval_required")
         && !task.task_run_id.is_empty()
@@ -1905,6 +2275,22 @@ fn parse_job_delay_seconds(input: &str) -> Result<u64, String> {
         return Err("job delay must be at least 5 seconds".into());
     }
     Ok(seconds)
+}
+
+fn parse_job_daily_time_seconds(input: &str) -> Result<u64, String> {
+    let (hour_text, minute_text) = input
+        .split_once(':')
+        .ok_or_else(|| format!("daily job time '{input}' must use HH:MM"))?;
+    let hour = hour_text
+        .parse::<u64>()
+        .map_err(|_| format!("daily job hour '{hour_text}' must be an integer"))?;
+    let minute = minute_text
+        .parse::<u64>()
+        .map_err(|_| format!("daily job minute '{minute_text}' must be an integer"))?;
+    if hour > 23 || minute > 59 {
+        return Err("daily job time must be between 00:00 and 23:59".into());
+    }
+    Ok(hour * 3600 + minute * 60)
 }
 
 fn parse_job_create_options(tokens: &[&str]) -> Result<(JobCreateOptions, String), String> {
@@ -2045,6 +2431,12 @@ fn format_job_schedule(job: &ScheduledJobSummary) -> String {
             return "once".into();
         }
         format!("once {}", format_next_due(job.next_run_at_ms))
+    } else if job.trigger_kind == "daily" {
+        format!(
+            "daily {} {}",
+            format_job_daily_time(job.interval_seconds),
+            format_next_due(job.next_run_at_ms)
+        )
     } else {
         format!(
             "every {} {}",
@@ -2061,6 +2453,13 @@ fn format_next_due(next_run_at_ms: u64) -> String {
     }
     let remaining = (next_run_at_ms - now) / 1000;
     format!("next in {}", format_job_interval(remaining.max(1)))
+}
+
+fn format_job_daily_time(seconds: u64) -> String {
+    let seconds = seconds.min(24 * 60 * 60 - 1);
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    format!("{hours:02}:{minutes:02}")
 }
 
 fn round_trip_error_text(err: RoundTripError) -> String {
@@ -2729,5 +3128,13 @@ mod tests {
         assert_eq!(parse_job_delay_seconds("5").unwrap(), 5);
         let err = parse_job_delay_seconds("4").unwrap_err();
         assert!(err.contains("at least 5 seconds"));
+    }
+
+    #[test]
+    fn parse_job_daily_time_accepts_hh_mm() {
+        assert_eq!(parse_job_daily_time_seconds("08:30").unwrap(), 30_600);
+        assert_eq!(parse_job_daily_time_seconds("23:59").unwrap(), 86_340);
+        let err = parse_job_daily_time_seconds("24:00").unwrap_err();
+        assert!(err.contains("between 00:00 and 23:59"));
     }
 }

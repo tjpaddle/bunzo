@@ -32,9 +32,12 @@ const SHELL_REQUEST_WAITING_SNAPSHOT_KIND: &str = "shell_request_waiting_v1";
 const SCHEDULED_JOB_WAITING_SNAPSHOT_KIND: &str = "scheduled_job_waiting_v1";
 const SCHEDULED_JOB_SCHEDULE_INTERVAL: &str = "interval";
 const SCHEDULED_JOB_SCHEDULE_ONCE: &str = "once";
+const SCHEDULED_JOB_SCHEDULE_DAILY: &str = "daily";
 const SCHEDULED_JOB_TRIGGER_INTERVAL: &str = "interval";
 const SCHEDULED_JOB_TRIGGER_ONCE: &str = "once";
+const SCHEDULED_JOB_TRIGGER_DAILY: &str = "daily";
 const SCHEDULED_JOB_TRIGGER_RETRY: &str = "retry";
+const MS_PER_DAY: i64 = 86_400_000;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeStore {
@@ -66,6 +69,19 @@ pub struct NewScheduledJob {
     pub retry_max_attempts: u32,
     pub retry_initial_backoff_seconds: u64,
     pub retry_max_backoff_seconds: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScheduledJobUpdate {
+    pub enabled: Option<bool>,
+    pub name: Option<String>,
+    pub prompt: Option<String>,
+    pub trigger_kind: Option<String>,
+    pub interval_seconds: Option<u64>,
+    pub run_at_ms: Option<u64>,
+    pub retry_max_attempts: Option<u32>,
+    pub retry_initial_backoff_seconds: Option<u64>,
+    pub retry_max_backoff_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1012,6 +1028,7 @@ impl RuntimeStore {
             Ok(ScheduledJobSummary {
                 job_id: row.get(0)?,
                 name: row.get(1)?,
+                prompt_text: prompt_text.clone(),
                 prompt_preview: truncate_preview(&prompt_text, 72),
                 trigger_kind: row.get(3)?,
                 interval_seconds: interval_seconds.max(0) as u64,
@@ -1047,17 +1064,19 @@ impl RuntimeStore {
             .context("starting scheduled job create transaction")?;
         let now = now_ms_i64();
         let trigger_kind = normalize_scheduled_job_trigger_kind(&job.trigger_kind)?;
-        let interval_seconds = if trigger_kind == SCHEDULED_JOB_SCHEDULE_INTERVAL {
-            job.interval_seconds.clamp(5, 7 * 24 * 60 * 60)
-        } else {
-            0
+        let interval_seconds = match trigger_kind {
+            SCHEDULED_JOB_SCHEDULE_INTERVAL => normalize_interval_seconds(job.interval_seconds),
+            SCHEDULED_JOB_SCHEDULE_DAILY => normalize_daily_time_seconds(job.interval_seconds)?,
+            SCHEDULED_JOB_SCHEDULE_ONCE => 0,
+            _ => unreachable!("trigger kind was normalized"),
         };
-        let next_run_at_ms = if trigger_kind == SCHEDULED_JOB_SCHEDULE_INTERVAL {
-            now.saturating_add(
+        let next_run_at_ms = match trigger_kind {
+            SCHEDULED_JOB_SCHEDULE_INTERVAL => now.saturating_add(
                 i64::try_from(interval_seconds.saturating_mul(1000)).unwrap_or(i64::MAX),
-            )
-        } else {
-            normalize_one_shot_run_at_ms(job.run_at_ms, now)
+            ),
+            SCHEDULED_JOB_SCHEDULE_DAILY => next_daily_run_at_ms(now, interval_seconds),
+            SCHEDULED_JOB_SCHEDULE_ONCE => normalize_one_shot_run_at_ms(job.run_at_ms, now),
+            _ => unreachable!("trigger kind was normalized"),
         };
         let retry_max_attempts = job.retry_max_attempts.min(10);
         let retry_initial_backoff_seconds = normalize_retry_backoff_seconds(
@@ -1137,6 +1156,179 @@ impl RuntimeStore {
         Ok(job_id)
     }
 
+    pub fn update_scheduled_job(
+        &self,
+        requested_job_id: &str,
+        update: ScheduledJobUpdate,
+    ) -> std::result::Result<ScheduledJobSummary, LookupError> {
+        let mut conn = self.connect().map_err(LookupError::Store)?;
+        let tx = conn
+            .transaction()
+            .map_err(anyhow::Error::from)
+            .map_err(LookupError::Store)?;
+        let job_id = resolve_prefixed_id(
+            &tx,
+            "scheduled_jobs",
+            "updated_at_ms",
+            requested_job_id,
+            "job",
+        )?;
+        let now = now_ms_i64();
+        let current = tx
+            .query_row(
+                concat!(
+                    "SELECT name, prompt_text, trigger_kind, interval_seconds, ",
+                    "retry_max_attempts, retry_initial_backoff_seconds, retry_max_backoff_seconds, ",
+                    "enabled, next_run_at_ms ",
+                    "FROM scheduled_jobs WHERE id = ?1"
+                ),
+                params![&job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .map_err(anyhow::Error::from)
+            .map_err(LookupError::Store)?;
+        let (
+            current_name,
+            current_prompt,
+            current_trigger_kind,
+            current_interval_seconds,
+            current_retry_max_attempts,
+            current_retry_initial_backoff_seconds,
+            current_retry_max_backoff_seconds,
+            current_enabled,
+            current_next_run_at_ms,
+        ) = current;
+
+        let prompt = match update.prompt {
+            Some(prompt) if prompt.trim().is_empty() => {
+                return Err(LookupError::Store(anyhow::anyhow!(
+                    "scheduled job prompt must not be empty"
+                )));
+            }
+            Some(prompt) => prompt,
+            None => current_prompt,
+        };
+        let name = match update.name {
+            Some(name) if name.trim().is_empty() => truncate_preview(&prompt, 48),
+            Some(name) => truncate_preview(name.trim(), 48),
+            None => current_name,
+        };
+        let trigger_kind = match update.trigger_kind.as_deref() {
+            Some(trigger_kind) => {
+                normalize_scheduled_job_trigger_kind(trigger_kind).map_err(LookupError::Store)?
+            }
+            None => normalize_scheduled_job_trigger_kind(&current_trigger_kind)
+                .map_err(LookupError::Store)?,
+        };
+        let current_interval_seconds = current_interval_seconds.max(0) as u64;
+        let interval_seconds = match trigger_kind {
+            SCHEDULED_JOB_SCHEDULE_INTERVAL => {
+                normalize_interval_seconds(update.interval_seconds.unwrap_or_else(|| {
+                    if current_trigger_kind == SCHEDULED_JOB_SCHEDULE_INTERVAL {
+                        current_interval_seconds
+                    } else {
+                        60
+                    }
+                }))
+            }
+            SCHEDULED_JOB_SCHEDULE_DAILY => {
+                normalize_daily_time_seconds(update.interval_seconds.unwrap_or_else(|| {
+                    if current_trigger_kind == SCHEDULED_JOB_SCHEDULE_DAILY {
+                        current_interval_seconds
+                    } else {
+                        0
+                    }
+                }))
+                .map_err(LookupError::Store)?
+            }
+            SCHEDULED_JOB_SCHEDULE_ONCE => 0,
+            _ => unreachable!("trigger kind was normalized"),
+        };
+        let retry_max_attempts = update
+            .retry_max_attempts
+            .unwrap_or(current_retry_max_attempts.max(0) as u32)
+            .min(10);
+        let retry_initial_backoff_seconds = normalize_retry_backoff_seconds(
+            update
+                .retry_initial_backoff_seconds
+                .unwrap_or(current_retry_initial_backoff_seconds.max(0) as u64),
+            DEFAULT_SCHEDULED_JOB_RETRY_INITIAL_BACKOFF_SECONDS,
+        );
+        let retry_max_backoff_seconds = normalize_retry_max_backoff_seconds(
+            update
+                .retry_max_backoff_seconds
+                .unwrap_or(current_retry_max_backoff_seconds.max(0) as u64),
+            retry_initial_backoff_seconds,
+        );
+        let enabled = update.enabled.unwrap_or(current_enabled != 0);
+        let schedule_changed = update.trigger_kind.is_some()
+            || update.interval_seconds.is_some()
+            || update.run_at_ms.is_some();
+        let was_disabled = current_enabled == 0;
+        let current_next_run_at_ms = current_next_run_at_ms.max(0);
+        let next_run_at_ms = if !enabled {
+            current_next_run_at_ms
+        } else if schedule_changed || was_disabled || current_next_run_at_ms <= now {
+            match trigger_kind {
+                SCHEDULED_JOB_SCHEDULE_INTERVAL => now.saturating_add(
+                    i64::try_from(interval_seconds.saturating_mul(1000)).unwrap_or(i64::MAX),
+                ),
+                SCHEDULED_JOB_SCHEDULE_DAILY => next_daily_run_at_ms(now, interval_seconds),
+                SCHEDULED_JOB_SCHEDULE_ONCE => normalize_one_shot_run_at_ms(update.run_at_ms, now),
+                _ => unreachable!("trigger kind was normalized"),
+            }
+        } else {
+            current_next_run_at_ms
+        };
+
+        tx.execute(
+            concat!(
+                "UPDATE scheduled_jobs SET ",
+                "name = ?2, prompt_text = ?3, trigger_kind = ?4, interval_seconds = ?5, ",
+                "retry_max_attempts = ?6, retry_initial_backoff_seconds = ?7, retry_max_backoff_seconds = ?8, ",
+                "enabled = ?9, next_run_at_ms = ?10, retry_due_at_ms = NULL, retry_attempt = 0, updated_at_ms = ?11 ",
+                "WHERE id = ?1"
+            ),
+            params![
+                &job_id,
+                name,
+                prompt,
+                trigger_kind,
+                i64::try_from(interval_seconds).unwrap_or(i64::MAX),
+                i64::from(retry_max_attempts),
+                i64::try_from(retry_initial_backoff_seconds).unwrap_or(i64::MAX),
+                i64::try_from(retry_max_backoff_seconds).unwrap_or(i64::MAX),
+                if enabled { 1 } else { 0 },
+                next_run_at_ms,
+                now
+            ],
+        )
+        .map_err(anyhow::Error::from)
+        .map_err(LookupError::Store)?;
+        let summary = load_scheduled_job_summary(&tx, &job_id)
+            .map_err(LookupError::Store)?
+            .ok_or_else(|| LookupError::NotFound {
+                kind: "job",
+                value: requested_job_id.to_string(),
+            })?;
+        tx.commit()
+            .map_err(anyhow::Error::from)
+            .map_err(LookupError::Store)?;
+        Ok(summary)
+    }
+
     pub fn claim_due_scheduled_job(
         &self,
         worker_id: &str,
@@ -1209,12 +1401,22 @@ impl RuntimeStore {
             return Ok(None);
         };
 
-        let next_run_at_ms = if job_trigger_kind == SCHEDULED_JOB_SCHEDULE_INTERVAL
-            && run_trigger_kind == SCHEDULED_JOB_TRIGGER_INTERVAL
-        {
-            advance_scheduled_job_time(scheduled_for_ms, interval_seconds.saturating_mul(1000), now)
-        } else {
-            i64::MAX
+        let next_run_at_ms = match (job_trigger_kind.as_str(), run_trigger_kind.as_str()) {
+            (SCHEDULED_JOB_SCHEDULE_INTERVAL, SCHEDULED_JOB_TRIGGER_INTERVAL) => {
+                advance_scheduled_job_time(
+                    scheduled_for_ms,
+                    interval_seconds.saturating_mul(1000),
+                    now,
+                )
+            }
+            (SCHEDULED_JOB_SCHEDULE_DAILY, SCHEDULED_JOB_TRIGGER_DAILY) => {
+                advance_daily_scheduled_job_time(
+                    scheduled_for_ms,
+                    interval_seconds.max(0) as u64,
+                    now,
+                )
+            }
+            _ => i64::MAX,
         };
         let job_run_id = new_id();
         tx.execute(
@@ -1261,7 +1463,7 @@ impl RuntimeStore {
                 params![&job_id, now],
             )
             .context("marking one-shot scheduled job claimed")?;
-        } else {
+        } else if job_trigger_kind == SCHEDULED_JOB_SCHEDULE_INTERVAL {
             debug_assert_eq!(job_trigger_kind, SCHEDULED_JOB_SCHEDULE_INTERVAL);
             debug_assert_eq!(run_trigger_kind, SCHEDULED_JOB_TRIGGER_INTERVAL);
             tx.execute(
@@ -1273,6 +1475,18 @@ impl RuntimeStore {
                 params![&job_id, next_run_at_ms, now],
             )
             .context("updating scheduled job next run")?;
+        } else {
+            debug_assert_eq!(job_trigger_kind, SCHEDULED_JOB_SCHEDULE_DAILY);
+            debug_assert_eq!(run_trigger_kind, SCHEDULED_JOB_TRIGGER_DAILY);
+            tx.execute(
+                concat!(
+                    "UPDATE scheduled_jobs SET ",
+                    "next_run_at_ms = ?2, retry_due_at_ms = NULL, retry_attempt = 0, updated_at_ms = ?3 ",
+                    "WHERE id = ?1"
+                ),
+                params![&job_id, next_run_at_ms, now],
+            )
+            .context("updating daily scheduled job next run")?;
         }
 
         tx.commit()
@@ -2044,6 +2258,7 @@ fn load_scheduled_job_summary(
             Ok(ScheduledJobSummary {
                 job_id: row.get(0)?,
                 name: row.get(1)?,
+                prompt_text: prompt_text.clone(),
                 prompt_preview: truncate_preview(&prompt_text, 72),
                 trigger_kind: row.get(3)?,
                 interval_seconds: interval_seconds.max(0) as u64,
@@ -2526,8 +2741,20 @@ fn normalize_scheduled_job_trigger_kind(value: &str) -> Result<&'static str> {
     match value {
         "" | SCHEDULED_JOB_SCHEDULE_INTERVAL => Ok(SCHEDULED_JOB_SCHEDULE_INTERVAL),
         SCHEDULED_JOB_SCHEDULE_ONCE => Ok(SCHEDULED_JOB_SCHEDULE_ONCE),
+        SCHEDULED_JOB_SCHEDULE_DAILY => Ok(SCHEDULED_JOB_SCHEDULE_DAILY),
         other => anyhow::bail!("unsupported scheduled job trigger '{other}'"),
     }
+}
+
+fn normalize_interval_seconds(value: u64) -> u64 {
+    value.clamp(5, 7 * 24 * 60 * 60)
+}
+
+fn normalize_daily_time_seconds(value: u64) -> Result<u64> {
+    if value >= 24 * 60 * 60 {
+        anyhow::bail!("daily scheduled job time must be between 00:00 and 23:59");
+    }
+    Ok(value)
 }
 
 fn normalize_one_shot_run_at_ms(run_at_ms: Option<u64>, now: i64) -> i64 {
@@ -2535,6 +2762,30 @@ fn normalize_one_shot_run_at_ms(run_at_ms: Option<u64>, now: i64) -> i64 {
         .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
         .unwrap_or(now)
         .max(now)
+}
+
+fn next_daily_run_at_ms(now: i64, time_of_day_seconds: u64) -> i64 {
+    let offset_ms = i64::try_from(time_of_day_seconds.saturating_mul(1000)).unwrap_or(i64::MAX);
+    let today_start = now.div_euclid(MS_PER_DAY).saturating_mul(MS_PER_DAY);
+    let candidate = today_start.saturating_add(offset_ms);
+    if candidate > now {
+        candidate
+    } else {
+        candidate.saturating_add(MS_PER_DAY)
+    }
+}
+
+fn advance_daily_scheduled_job_time(
+    scheduled_for_ms: i64,
+    time_of_day_seconds: u64,
+    now: i64,
+) -> i64 {
+    let next = scheduled_for_ms.saturating_add(MS_PER_DAY);
+    if next > now {
+        next
+    } else {
+        next_daily_run_at_ms(now, time_of_day_seconds)
+    }
 }
 
 fn normalize_retry_backoff_seconds(value: u64, default_value: u64) -> u64 {
@@ -2783,6 +3034,97 @@ mod tests {
         assert_eq!(deleted, created.job_id);
         let jobs = store.list_scheduled_jobs(10).expect("list deleted jobs");
         assert!(!jobs[0].enabled);
+    }
+
+    #[test]
+    fn daily_scheduled_job_can_be_created_claimed_and_advanced() {
+        let (_dir, store) = temp_store();
+
+        let created = store
+            .create_scheduled_job(NewScheduledJob {
+                name: "daily check".into(),
+                prompt: "daily check".into(),
+                trigger_kind: SCHEDULED_JOB_SCHEDULE_DAILY.into(),
+                interval_seconds: 8 * 3600 + 30 * 60,
+                run_at_ms: None,
+                retry_max_attempts: DEFAULT_SCHEDULED_JOB_RETRY_MAX_ATTEMPTS,
+                retry_initial_backoff_seconds: DEFAULT_SCHEDULED_JOB_RETRY_INITIAL_BACKOFF_SECONDS,
+                retry_max_backoff_seconds: DEFAULT_SCHEDULED_JOB_RETRY_MAX_BACKOFF_SECONDS,
+            })
+            .expect("create daily job");
+        assert_eq!(created.trigger_kind, SCHEDULED_JOB_SCHEDULE_DAILY);
+        assert_eq!(created.interval_seconds, 8 * 3600 + 30 * 60);
+
+        let conn = store.connect().expect("connect");
+        conn.execute(
+            "UPDATE scheduled_jobs SET next_run_at_ms = 0 WHERE id = ?1",
+            params![&created.job_id],
+        )
+        .expect("force daily due");
+
+        let claim = store
+            .claim_due_scheduled_job("worker-1", Duration::from_secs(30))
+            .expect("claim daily")
+            .expect("daily job should be due");
+        assert_eq!(claim.job_id, created.job_id);
+        assert_eq!(claim.trigger_kind, SCHEDULED_JOB_TRIGGER_DAILY);
+        assert_eq!(claim.attempt, 0);
+
+        let jobs = store.list_scheduled_jobs(10).expect("list daily jobs");
+        assert!(jobs[0].next_run_at_ms > now_ms_i64() as u64);
+    }
+
+    #[test]
+    fn scheduled_job_can_be_paused_resumed_and_edited() {
+        let (_dir, store) = temp_store();
+
+        let created = store
+            .create_scheduled_job(NewScheduledJob {
+                name: "check".into(),
+                prompt: "old prompt".into(),
+                trigger_kind: SCHEDULED_JOB_SCHEDULE_INTERVAL.into(),
+                interval_seconds: 60,
+                run_at_ms: None,
+                retry_max_attempts: DEFAULT_SCHEDULED_JOB_RETRY_MAX_ATTEMPTS,
+                retry_initial_backoff_seconds: DEFAULT_SCHEDULED_JOB_RETRY_INITIAL_BACKOFF_SECONDS,
+                retry_max_backoff_seconds: DEFAULT_SCHEDULED_JOB_RETRY_MAX_BACKOFF_SECONDS,
+            })
+            .expect("create job");
+
+        let paused = store
+            .update_scheduled_job(
+                &created.job_id[..8],
+                ScheduledJobUpdate {
+                    enabled: Some(false),
+                    ..ScheduledJobUpdate::default()
+                },
+            )
+            .expect("pause job");
+        assert!(!paused.enabled);
+
+        let edited = store
+            .update_scheduled_job(
+                &created.job_id[..8],
+                ScheduledJobUpdate {
+                    enabled: Some(true),
+                    prompt: Some("new prompt".into()),
+                    trigger_kind: Some(SCHEDULED_JOB_SCHEDULE_DAILY.into()),
+                    interval_seconds: Some(9 * 3600),
+                    retry_max_attempts: Some(4),
+                    retry_initial_backoff_seconds: Some(10),
+                    retry_max_backoff_seconds: Some(120),
+                    ..ScheduledJobUpdate::default()
+                },
+            )
+            .expect("edit job");
+        assert!(edited.enabled);
+        assert_eq!(edited.prompt_text, "new prompt");
+        assert_eq!(edited.trigger_kind, SCHEDULED_JOB_SCHEDULE_DAILY);
+        assert_eq!(edited.interval_seconds, 9 * 3600);
+        assert_eq!(edited.retry_max_attempts, 4);
+        assert_eq!(edited.retry_initial_backoff_seconds, 10);
+        assert_eq!(edited.retry_max_backoff_seconds, 120);
+        assert_eq!(edited.pending_retry_at_ms, None);
     }
 
     #[test]

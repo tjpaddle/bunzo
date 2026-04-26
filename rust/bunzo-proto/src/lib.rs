@@ -60,6 +60,8 @@ pub struct PolicySummary {
 pub struct ScheduledJobSummary {
     pub job_id: String,
     pub name: String,
+    #[serde(default)]
+    pub prompt_text: String,
     pub prompt_preview: String,
     #[serde(default = "default_scheduled_job_trigger_kind")]
     pub trigger_kind: String,
@@ -208,6 +210,28 @@ pub enum ClientMessage {
         retry_initial_backoff_seconds: u64,
         #[serde(default = "default_job_retry_max_backoff_seconds")]
         retry_max_backoff_seconds: u64,
+    },
+    UpdateScheduledJob {
+        id: String,
+        job_id: String,
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        prompt: Option<String>,
+        #[serde(default)]
+        trigger_kind: Option<String>,
+        #[serde(default)]
+        interval_seconds: Option<u64>,
+        #[serde(default)]
+        run_at_ms: Option<u64>,
+        #[serde(default)]
+        retry_max_attempts: Option<u32>,
+        #[serde(default)]
+        retry_initial_backoff_seconds: Option<u64>,
+        #[serde(default)]
+        retry_max_backoff_seconds: Option<u64>,
     },
     DeleteScheduledJob {
         id: String,
@@ -558,6 +582,7 @@ mod tests {
                 jobs: vec![ScheduledJobSummary {
                     job_id: "job1".into(),
                     name: "check os".into(),
+                    prompt_text: "what OS is this?".into(),
                     prompt_preview: "what OS is this?".into(),
                     trigger_kind: "interval".into(),
                     interval_seconds: 60,
@@ -604,6 +629,7 @@ mod tests {
                 job: ScheduledJobSummary {
                     job_id: "job1".into(),
                     name: "check os".into(),
+                    prompt_text: "what OS is this?".into(),
                     prompt_preview: "what OS is this?".into(),
                     trigger_kind: "interval".into(),
                     interval_seconds: 60,
@@ -678,6 +704,19 @@ mod tests {
                 retry_max_attempts: 2,
                 retry_initial_backoff_seconds: 30,
                 retry_max_backoff_seconds: 300,
+            },
+            ClientMessage::UpdateScheduledJob {
+                id: "ctl5b".into(),
+                job_id: "job1".into(),
+                enabled: Some(false),
+                name: None,
+                prompt: None,
+                trigger_kind: None,
+                interval_seconds: None,
+                run_at_ms: None,
+                retry_max_attempts: None,
+                retry_initial_backoff_seconds: None,
+                retry_max_backoff_seconds: None,
             },
             ClientMessage::DeleteScheduledJob {
                 id: "ctl6".into(),

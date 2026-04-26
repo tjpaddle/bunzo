@@ -11,7 +11,9 @@ use bunzod::ledger::Ledger;
 use bunzod::policy::{Decision as PolicyDecision, GrantScope, NewRuntimePolicy};
 use bunzod::runtime;
 use bunzod::skills::{self, Registry};
-use bunzod::store::{self, LookupError, PrepareRequestError, RuntimeStore, WaitingApprovalError};
+use bunzod::store::{
+    self, LookupError, PrepareRequestError, RuntimeStore, ScheduledJobUpdate, WaitingApprovalError,
+};
 use listenfd::ListenFd;
 use sd_notify::NotifyState;
 use std::os::unix::fs::PermissionsExt;
@@ -178,6 +180,38 @@ async fn handle_connection(
                     retry_max_attempts,
                     retry_initial_backoff_seconds,
                     retry_max_backoff_seconds,
+                    &store,
+                )
+                .await?;
+            }
+            ClientMessage::UpdateScheduledJob {
+                id,
+                job_id,
+                enabled,
+                name,
+                prompt,
+                trigger_kind,
+                interval_seconds,
+                run_at_ms,
+                retry_max_attempts,
+                retry_initial_backoff_seconds,
+                retry_max_backoff_seconds,
+            } => {
+                handle_update_scheduled_job(
+                    &mut write_half,
+                    &id,
+                    &job_id,
+                    ScheduledJobUpdate {
+                        enabled,
+                        name,
+                        prompt,
+                        trigger_kind,
+                        interval_seconds,
+                        run_at_ms,
+                        retry_max_attempts,
+                        retry_initial_backoff_seconds,
+                        retry_max_backoff_seconds,
+                    },
                     &store,
                 )
                 .await?;
@@ -705,7 +739,7 @@ where
         return Ok(());
     }
 
-    if !matches!(trigger_kind, "" | "interval" | "once") {
+    if !matches!(trigger_kind, "" | "interval" | "once" | "daily") {
         let err = Envelope::new(ServerMessage::Error {
             id: id.into(),
             code: "invalid_job_trigger".into(),
@@ -757,6 +791,73 @@ where
                 id: id.into(),
                 job_id,
             });
+            write_frame_async(w, &frame).await?;
+        }
+        Err(LookupError::NotFound { kind, value }) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "job_not_found".into(),
+                text: format!("{kind} '{value}' was not found"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+        Err(LookupError::Ambiguous { kind, value }) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "job_ambiguous".into(),
+                text: format!("{kind} prefix '{value}' matches multiple records"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+        Err(LookupError::Store(e)) => {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "runtime_store_error".into(),
+                text: format!("{e:#}"),
+            });
+            write_frame_async(w, &err).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_update_scheduled_job<W>(
+    w: &mut W,
+    id: &str,
+    job_id: &str,
+    update: ScheduledJobUpdate,
+    store: &RuntimeStore,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(prompt) = update.prompt.as_deref() {
+        if prompt.trim().is_empty() {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "invalid_job_prompt".into(),
+                text: "scheduled job prompt must not be empty".into(),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+    }
+    if let Some(trigger_kind) = update.trigger_kind.as_deref() {
+        if !matches!(trigger_kind, "" | "interval" | "once" | "daily") {
+            let err = Envelope::new(ServerMessage::Error {
+                id: id.into(),
+                code: "invalid_job_trigger".into(),
+                text: format!("unsupported scheduled job trigger '{trigger_kind}'"),
+            });
+            write_frame_async(w, &err).await?;
+            return Ok(());
+        }
+    }
+
+    match store.update_scheduled_job(job_id, update) {
+        Ok(job) => {
+            let frame =
+                Envelope::new(ServerMessage::ScheduledJobMutationResult { id: id.into(), job });
             write_frame_async(w, &frame).await?;
         }
         Err(LookupError::NotFound { kind, value }) => {
