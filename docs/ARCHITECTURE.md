@@ -89,18 +89,25 @@ explicit-interface `existing_network` path.
 
 ### `bunzo-setup-httpd`
 
-The thin headless provisioning frontend introduced in the latest M7 slice.
+The thin headless HTTP frontend introduced in M7 and extended in the first M9
+slice.
 
 Responsibilities:
 
 - expose a minimal browser/HTTP setup surface on the dev network path
 - show provisioning status from `bunzo-provisiond`
 - submit the same canonical setup inputs through the provisioning socket API
+- after provisioning is `ready`, serve the local browser control surface
+- send browser prompts, history summary requests, job list requests, and
+  approval resolution requests through the existing `bunzod` Unix-socket API
 - avoid owning provisioning logic or writing `/var/lib/bunzo/` or `/etc/bunzo/`
   directly
+- avoid owning runtime execution, policy, task, scheduler, or audit logic
 
 Current shape: socket-activated HTTP on guest port `8080`. In the QEMU dev
-loop, `run-qemu.sh` forwards host port `8080` to that guest port.
+loop, `run-qemu.sh` forwards host port `8080` to that guest port. `/setup`
+stays available for setup/reconfiguration; `/` becomes the control UI once
+provisioning is ready.
 
 ## Key data paths
 
@@ -145,6 +152,12 @@ evaluation → skill/model execution → task events/state updates
 `/etc/bunzo/bunzod.toml` → live hostname application + provider validation →
 normal `bunzod` request path on the next shell request
 
+### Browser control path
+
+`bunzo-setup-httpd /api/*` after provisioning is ready → `bunzod` →
+runtime store/task creation → policy evaluation → skill/model execution →
+task events/state updates
+
 ### Provisioning reconciliation path
 
 boot/startup → `bunzo-provisioning-reconcile.service` and startup
@@ -178,18 +191,18 @@ runtime/task/policy path as interactive work
 - proactive interval jobs via `/jobs`
 - provisioning via `bunzo-provisiond` with both local-shell and headless HTTP
   frontends
+- local browser control after provisioning through the existing HTTP frontend
+  and `bunzod` runtime path
 - boot-safe runtime hostname/network/config reconciliation from canonical
   provisioning state
 
 ### Next
 
-- additional connectivity modes beyond the current explicit-interface
-  `existing_network` slice
-- scheduler hardening beyond interval-only slice 1
+- trust/pairing model for browser control
+- richer historical action review in the browser surface
 
 ### Later
 
-- phone/browser control after provisioning
 - read-only rootfs + durable writable state
 - OTA/update machinery
 
