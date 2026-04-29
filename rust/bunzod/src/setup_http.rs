@@ -79,6 +79,7 @@ impl fmt::Display for RuntimeClientError {
 struct HttpRequest {
     method: String,
     path: String,
+    query: Option<String>,
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
@@ -224,7 +225,9 @@ async fn route_request(request: HttpRequest) -> HttpResponse {
         ("POST", "/api/pair") => route_control_pair(&request).await,
         ("GET", "/api/bootstrap") => route_control_bootstrap(&request).await,
         ("GET", "/api/conversations") => route_control_conversations(&request).await,
+        ("GET", "/api/conversation") => route_control_conversation_detail(&request).await,
         ("GET", "/api/tasks") => route_control_tasks(&request).await,
+        ("GET", "/api/task") => route_control_task_detail(&request).await,
         ("GET", "/api/jobs") => route_control_jobs(&request).await,
         ("POST", "/api/message") => route_control_message(&request).await,
         ("POST", "/api/approve") => route_control_approve(&request).await,
@@ -495,12 +498,60 @@ async fn route_control_conversations(request: &HttpRequest) -> HttpResponse {
     }
 }
 
+async fn route_control_conversation_detail(request: &HttpRequest) -> HttpResponse {
+    match require_ready_and_trusted(request).await {
+        Ok(_) => {
+            let conversation_id = match required_query_param(request, "id") {
+                Ok(value) => value,
+                Err(err) => {
+                    return json_error("400 Bad Request", "invalid_query", &format!("{err:#}"));
+                }
+            };
+            let event_limit = match optional_query_u32(request, "event_limit") {
+                Ok(value) => value.unwrap_or(120),
+                Err(err) => {
+                    return json_error("400 Bad Request", "invalid_query", &format!("{err:#}"));
+                }
+            };
+            match request_conversation_detail(&conversation_id, event_limit).await {
+                Ok(detail) => json_response("200 OK", &serde_json::json!({ "detail": detail })),
+                Err(err) => runtime_json_error(err),
+            }
+        }
+        Err(response) => response,
+    }
+}
+
 async fn route_control_tasks(request: &HttpRequest) -> HttpResponse {
     match require_ready_and_trusted(request).await {
         Ok(_) => match request_tasks(24).await {
             Ok(tasks) => json_response("200 OK", &serde_json::json!({ "tasks": tasks })),
             Err(err) => runtime_json_error(err),
         },
+        Err(response) => response,
+    }
+}
+
+async fn route_control_task_detail(request: &HttpRequest) -> HttpResponse {
+    match require_ready_and_trusted(request).await {
+        Ok(_) => {
+            let task_id = match required_query_param(request, "id") {
+                Ok(value) => value,
+                Err(err) => {
+                    return json_error("400 Bad Request", "invalid_query", &format!("{err:#}"));
+                }
+            };
+            let event_limit = match optional_query_u32(request, "event_limit") {
+                Ok(value) => value.unwrap_or(120),
+                Err(err) => {
+                    return json_error("400 Bad Request", "invalid_query", &format!("{err:#}"));
+                }
+            };
+            match request_task_detail(&task_id, event_limit).await {
+                Ok(detail) => json_response("200 OK", &serde_json::json!({ "detail": detail })),
+                Err(err) => runtime_json_error(err),
+            }
+        }
         Err(response) => response,
     }
 }
@@ -621,7 +672,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         bail!("unsupported HTTP version '{version}'");
     }
 
-    let (path, _query) = match target.split_once('?') {
+    let (path, query) = match target.split_once('?') {
         Some((path, query)) => (path.to_string(), Some(query.to_string())),
         None => (target.to_string(), None),
     };
@@ -664,6 +715,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     Ok(HttpRequest {
         method,
         path,
+        query,
         headers,
         body,
     })
@@ -901,6 +953,42 @@ async fn request_conversations(
     }
 }
 
+async fn request_conversation_detail(
+    conversation_id: &str,
+    event_limit: u32,
+) -> Result<bunzo_proto::ConversationDetail, RuntimeClientError> {
+    let id = next_request_id("control-conversation");
+    let message = ClientMessage::GetConversation {
+        id: id.clone(),
+        conversation_id: conversation_id.to_string(),
+        event_limit,
+    };
+    let mut stream = connect_bunzod().await?;
+    write_runtime_request(&mut stream, &message).await?;
+    let (read_half, _write_half) = stream.split();
+    let mut reader = BufReader::new(read_half);
+
+    loop {
+        let frame = read_runtime_frame(&mut reader).await?;
+        match frame.msg {
+            ServerMessage::ConversationDetail {
+                id: detail_id,
+                detail,
+            } if detail_id == id => return Ok(detail),
+            ServerMessage::ConversationDetail { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RuntimeClientError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            _ => {}
+        }
+    }
+}
+
 async fn request_tasks(limit: u32) -> Result<Vec<bunzo_proto::TaskSummary>, RuntimeClientError> {
     let id = next_request_id("control-tasks");
     let message = ClientMessage::ListTasks {
@@ -917,6 +1005,42 @@ async fn request_tasks(limit: u32) -> Result<Vec<bunzo_proto::TaskSummary>, Runt
         match frame.msg {
             ServerMessage::TaskList { id: list_id, tasks } if list_id == id => return Ok(tasks),
             ServerMessage::TaskList { .. } => {}
+            ServerMessage::Error {
+                id: err_id,
+                code,
+                text,
+            } if err_id == id || err_id.is_empty() => {
+                return Err(RuntimeClientError::Remote { code, text });
+            }
+            ServerMessage::Error { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+async fn request_task_detail(
+    task_id: &str,
+    event_limit: u32,
+) -> Result<bunzo_proto::TaskDetail, RuntimeClientError> {
+    let id = next_request_id("control-task");
+    let message = ClientMessage::GetTask {
+        id: id.clone(),
+        task_id: task_id.to_string(),
+        event_limit,
+    };
+    let mut stream = connect_bunzod().await?;
+    write_runtime_request(&mut stream, &message).await?;
+    let (read_half, _write_half) = stream.split();
+    let mut reader = BufReader::new(read_half);
+
+    loop {
+        let frame = read_runtime_frame(&mut reader).await?;
+        match frame.msg {
+            ServerMessage::TaskDetail {
+                id: detail_id,
+                detail,
+            } if detail_id == id => return Ok(detail),
+            ServerMessage::TaskDetail { .. } => {}
             ServerMessage::Error {
                 id: err_id,
                 code,
@@ -1192,6 +1316,31 @@ fn parse_form_fields(raw: &str) -> Result<HashMap<String, String>> {
         fields.insert(name, value);
     }
     Ok(fields)
+}
+
+fn required_query_param(request: &HttpRequest, name: &str) -> Result<String> {
+    query_param(request, name)?.ok_or_else(|| anyhow!("missing '{name}' query parameter"))
+}
+
+fn optional_query_u32(request: &HttpRequest, name: &str) -> Result<Option<u32>> {
+    query_param(request, name)?
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .with_context(|| format!("'{value}' is not a valid {name} value"))
+        })
+        .transpose()
+}
+
+fn query_param(request: &HttpRequest, name: &str) -> Result<Option<String>> {
+    let Some(query) = request.query.as_deref() else {
+        return Ok(None);
+    };
+    let fields = parse_form_fields(query)?;
+    Ok(fields
+        .get(name)
+        .cloned()
+        .and_then(|value| non_empty(Some(value))))
 }
 
 fn decode_form_component(raw: &str) -> Result<String> {
@@ -1872,6 +2021,127 @@ function addEvent(text, mode = '') {
   els.events.appendChild(item);
 }
 
+function clearThread() {
+  els.thread.replaceChildren();
+}
+
+async function loadConversation(conversationId) {
+  if (state.busy) return;
+  state.busy = true;
+  addEvent(`loading conversation ${shortId(conversationId)}`, 'waiting');
+  try {
+    const data = await requestJson(`/api/conversation?id=${encodeURIComponent(conversationId)}`);
+    renderConversationDetail(data.detail);
+  } catch (error) {
+    appendBubble('system', error.message || String(error));
+    addEvent(error.message || String(error), 'error');
+  } finally {
+    state.busy = false;
+  }
+}
+
+async function loadTask(taskId) {
+  if (state.busy) return;
+  state.busy = true;
+  addEvent(`loading task ${shortId(taskId)}`, 'waiting');
+  try {
+    const data = await requestJson(`/api/task?id=${encodeURIComponent(taskId)}`);
+    renderTaskDetail(data.detail);
+  } catch (error) {
+    appendBubble('system', error.message || String(error));
+    addEvent(error.message || String(error), 'error');
+  } finally {
+    state.busy = false;
+  }
+}
+
+function renderConversationDetail(detail) {
+  const conversation = detail?.conversation || {};
+  state.conversationId = conversation.conversation_id || state.conversationId;
+  clearThread();
+  const messages = detail?.messages || [];
+  if (!messages.length) {
+    appendBubble('system', `Conversation ${shortId(state.conversationId)} has no captured messages.`);
+  } else {
+    messages.forEach(renderHistoricalMessage);
+  }
+  renderHistoricalEvents(detail?.events || []);
+}
+
+function renderTaskDetail(detail) {
+  const task = detail?.task || {};
+  state.conversationId = task.conversation_id || state.conversationId;
+  clearThread();
+  const messages = detail?.messages || [];
+  if (!messages.length) {
+    appendBubble('system', `Task ${shortId(task.task_id)} has no captured messages.`);
+  } else {
+    messages.forEach(renderHistoricalMessage);
+  }
+  renderHistoricalEvents(detail?.events || []);
+}
+
+function renderHistoricalMessage(message) {
+  const kind = message.role === 'assistant' ? 'assistant' :
+    message.role === 'user' ? 'user' : 'system';
+  appendBubble(kind, message.content || '');
+}
+
+function renderHistoricalEvents(events) {
+  els.events.textContent = '';
+  if (!events.length) {
+    addEvent('no recorded activity');
+    return;
+  }
+  events.forEach((event) => addEvent(eventLabel(event), eventMode(event)));
+}
+
+function eventPayload(event) {
+  try {
+    return JSON.parse(event.payload_json || '{}');
+  } catch (_) {
+    return {};
+  }
+}
+
+function eventLabel(event) {
+  const payload = eventPayload(event);
+  switch (event.kind) {
+    case 'tool.invoke':
+      return `${payload.name || 'tool'}: invoke`;
+    case 'tool.result': {
+      const phase = payload.ok === false ? 'error' : 'ok';
+      const detail = payload.detail ? ` - ${payload.detail}` : '';
+      return `${payload.name || 'tool'}: ${phase}${detail}`;
+    }
+    case 'policy.decision':
+      return `${payload.decision || 'policy'}: ${payload.resource || payload.action || 'runtime action'}`;
+    case 'message.user':
+      return `user message${payload.chars ? ` - ${payload.chars} chars` : ''}`;
+    case 'message.assistant':
+      return `assistant reply${payload.chars ? ` - ${payload.chars} chars` : ''}`;
+    case 'task.created':
+      return `task created${payload.summary ? ` - ${payload.summary}` : ''}`;
+    case 'task.run.started':
+      return `task started${payload.backend ? ` - ${payload.backend}` : ''}`;
+    case 'task.waiting':
+      return `task waiting${payload.reason_code ? ` - ${payload.reason_code}` : ''}`;
+    case 'task.completed':
+      return `task completed${payload.finish_reason ? ` - ${payload.finish_reason}` : ''}`;
+    case 'task.failed':
+      return `task failed${payload.state_reason_code ? ` - ${payload.state_reason_code}` : ''}`;
+    default:
+      return event.kind || 'runtime event';
+  }
+}
+
+function eventMode(event) {
+  const payload = eventPayload(event);
+  if (event.kind === 'task.waiting' || payload.decision === 'require_approval') return 'waiting';
+  if (event.kind === 'task.failed' || payload.decision === 'deny' || payload.ok === false) return 'error';
+  return '';
+}
+
 function shortId(value) {
   return value ? value.slice(0, 8) : 'none';
 }
@@ -1932,10 +2202,12 @@ function renderTasks(tasks) {
     return;
   }
   els.tasks.replaceChildren(...tasks.map((task) => {
-    const row = document.createElement('div');
+    const row = document.createElement('button');
     row.className = 'row';
+    row.type = 'button';
     row.innerHTML = `<div class="row-title">${escapeHtml(task.summary || 'Task')}</div>
       <div class="row-meta">${escapeHtml(task.task_kind)} - ${escapeHtml(task.task_status)}/${escapeHtml(task.run_status)} - run ${shortId(task.task_run_id)}</div>`;
+    row.addEventListener('click', () => loadTask(task.task_id));
     return row;
   }));
 }
@@ -1968,10 +2240,7 @@ function renderThreads(conversations) {
     row.type = 'button';
     row.innerHTML = `<div class="row-title">${escapeHtml(conv.last_user_text || 'Conversation')}</div>
       <div class="row-meta">${shortId(conv.conversation_id)} - ${conv.message_count} messages - ${escapeHtml(conv.last_task_status)}</div>`;
-    row.addEventListener('click', () => {
-      state.conversationId = conv.conversation_id;
-      appendBubble('system', `Conversation ${shortId(conv.conversation_id)} selected.`);
-    });
+    row.addEventListener('click', () => loadConversation(conv.conversation_id));
     return row;
   }));
 }
@@ -2451,6 +2720,7 @@ mod tests {
         let request = HttpRequest {
             method: "POST".into(),
             path: "/api/message".into(),
+            query: None,
             headers: HashMap::from([("content-type".into(), "application/json".into())]),
             body: br#"{"text":"hello","conversation_id":"conv1"}"#.to_vec(),
         };
@@ -2458,6 +2728,23 @@ mod tests {
         let input: ControlMessageRequest = parse_json_body(&request).unwrap();
         assert_eq!(input.text, "hello");
         assert_eq!(input.conversation_id.as_deref(), Some("conv1"));
+    }
+
+    #[test]
+    fn query_params_decode_detail_ids() {
+        let request = HttpRequest {
+            method: "GET".into(),
+            path: "/api/conversation".into(),
+            query: Some("id=conv%2B1&event_limit=25".into()),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        assert_eq!(required_query_param(&request, "id").unwrap(), "conv+1");
+        assert_eq!(
+            optional_query_u32(&request, "event_limit").unwrap(),
+            Some(25)
+        );
     }
 
     #[test]
@@ -2470,6 +2757,8 @@ mod tests {
         assert!(html.contains("&lt;bunzo-phone&gt;"));
         assert!(html.contains("/api/message"));
         assert!(html.contains("/api/bootstrap"));
+        assert!(html.contains("/api/conversation"));
+        assert!(html.contains("/api/task"));
         assert!(!html.contains("/var/lib/bunzo/secrets/openai.key"));
     }
 
@@ -2494,6 +2783,7 @@ mod tests {
         let request = HttpRequest {
             method: "GET".into(),
             path: "/api/bootstrap".into(),
+            query: None,
             headers: HashMap::from([(
                 "cookie".into(),
                 format!("theme=dark; {}={token}; other=value", SESSION_COOKIE_NAME),
@@ -2515,6 +2805,7 @@ mod tests {
         let request = HttpRequest {
             method: "POST".into(),
             path: "/setup".into(),
+            query: None,
             headers: HashMap::from([(
                 "content-type".into(),
                 "application/x-www-form-urlencoded".into(),
@@ -2540,6 +2831,7 @@ mod tests {
         let request = HttpRequest {
             method: "POST".into(),
             path: "/setup".into(),
+            query: None,
             headers: HashMap::from([(
                 "content-type".into(),
                 "application/x-www-form-urlencoded".into(),
@@ -2561,6 +2853,7 @@ mod tests {
         let request = HttpRequest {
             method: "POST".into(),
             path: "/setup".into(),
+            query: None,
             headers: HashMap::from([(
                 "content-type".into(),
                 "application/x-www-form-urlencoded".into(),

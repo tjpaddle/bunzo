@@ -26,6 +26,33 @@ pub struct ConversationSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    pub message_id: String,
+    pub task_id: Option<String>,
+    pub role: String,
+    pub content: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeEventSummary {
+    pub event_id: String,
+    pub conversation_id: String,
+    pub task_id: Option<String>,
+    pub task_run_id: Option<String>,
+    pub kind: String,
+    pub payload_json: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationDetail {
+    pub conversation: ConversationSummary,
+    pub messages: Vec<ConversationMessage>,
+    pub events: Vec<RuntimeEventSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub task_id: String,
     pub conversation_id: String,
@@ -39,6 +66,13 @@ pub struct TaskSummary {
     pub state_reason_code: Option<String>,
     pub state_reason_text: Option<String>,
     pub snapshot_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDetail {
+    pub task: TaskSummary,
+    pub messages: Vec<ConversationMessage>,
+    pub events: Vec<RuntimeEventSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,10 +203,22 @@ pub enum ClientMessage {
         #[serde(default = "default_list_limit")]
         limit: u32,
     },
+    GetConversation {
+        id: String,
+        conversation_id: String,
+        #[serde(default = "default_event_limit")]
+        event_limit: u32,
+    },
     ListTasks {
         id: String,
         #[serde(default = "default_list_limit")]
         limit: u32,
+    },
+    GetTask {
+        id: String,
+        task_id: String,
+        #[serde(default = "default_event_limit")]
+        event_limit: u32,
     },
     ListPolicies {
         id: String,
@@ -299,9 +345,17 @@ pub enum ServerMessage {
         id: String,
         conversations: Vec<ConversationSummary>,
     },
+    ConversationDetail {
+        id: String,
+        detail: ConversationDetail,
+    },
     TaskList {
         id: String,
         tasks: Vec<TaskSummary>,
+    },
+    TaskDetail {
+        id: String,
+        detail: TaskDetail,
     },
     PolicyList {
         id: String,
@@ -362,6 +416,10 @@ pub enum ProvisionServerMessage {
 
 fn default_list_limit() -> u32 {
     10
+}
+
+fn default_event_limit() -> u32 {
+    100
 }
 
 fn default_task_kind() -> String {
@@ -557,6 +615,34 @@ mod tests {
                     last_user_text: "hello".into(),
                 }],
             },
+            ServerMessage::ConversationDetail {
+                id: "u1".into(),
+                detail: ConversationDetail {
+                    conversation: ConversationSummary {
+                        conversation_id: "c1".into(),
+                        updated_at_ms: 1,
+                        message_count: 2,
+                        last_task_status: "completed".into(),
+                        last_user_text: "hello".into(),
+                    },
+                    messages: vec![ConversationMessage {
+                        message_id: "m1".into(),
+                        task_id: Some("t1".into()),
+                        role: "assistant".into(),
+                        content: "hello back".into(),
+                        created_at_ms: 2,
+                    }],
+                    events: vec![RuntimeEventSummary {
+                        event_id: "e1".into(),
+                        conversation_id: "c1".into(),
+                        task_id: Some("t1".into()),
+                        task_run_id: Some("tr1".into()),
+                        kind: "tool.result".into(),
+                        payload_json: "{\"ok\":true}".into(),
+                        created_at_ms: 3,
+                    }],
+                },
+            },
             ServerMessage::TaskList {
                 id: "u1".into(),
                 tasks: vec![TaskSummary {
@@ -572,6 +658,40 @@ mod tests {
                     state_reason_text: Some("missing API key".into()),
                     snapshot_kind: Some("shell_request_waiting_v1".into()),
                 }],
+            },
+            ServerMessage::TaskDetail {
+                id: "u1".into(),
+                detail: TaskDetail {
+                    task: TaskSummary {
+                        task_id: "t1".into(),
+                        conversation_id: "c1".into(),
+                        task_run_id: "tr1".into(),
+                        task_kind: "shell_request".into(),
+                        updated_at_ms: 1,
+                        task_status: "completed".into(),
+                        run_status: "completed".into(),
+                        summary: "hello".into(),
+                        state_reason_code: None,
+                        state_reason_text: None,
+                        snapshot_kind: None,
+                    },
+                    messages: vec![ConversationMessage {
+                        message_id: "m1".into(),
+                        task_id: Some("t1".into()),
+                        role: "user".into(),
+                        content: "hello".into(),
+                        created_at_ms: 1,
+                    }],
+                    events: vec![RuntimeEventSummary {
+                        event_id: "e1".into(),
+                        conversation_id: "c1".into(),
+                        task_id: Some("t1".into()),
+                        task_run_id: Some("tr1".into()),
+                        kind: "policy.decision".into(),
+                        payload_json: "{\"decision\":\"require_approval\"}".into(),
+                        created_at_ms: 2,
+                    }],
+                },
             },
             ServerMessage::PolicyList {
                 id: "u1".into(),
@@ -685,6 +805,16 @@ mod tests {
             ClientMessage::ListScheduledJobs {
                 id: "ctl1b".into(),
                 limit: 10,
+            },
+            ClientMessage::GetConversation {
+                id: "ctl1c".into(),
+                conversation_id: "c1".into(),
+                event_limit: 20,
+            },
+            ClientMessage::GetTask {
+                id: "ctl1d".into(),
+                task_id: "t1".into(),
+                event_limit: 20,
             },
             ClientMessage::UpsertPolicy {
                 id: "ctl2".into(),

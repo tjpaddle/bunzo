@@ -434,7 +434,9 @@ fn round_trip(
             }
             ServerMessage::PolicyDecision { .. } => {}
             ServerMessage::ConversationList { .. } => {}
+            ServerMessage::ConversationDetail { .. } => {}
             ServerMessage::TaskList { .. } => {}
+            ServerMessage::TaskDetail { .. } => {}
             ServerMessage::PolicyList { .. } => {}
             ServerMessage::PolicyMutationResult { .. } => {}
             ServerMessage::PolicyDeleteResult { .. } => {}
@@ -2172,7 +2174,9 @@ fn request_approval_resolution(
             }
             ServerMessage::PolicyDecision { .. } => {}
             ServerMessage::ConversationList { .. } => {}
+            ServerMessage::ConversationDetail { .. } => {}
             ServerMessage::TaskList { .. } => {}
+            ServerMessage::TaskDetail { .. } => {}
             ServerMessage::PolicyList { .. } => {}
             ServerMessage::PolicyDeleteResult { .. } => {}
             ServerMessage::ScheduledJobList { .. } => {}

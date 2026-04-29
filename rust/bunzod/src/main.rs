@@ -122,8 +122,29 @@ async fn handle_connection(
             ClientMessage::ListConversations { id, limit } => {
                 handle_list_conversations(&mut write_half, &id, limit, &store).await?;
             }
+            ClientMessage::GetConversation {
+                id,
+                conversation_id,
+                event_limit,
+            } => {
+                handle_get_conversation(
+                    &mut write_half,
+                    &id,
+                    &conversation_id,
+                    event_limit,
+                    &store,
+                )
+                .await?;
+            }
             ClientMessage::ListTasks { id, limit } => {
                 handle_list_tasks(&mut write_half, &id, limit, &store).await?;
+            }
+            ClientMessage::GetTask {
+                id,
+                task_id,
+                event_limit,
+            } => {
+                handle_get_task(&mut write_half, &id, &task_id, event_limit, &store).await?;
             }
             ClientMessage::ListPolicies { id, limit } => {
                 handle_list_policies(&mut write_half, &id, limit, &store).await?;
@@ -483,6 +504,37 @@ where
     Ok(())
 }
 
+async fn handle_get_conversation<W>(
+    w: &mut W,
+    id: &str,
+    conversation_id: &str,
+    event_limit: u32,
+    store: &RuntimeStore,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match store.get_conversation_detail(conversation_id, event_limit) {
+        Ok(detail) => {
+            let frame = Envelope::new(ServerMessage::ConversationDetail {
+                id: id.into(),
+                detail,
+            });
+            write_frame_async(w, &frame).await?;
+        }
+        Err(e) => {
+            let err = Envelope::new(detail_lookup_error(
+                id,
+                e,
+                "conversation_not_found",
+                "conversation_ambiguous",
+            ));
+            write_frame_async(w, &err).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn handle_list_tasks<W>(w: &mut W, id: &str, limit: u32, store: &RuntimeStore) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -505,6 +557,63 @@ where
         }
     }
     Ok(())
+}
+
+async fn handle_get_task<W>(
+    w: &mut W,
+    id: &str,
+    task_id: &str,
+    event_limit: u32,
+    store: &RuntimeStore,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match store.get_task_detail(task_id, event_limit) {
+        Ok(detail) => {
+            let frame = Envelope::new(ServerMessage::TaskDetail {
+                id: id.into(),
+                detail,
+            });
+            write_frame_async(w, &frame).await?;
+        }
+        Err(e) => {
+            let err = Envelope::new(detail_lookup_error(
+                id,
+                e,
+                "task_not_found",
+                "task_ambiguous",
+            ));
+            write_frame_async(w, &err).await?;
+        }
+    }
+    Ok(())
+}
+
+fn detail_lookup_error(
+    id: &str,
+    err: LookupError,
+    not_found_code: &str,
+    ambiguous_code: &str,
+) -> ServerMessage {
+    let text = err.to_string();
+    match err {
+        LookupError::NotFound { .. } => ServerMessage::Error {
+            id: id.into(),
+            code: not_found_code.into(),
+            text,
+        },
+        LookupError::Ambiguous { .. } => ServerMessage::Error {
+            id: id.into(),
+            code: ambiguous_code.into(),
+            text,
+        },
+        LookupError::Store(err) => ServerMessage::Error {
+            id: id.into(),
+            code: "runtime_store_error".into(),
+            text: format!("{err:#}"),
+        },
+    }
 }
 
 async fn handle_list_policies<W>(

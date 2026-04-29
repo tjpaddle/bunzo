@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bunzo_proto::{ConversationSummary, PolicySummary, ScheduledJobSummary, TaskSummary};
+use bunzo_proto::{
+    ConversationDetail, ConversationMessage, ConversationSummary, PolicySummary,
+    RuntimeEventSummary, ScheduledJobSummary, TaskDetail, TaskSummary,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Deserialize;
 use serde_json::json;
@@ -947,6 +950,61 @@ impl RuntimeStore {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    pub fn get_conversation_detail(
+        &self,
+        requested_conversation_id: &str,
+        event_limit: u32,
+    ) -> std::result::Result<ConversationDetail, LookupError> {
+        let conn = self.connect().map_err(LookupError::Store)?;
+        let conversation_id = resolve_prefixed_id(
+            &conn,
+            "conversations",
+            "updated_at_ms",
+            requested_conversation_id,
+            "conversation",
+        )?;
+        let conversation = load_conversation_summary(&conn, &conversation_id)
+            .map_err(LookupError::Store)?
+            .ok_or_else(|| LookupError::NotFound {
+                kind: "conversation",
+                value: requested_conversation_id.to_string(),
+            })?;
+        let messages =
+            load_conversation_messages(&conn, &conversation_id).map_err(LookupError::Store)?;
+        let events = load_conversation_events(&conn, &conversation_id, event_limit)
+            .map_err(LookupError::Store)?;
+
+        Ok(ConversationDetail {
+            conversation,
+            messages,
+            events,
+        })
+    }
+
+    pub fn get_task_detail(
+        &self,
+        requested_task_id: &str,
+        event_limit: u32,
+    ) -> std::result::Result<TaskDetail, LookupError> {
+        let conn = self.connect().map_err(LookupError::Store)?;
+        let task_id =
+            resolve_prefixed_id(&conn, "tasks", "updated_at_ms", requested_task_id, "task")?;
+        let task = load_task_summary(&conn, &task_id)
+            .map_err(LookupError::Store)?
+            .ok_or_else(|| LookupError::NotFound {
+                kind: "task",
+                value: requested_task_id.to_string(),
+            })?;
+        let messages = load_task_messages(&conn, &task_id).map_err(LookupError::Store)?;
+        let events = load_task_events(&conn, &task_id, event_limit).map_err(LookupError::Store)?;
+
+        Ok(TaskDetail {
+            task,
+            messages,
+            events,
+        })
     }
 
     pub fn list_runtime_policies(&self, limit: u32) -> Result<Vec<PolicySummary>> {
@@ -2473,6 +2531,204 @@ fn resolve_conversation_id(
     }
 }
 
+fn load_conversation_summary(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<ConversationSummary>> {
+    conn.query_row(
+        concat!(
+            "SELECT ",
+            "  c.id, ",
+            "  c.updated_at_ms, ",
+            "  (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count, ",
+            "  COALESCE((SELECT t.status FROM tasks t ",
+            "            WHERE t.conversation_id = c.id ",
+            "            ORDER BY t.created_at_ms DESC, t.rowid DESC LIMIT 1), 'unknown') AS last_task_status, ",
+            "  COALESCE((SELECT m.content FROM messages m ",
+            "            WHERE m.conversation_id = c.id AND m.role = 'user' ",
+            "            ORDER BY m.created_at_ms DESC, m.rowid DESC LIMIT 1), '') AS last_user_text ",
+            "FROM conversations c ",
+            "WHERE c.id = ?1"
+        ),
+        params![conversation_id],
+        |row| {
+            let updated_at_ms: i64 = row.get(1)?;
+            let message_count: i64 = row.get(2)?;
+            let last_user_text: String = row.get(4)?;
+            Ok(ConversationSummary {
+                conversation_id: row.get(0)?,
+                updated_at_ms: updated_at_ms.max(0) as u64,
+                message_count: message_count.max(0) as u32,
+                last_task_status: row.get(3)?,
+                last_user_text: truncate_preview(&last_user_text, 72),
+            })
+        },
+    )
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
+fn load_task_summary(conn: &Connection, task_id: &str) -> Result<Option<TaskSummary>> {
+    conn.query_row(
+        concat!(
+            "SELECT ",
+            "  t.id, ",
+            "  t.conversation_id, ",
+            "  t.updated_at_ms, ",
+            "  t.kind, ",
+            "  t.status, ",
+            "  t.summary, ",
+            "  COALESCE((SELECT tr.id FROM task_runs tr ",
+            "            WHERE tr.task_id = t.id ",
+            "            ORDER BY tr.started_at_ms DESC, tr.rowid DESC LIMIT 1), '') AS task_run_id, ",
+            "  COALESCE((SELECT tr.status FROM task_runs tr ",
+            "            WHERE tr.task_id = t.id ",
+            "            ORDER BY tr.started_at_ms DESC, tr.rowid DESC LIMIT 1), 'unknown') AS run_status, ",
+            "  (SELECT tr.state_reason_code FROM task_runs tr ",
+            "   WHERE tr.task_id = t.id ",
+            "   ORDER BY tr.started_at_ms DESC, tr.rowid DESC LIMIT 1) AS state_reason_code, ",
+            "  (SELECT tr.state_reason_text FROM task_runs tr ",
+            "   WHERE tr.task_id = t.id ",
+            "   ORDER BY tr.started_at_ms DESC, tr.rowid DESC LIMIT 1) AS state_reason_text, ",
+            "  (SELECT ts.kind FROM task_snapshots ts ",
+            "   WHERE ts.task_id = t.id ",
+            "   ORDER BY ts.created_at_ms DESC, ts.rowid DESC LIMIT 1) AS snapshot_kind ",
+            "FROM tasks t ",
+            "WHERE t.id = ?1"
+        ),
+        params![task_id],
+        |row| {
+            let updated_at_ms: i64 = row.get(2)?;
+            Ok(TaskSummary {
+                task_id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                task_kind: row.get(3)?,
+                updated_at_ms: updated_at_ms.max(0) as u64,
+                task_status: row.get(4)?,
+                summary: row.get(5)?,
+                task_run_id: row.get(6)?,
+                run_status: row.get(7)?,
+                state_reason_code: row.get(8)?,
+                state_reason_text: row.get(9)?,
+                snapshot_kind: row.get(10)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
+fn load_conversation_messages(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Vec<ConversationMessage>> {
+    let mut stmt = conn.prepare(concat!(
+        "SELECT id, task_id, role, content, created_at_ms FROM messages ",
+        "WHERE conversation_id = ?1 ",
+        "ORDER BY created_at_ms ASC, rowid ASC"
+    ))?;
+    load_messages_from_stmt(&mut stmt, params![conversation_id])
+}
+
+fn load_task_messages(conn: &Connection, task_id: &str) -> Result<Vec<ConversationMessage>> {
+    let mut stmt = conn.prepare(concat!(
+        "SELECT id, task_id, role, content, created_at_ms FROM messages ",
+        "WHERE task_id = ?1 ",
+        "ORDER BY created_at_ms ASC, rowid ASC"
+    ))?;
+    load_messages_from_stmt(&mut stmt, params![task_id])
+}
+
+fn load_messages_from_stmt<P>(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: P,
+) -> Result<Vec<ConversationMessage>>
+where
+    P: rusqlite::Params,
+{
+    let rows = stmt.query_map(params, |row| {
+        let created_at_ms: i64 = row.get(4)?;
+        Ok(ConversationMessage {
+            message_id: row.get(0)?,
+            task_id: row.get(1)?,
+            role: row.get(2)?,
+            content: row.get(3)?,
+            created_at_ms: created_at_ms.max(0) as u64,
+        })
+    })?;
+    let mut messages = Vec::new();
+    for row in rows {
+        messages.push(row?);
+    }
+    Ok(messages)
+}
+
+fn load_conversation_events(
+    conn: &Connection,
+    conversation_id: &str,
+    event_limit: u32,
+) -> Result<Vec<RuntimeEventSummary>> {
+    let capped_limit = i64::from(event_limit.clamp(1, 200));
+    let mut stmt = conn.prepare(concat!(
+        "SELECT id, conversation_id, task_id, task_run_id, kind, payload_json, created_at_ms ",
+        "FROM (",
+        "  SELECT rowid AS event_rowid, id, conversation_id, task_id, task_run_id, kind, payload_json, created_at_ms ",
+        "  FROM events ",
+        "  WHERE conversation_id = ?1 ",
+        "  ORDER BY created_at_ms DESC, rowid DESC ",
+        "  LIMIT ?2",
+        ") ",
+        "ORDER BY created_at_ms ASC, event_rowid ASC"
+    ))?;
+    load_events_from_stmt(&mut stmt, params![conversation_id, capped_limit])
+}
+
+fn load_task_events(
+    conn: &Connection,
+    task_id: &str,
+    event_limit: u32,
+) -> Result<Vec<RuntimeEventSummary>> {
+    let capped_limit = i64::from(event_limit.clamp(1, 200));
+    let mut stmt = conn.prepare(concat!(
+        "SELECT id, conversation_id, task_id, task_run_id, kind, payload_json, created_at_ms ",
+        "FROM (",
+        "  SELECT rowid AS event_rowid, id, conversation_id, task_id, task_run_id, kind, payload_json, created_at_ms ",
+        "  FROM events ",
+        "  WHERE task_id = ?1 ",
+        "  ORDER BY created_at_ms DESC, rowid DESC ",
+        "  LIMIT ?2",
+        ") ",
+        "ORDER BY created_at_ms ASC, event_rowid ASC"
+    ))?;
+    load_events_from_stmt(&mut stmt, params![task_id, capped_limit])
+}
+
+fn load_events_from_stmt<P>(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: P,
+) -> Result<Vec<RuntimeEventSummary>>
+where
+    P: rusqlite::Params,
+{
+    let rows = stmt.query_map(params, |row| {
+        let created_at_ms: i64 = row.get(6)?;
+        Ok(RuntimeEventSummary {
+            event_id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            task_id: row.get(2)?,
+            task_run_id: row.get(3)?,
+            kind: row.get(4)?,
+            payload_json: row.get(5)?,
+            created_at_ms: created_at_ms.max(0) as u64,
+        })
+    })?;
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row?);
+    }
+    Ok(events)
+}
+
 fn load_history(tx: &Transaction<'_>, conversation_id: &str) -> Result<Vec<Message>> {
     let mut stmt = tx.prepare(concat!(
         "SELECT role, content FROM messages ",
@@ -2969,6 +3225,45 @@ mod tests {
     }
 
     #[test]
+    fn conversation_detail_includes_messages_and_events() {
+        let (_dir, store) = temp_store();
+
+        let request = store
+            .prepare_shell_request("u1", None, "what OS is this?")
+            .expect("request");
+        store
+            .record_tool_invoke(&request, "read-local-file")
+            .expect("record tool invoke");
+        store
+            .record_tool_result(&request, "read-local-file", true, 12, "/etc/os-release")
+            .expect("record tool result");
+        store
+            .finish_shell_request(&request, "bunzo 0.0.1", "stop", Some("openai"), None, None)
+            .expect("finish request");
+
+        let detail = store
+            .get_conversation_detail(&request.conversation_id[..8], 50)
+            .expect("conversation detail");
+        assert_eq!(detail.conversation.conversation_id, request.conversation_id);
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[0].role, "user");
+        assert_eq!(detail.messages[0].content, "what OS is this?");
+        assert_eq!(detail.messages[1].role, "assistant");
+        assert_eq!(detail.messages[1].content, "bunzo 0.0.1");
+
+        let event_kinds: Vec<&str> = detail
+            .events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert!(event_kinds.contains(&"message.user"));
+        assert!(event_kinds.contains(&"tool.invoke"));
+        assert!(event_kinds.contains(&"tool.result"));
+        assert!(event_kinds.contains(&"message.assistant"));
+        assert!(event_kinds.contains(&"task.completed"));
+    }
+
+    #[test]
     fn recent_tasks_include_task_kind() {
         let (_dir, store) = temp_store();
 
@@ -2983,6 +3278,37 @@ mod tests {
         assert_eq!(recent[0].task_kind, TASK_KIND_SCHEDULED_JOB);
         assert_eq!(recent[0].task_status, "queued");
         assert_eq!(recent[0].run_status, "queued");
+    }
+
+    #[test]
+    fn task_detail_includes_task_messages_and_policy_events() {
+        let (_dir, store) = temp_store();
+
+        let request = store
+            .prepare_shell_request("u1", None, "what OS is this?")
+            .expect("request");
+        let evaluation = store
+            .evaluate_policy(&request, "shell_request", "invoke_skill", "read-local-file")
+            .expect("policy evaluation");
+        assert_eq!(evaluation.decision, PolicyDecision::RequireApproval);
+
+        let detail = store
+            .get_task_detail(&request.task_id[..8], 50)
+            .expect("task detail");
+        assert_eq!(detail.task.task_id, request.task_id);
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].role, "user");
+        assert_eq!(detail.messages[0].content, "what OS is this?");
+
+        let policy_event = detail
+            .events
+            .iter()
+            .find(|event| event.kind == "policy.decision")
+            .expect("policy event");
+        let payload: serde_json::Value =
+            serde_json::from_str(&policy_event.payload_json).expect("event payload json");
+        assert_eq!(payload["decision"], "require_approval");
+        assert_eq!(payload["resource"], "read-local-file");
     }
 
     #[test]
