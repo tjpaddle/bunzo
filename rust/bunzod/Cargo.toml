@@ -21,6 +21,8 @@ toml = "0.8"
 wasmtime = "27"
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v7"] }
+rand = "0.8"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

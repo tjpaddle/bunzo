@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod config;
+pub mod control_trust;
 pub mod ledger;
 pub mod policy;
 pub mod provisioning;

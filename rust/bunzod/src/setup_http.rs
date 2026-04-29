@@ -23,6 +23,10 @@ use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::time::timeout;
 
 use crate::config::RECOMMENDED_OPENAI_MODEL;
+use crate::control_trust::{
+    BrowserTrustStore, PairingChallengeSummary, PairingError, SESSION_COOKIE_NAME,
+    SESSION_MAX_AGE_SECONDS,
+};
 use crate::provisioning::{
     DEFAULT_RUNTIME_NETWORK_INTERFACES_PATH, SOCKET_PATH as PROVISIOND_SOCKET,
 };
@@ -82,6 +86,7 @@ struct HttpRequest {
 struct HttpResponse {
     status: &'static str,
     content_type: &'static str,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -109,6 +114,11 @@ struct ControlApprovalRequest {
     grant_scope: Option<String>,
     #[serde(default)]
     note_text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlPairRequest {
+    pairing_code: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,48 +206,10 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
 
 async fn route_request(request: HttpRequest) -> HttpResponse {
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") => match request_provisioning_status().await {
-            Ok(status) if status.ready => html_response(render_control_page(&status, None)),
-            Ok(status) => html_response(render_page(Some(&status), None, None)),
-            Err(err) => html_response(render_page(
-                None,
-                Some(&format!("{err}")),
-                Some(&FlashMessage {
-                    kind: FlashKind::Error,
-                    text: format!("status check failed: {err}"),
-                }),
-            )),
-        },
-        ("GET", "/setup") => match request_provisioning_status().await {
-            Ok(status) => html_response(render_page(Some(&status), None, None)),
-            Err(err) => html_response(render_page(
-                None,
-                Some(&format!("{err}")),
-                Some(&FlashMessage {
-                    kind: FlashKind::Error,
-                    text: format!("status check failed: {err}"),
-                }),
-            )),
-        },
-        ("GET", "/control") => match request_provisioning_status().await {
-            Ok(status) if status.ready => html_response(render_control_page(&status, None)),
-            Ok(status) => html_response(render_page(
-                Some(&status),
-                None,
-                Some(&FlashMessage {
-                    kind: FlashKind::Error,
-                    text: "setup must reach ready before browser control is available".into(),
-                }),
-            )),
-            Err(err) => html_response(render_page(
-                None,
-                Some(&format!("{err}")),
-                Some(&FlashMessage {
-                    kind: FlashKind::Error,
-                    text: format!("status check failed: {err}"),
-                }),
-            )),
-        },
+        ("GET", "/") => route_home(&request).await,
+        ("GET", "/setup") => route_setup_get(&request).await,
+        ("GET", "/control") => route_control_get(&request).await,
+        ("GET", "/pair") => route_pair_get().await,
         ("GET", "/status") => match request_provisioning_status().await {
             Ok(status) => json_response("200 OK", &status),
             Err(err) => json_response(
@@ -247,56 +219,19 @@ async fn route_request(request: HttpRequest) -> HttpResponse {
                 }),
             ),
         },
-        ("POST", "/setup") => match parse_setup_form(&request) {
-            Ok(setup) => match request_apply_setup(&setup).await {
-                Ok(status) => html_response(render_page(
-                    Some(&status),
-                    None,
-                    Some(&FlashMessage {
-                        kind: FlashKind::Success,
-                        text: format!(
-                            "validated OpenAI access for {}, applied the hostname, rendered {} for {}, and rendered {} for {}",
-                            status.device_name.as_deref().unwrap_or("this device"),
-                            DEFAULT_RUNTIME_NETWORK_INTERFACES_PATH,
-                            connectivity_summary(&status),
-                            status
-                                .rendered_config_path
-                                .as_deref()
-                                .unwrap_or("/etc/bunzo/bunzod.toml"),
-                            status.model.as_deref().unwrap_or(RECOMMENDED_OPENAI_MODEL),
-                        ),
-                    }),
-                )),
-                Err(err) => {
-                    let status = request_provisioning_status().await.ok();
-                    html_response(render_page(
-                        status.as_ref(),
-                        None,
-                        Some(&FlashMessage {
-                            kind: FlashKind::Error,
-                            text: format!("setup failed: {err}"),
-                        }),
-                    ))
-                }
-            },
-            Err(err) => html_response(render_page(
-                None,
-                None,
-                Some(&FlashMessage {
-                    kind: FlashKind::Error,
-                    text: format!("invalid request: {err}"),
-                }),
-            )),
-        },
-        ("GET", "/api/bootstrap") => route_control_bootstrap().await,
-        ("GET", "/api/conversations") => route_control_conversations().await,
-        ("GET", "/api/tasks") => route_control_tasks().await,
-        ("GET", "/api/jobs") => route_control_jobs().await,
+        ("POST", "/setup") => route_setup_post(&request).await,
+        ("POST", "/pair") => route_pair_post(&request).await,
+        ("POST", "/api/pair") => route_control_pair(&request).await,
+        ("GET", "/api/bootstrap") => route_control_bootstrap(&request).await,
+        ("GET", "/api/conversations") => route_control_conversations(&request).await,
+        ("GET", "/api/tasks") => route_control_tasks(&request).await,
+        ("GET", "/api/jobs") => route_control_jobs(&request).await,
         ("POST", "/api/message") => route_control_message(&request).await,
         ("POST", "/api/approve") => route_control_approve(&request).await,
         ("GET", "/favicon.ico") => HttpResponse {
             status: "204 No Content",
             content_type: "text/plain; charset=utf-8",
+            headers: Vec::new(),
             body: Vec::new(),
         },
         _ => html_with_status(
@@ -307,8 +242,224 @@ async fn route_request(request: HttpRequest) -> HttpResponse {
     }
 }
 
-async fn route_control_bootstrap() -> HttpResponse {
+async fn route_home(request: &HttpRequest) -> HttpResponse {
+    match request_provisioning_status().await {
+        Ok(status) if status.ready => match trusted_control_request(request) {
+            Ok(true) => html_response(render_control_page(&status, None)),
+            Ok(false) => render_pairing_response(&status, None),
+            Err(err) => html_response(render_control_trust_error_page(&status, &err.to_string())),
+        },
+        Ok(status) => html_response(render_page(Some(&status), None, None)),
+        Err(err) => html_response(render_page(
+            None,
+            Some(&format!("{err}")),
+            Some(&FlashMessage {
+                kind: FlashKind::Error,
+                text: format!("status check failed: {err}"),
+            }),
+        )),
+    }
+}
+
+async fn route_control_get(request: &HttpRequest) -> HttpResponse {
+    match request_provisioning_status().await {
+        Ok(status) if status.ready => match trusted_control_request(request) {
+            Ok(true) => html_response(render_control_page(&status, None)),
+            Ok(false) => render_pairing_response(&status, None),
+            Err(err) => html_response(render_control_trust_error_page(&status, &err.to_string())),
+        },
+        Ok(status) => html_response(render_page(
+            Some(&status),
+            None,
+            Some(&FlashMessage {
+                kind: FlashKind::Error,
+                text: "setup must reach ready before browser control is available".into(),
+            }),
+        )),
+        Err(err) => html_response(render_page(
+            None,
+            Some(&format!("{err}")),
+            Some(&FlashMessage {
+                kind: FlashKind::Error,
+                text: format!("status check failed: {err}"),
+            }),
+        )),
+    }
+}
+
+async fn route_setup_get(request: &HttpRequest) -> HttpResponse {
+    match request_provisioning_status().await {
+        Ok(status) if status.ready => match trusted_control_request(request) {
+            Ok(true) => html_response(render_page(Some(&status), None, None)),
+            Ok(false) => render_pairing_response(
+                &status,
+                Some(&FlashMessage {
+                    kind: FlashKind::Error,
+                    text: "pair this browser before reconfiguring setup".into(),
+                }),
+            ),
+            Err(err) => html_response(render_control_trust_error_page(&status, &err.to_string())),
+        },
+        Ok(status) => html_response(render_page(Some(&status), None, None)),
+        Err(err) => html_response(render_page(
+            None,
+            Some(&format!("{err}")),
+            Some(&FlashMessage {
+                kind: FlashKind::Error,
+                text: format!("status check failed: {err}"),
+            }),
+        )),
+    }
+}
+
+async fn route_setup_post(request: &HttpRequest) -> HttpResponse {
+    match request_provisioning_status().await {
+        Ok(status) if status.ready => match trusted_control_request(request) {
+            Ok(true) => {}
+            Ok(false) => {
+                return render_pairing_response(
+                    &status,
+                    Some(&FlashMessage {
+                        kind: FlashKind::Error,
+                        text: "pair this browser before reconfiguring setup".into(),
+                    }),
+                );
+            }
+            Err(err) => {
+                return html_response(render_control_trust_error_page(&status, &err.to_string()));
+            }
+        },
+        Ok(_) => {}
+        Err(_) => {}
+    }
+
+    match parse_setup_form(request) {
+        Ok(setup) => match request_apply_setup(&setup).await {
+            Ok(status) => html_response(render_page(
+                Some(&status),
+                None,
+                Some(&FlashMessage {
+                    kind: FlashKind::Success,
+                    text: format!(
+                        "validated OpenAI access for {}, applied the hostname, rendered {} for {}, and rendered {} for {}",
+                        status.device_name.as_deref().unwrap_or("this device"),
+                        DEFAULT_RUNTIME_NETWORK_INTERFACES_PATH,
+                        connectivity_summary(&status),
+                        status
+                            .rendered_config_path
+                            .as_deref()
+                            .unwrap_or("/etc/bunzo/bunzod.toml"),
+                        status.model.as_deref().unwrap_or(RECOMMENDED_OPENAI_MODEL),
+                    ),
+                }),
+            )),
+            Err(err) => {
+                let status = request_provisioning_status().await.ok();
+                html_response(render_page(
+                    status.as_ref(),
+                    None,
+                    Some(&FlashMessage {
+                        kind: FlashKind::Error,
+                        text: format!("setup failed: {err}"),
+                    }),
+                ))
+            }
+        },
+        Err(err) => html_response(render_page(
+            None,
+            None,
+            Some(&FlashMessage {
+                kind: FlashKind::Error,
+                text: format!("invalid request: {err}"),
+            }),
+        )),
+    }
+}
+
+async fn route_pair_get() -> HttpResponse {
+    match request_provisioning_status().await {
+        Ok(status) if status.ready => render_pairing_response(&status, None),
+        Ok(status) => html_response(render_page(
+            Some(&status),
+            None,
+            Some(&FlashMessage {
+                kind: FlashKind::Error,
+                text: "setup must reach ready before browser pairing is available".into(),
+            }),
+        )),
+        Err(err) => html_response(render_page(
+            None,
+            Some(&format!("{err}")),
+            Some(&FlashMessage {
+                kind: FlashKind::Error,
+                text: format!("status check failed: {err}"),
+            }),
+        )),
+    }
+}
+
+async fn route_pair_post(request: &HttpRequest) -> HttpResponse {
+    let status = match request_provisioning_status().await {
+        Ok(status) if status.ready => status,
+        Ok(status) => {
+            return html_response(render_page(
+                Some(&status),
+                None,
+                Some(&FlashMessage {
+                    kind: FlashKind::Error,
+                    text: "setup must reach ready before browser pairing is available".into(),
+                }),
+            ));
+        }
+        Err(err) => {
+            return html_response(render_page(
+                None,
+                Some(&format!("{err}")),
+                Some(&FlashMessage {
+                    kind: FlashKind::Error,
+                    text: format!("status check failed: {err}"),
+                }),
+            ));
+        }
+    };
+
+    match parse_pair_form(request) {
+        Ok(input) => match BrowserTrustStore::default().pair_with_code(&input.pairing_code) {
+            Ok(token) => redirect_with_session("/control", &token),
+            Err(err) => render_pairing_response(
+                &status,
+                Some(&FlashMessage {
+                    kind: FlashKind::Error,
+                    text: pairing_error_text(&err),
+                }),
+            ),
+        },
+        Err(err) => render_pairing_response(
+            &status,
+            Some(&FlashMessage {
+                kind: FlashKind::Error,
+                text: format!("invalid request: {err}"),
+            }),
+        ),
+    }
+}
+
+async fn route_control_pair(request: &HttpRequest) -> HttpResponse {
     match require_ready_status().await {
+        Ok(_) => match parse_json_body::<ControlPairRequest>(request) {
+            Ok(input) => match BrowserTrustStore::default().pair_with_code(&input.pairing_code) {
+                Ok(token) => json_response("200 OK", &serde_json::json!({ "paired": true }))
+                    .with_header("Set-Cookie", session_cookie(&token)),
+                Err(err) => pairing_json_error(err),
+            },
+            Err(err) => json_error("400 Bad Request", "invalid_json", &format!("{err:#}")),
+        },
+        Err(response) => response,
+    }
+}
+
+async fn route_control_bootstrap(request: &HttpRequest) -> HttpResponse {
+    match require_ready_and_trusted(request).await {
         Ok(status) => {
             let conversations = request_conversations(12).await;
             let tasks = request_tasks(16).await;
@@ -331,8 +482,8 @@ async fn route_control_bootstrap() -> HttpResponse {
     }
 }
 
-async fn route_control_conversations() -> HttpResponse {
-    match require_ready_status().await {
+async fn route_control_conversations(request: &HttpRequest) -> HttpResponse {
+    match require_ready_and_trusted(request).await {
         Ok(_) => match request_conversations(24).await {
             Ok(conversations) => json_response(
                 "200 OK",
@@ -344,8 +495,8 @@ async fn route_control_conversations() -> HttpResponse {
     }
 }
 
-async fn route_control_tasks() -> HttpResponse {
-    match require_ready_status().await {
+async fn route_control_tasks(request: &HttpRequest) -> HttpResponse {
+    match require_ready_and_trusted(request).await {
         Ok(_) => match request_tasks(24).await {
             Ok(tasks) => json_response("200 OK", &serde_json::json!({ "tasks": tasks })),
             Err(err) => runtime_json_error(err),
@@ -354,8 +505,8 @@ async fn route_control_tasks() -> HttpResponse {
     }
 }
 
-async fn route_control_jobs() -> HttpResponse {
-    match require_ready_status().await {
+async fn route_control_jobs(request: &HttpRequest) -> HttpResponse {
+    match require_ready_and_trusted(request).await {
         Ok(_) => match request_jobs(24).await {
             Ok(jobs) => json_response("200 OK", &serde_json::json!({ "jobs": jobs })),
             Err(err) => runtime_json_error(err),
@@ -365,7 +516,7 @@ async fn route_control_jobs() -> HttpResponse {
 }
 
 async fn route_control_message(request: &HttpRequest) -> HttpResponse {
-    match require_ready_status().await {
+    match require_ready_and_trusted(request).await {
         Ok(_) => match parse_json_body::<ControlMessageRequest>(request) {
             Ok(input) => match request_control_message(input).await {
                 Ok(response) => json_response("200 OK", &response),
@@ -378,7 +529,7 @@ async fn route_control_message(request: &HttpRequest) -> HttpResponse {
 }
 
 async fn route_control_approve(request: &HttpRequest) -> HttpResponse {
-    match require_ready_status().await {
+    match require_ready_and_trusted(request).await {
         Ok(_) => match parse_json_body::<ControlApprovalRequest>(request) {
             Ok(input) => match request_control_approval(input).await {
                 Ok(response) => json_response("200 OK", &response),
@@ -387,6 +538,25 @@ async fn route_control_approve(request: &HttpRequest) -> HttpResponse {
             Err(err) => json_error("400 Bad Request", "invalid_json", &format!("{err:#}")),
         },
         Err(response) => response,
+    }
+}
+
+async fn require_ready_and_trusted(
+    request: &HttpRequest,
+) -> std::result::Result<ProvisioningStatus, HttpResponse> {
+    let status = require_ready_status().await?;
+    match trusted_control_request(request) {
+        Ok(true) => Ok(status),
+        Ok(false) => Err(json_error(
+            "401 Unauthorized",
+            "pairing_required",
+            "pair this browser before using control APIs",
+        )),
+        Err(err) => Err(json_error(
+            "500 Internal Server Error",
+            "control_trust_unavailable",
+            &err.to_string(),
+        )),
     }
 }
 
@@ -500,12 +670,17 @@ async fn read_request(stream: &mut TcpStream) -> Result<HttpRequest> {
 }
 
 async fn write_response(stream: &mut TcpStream, response: HttpResponse) -> Result<()> {
-    let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        response.status,
-        response.content_type,
-        response.body.len()
+    let mut header = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n",
+        response.status, response.content_type, response.body.len()
     );
+    for (name, value) in &response.headers {
+        header.push_str(name);
+        header.push_str(": ");
+        header.push_str(value);
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
     timeout(REQUEST_TIMEOUT, stream.write_all(header.as_bytes()))
         .await
         .context("timed out writing response headers")??;
@@ -518,6 +693,13 @@ async fn write_response(stream: &mut TcpStream, response: HttpResponse) -> Resul
         .await
         .context("timed out shutting down response stream")??;
     Ok(())
+}
+
+impl HttpResponse {
+    fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
 }
 
 async fn request_provisioning_status() -> Result<ProvisioningStatus, ProvisionClientError> {
@@ -978,6 +1160,23 @@ where
     serde_json::from_slice(&request.body).context("request body is not valid JSON")
 }
 
+fn parse_pair_form(request: &HttpRequest) -> Result<ControlPairRequest> {
+    let content_type = request
+        .headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or("");
+    if !content_type.starts_with("application/x-www-form-urlencoded") {
+        bail!("expected application/x-www-form-urlencoded");
+    }
+
+    let raw_body = str::from_utf8(&request.body).context("request body is not valid utf-8")?;
+    let form = parse_form_fields(raw_body)?;
+    Ok(ControlPairRequest {
+        pairing_code: form.get("pairing_code").cloned().unwrap_or_default(),
+    })
+}
+
 fn parse_form_fields(raw: &str) -> Result<HashMap<String, String>> {
     let mut fields = HashMap::new();
     for pair in raw.split('&') {
@@ -1030,6 +1229,156 @@ fn decode_hex(byte: u8) -> Result<u8> {
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => bail!("invalid hex digit in form body"),
     }
+}
+
+fn trusted_control_request(request: &HttpRequest) -> Result<bool> {
+    let Some(token) = request_session_token(request) else {
+        return Ok(false);
+    };
+    BrowserTrustStore::default()
+        .trusted_session_token(&token)
+        .map(|session| session.is_some())
+}
+
+fn request_session_token(request: &HttpRequest) -> Option<String> {
+    request
+        .headers
+        .get("x-bunzo-control-session")
+        .and_then(|value| non_empty(Some(value.clone())))
+        .or_else(|| {
+            request
+                .headers
+                .get("cookie")
+                .and_then(|header| cookie_value(header, SESSION_COOKIE_NAME))
+        })
+}
+
+fn cookie_value(header: &str, name: &str) -> Option<String> {
+    for part in header.split(';') {
+        if let Some((cookie_name, cookie_value)) = part.trim().split_once('=') {
+            if cookie_name == name {
+                return non_empty(Some(cookie_value.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn render_pairing_response(
+    status: &ProvisioningStatus,
+    flash: Option<&FlashMessage>,
+) -> HttpResponse {
+    match BrowserTrustStore::default().ensure_pairing_challenge() {
+        Ok(challenge) => html_response(render_pairing_page(status, &challenge, flash)),
+        Err(err) => html_response(render_control_trust_error_page(status, &err.to_string())),
+    }
+}
+
+fn render_control_trust_error_page(status: &ProvisioningStatus, detail: &str) -> String {
+    render_pairing_page(
+        status,
+        &PairingChallengeSummary {
+            code_path: BrowserTrustStore::default().pairing_code_path(),
+            expires_at_ms: 0,
+            locked_until_ms: None,
+        },
+        Some(&FlashMessage {
+            kind: FlashKind::Error,
+            text: format!("browser trust state is unavailable: {detail}"),
+        }),
+    )
+}
+
+fn render_pairing_page(
+    status: &ProvisioningStatus,
+    challenge: &PairingChallengeSummary,
+    flash: Option<&FlashMessage>,
+) -> String {
+    let device_name = status.device_name.as_deref().unwrap_or("bunzo");
+    let model = status.model.as_deref().unwrap_or(RECOMMENDED_OPENAI_MODEL);
+    let connectivity = connectivity_summary(status);
+    let flash_html = flash
+        .map(|flash| {
+            let class_name = match flash.kind {
+                FlashKind::Success => "flash-success",
+                FlashKind::Error => "flash-error",
+            };
+            format!(
+                "<div class=\"flash {class_name}\">{}</div>",
+                escape_html(&flash.text)
+            )
+        })
+        .unwrap_or_default();
+    let lock_html = challenge
+        .locked_until_ms
+        .map(|until| {
+            format!(
+                "<div class=\"flash flash-error\">Pairing is temporarily locked until {until}.</div>"
+            )
+        })
+        .unwrap_or_default();
+    let code_path = challenge.code_path.display().to_string();
+
+    format!(
+        concat!(
+            "<!doctype html>",
+            "<html lang=\"en\"><head>",
+            "<meta charset=\"utf-8\">",
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+            "<title>pair {device_name}</title>",
+            "<style>",
+            ":root {{ --ink: #f4f0e8; --surface: #111318; --surface-2: #181b21; --line: rgba(244,240,232,0.13); --accent: #ffb84d; --muted: #a6adba; --red: #ff8a8a; --green: #65d987; font-family: \"Avenir Next\", \"Segoe UI\", system-ui, sans-serif; }}",
+            "* {{ box-sizing: border-box; }}",
+            "body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 18px; background: var(--surface); color: var(--ink); }}",
+            "main {{ width: min(560px, 100%); display: grid; gap: 16px; }}",
+            ".panel {{ display: grid; gap: 16px; padding: 22px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }}",
+            ".mark {{ width: 38px; height: 38px; display: grid; place-items: center; border-radius: 8px; background: #2d2518; color: var(--accent); font-weight: 900; }}",
+            "h1 {{ margin: 0; font-size: 1.7rem; line-height: 1.1; }}",
+            "p {{ margin: 0; color: var(--muted); line-height: 1.5; }}",
+            "code {{ color: var(--ink); overflow-wrap: anywhere; }}",
+            ".facts {{ display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }}",
+            ".fact {{ padding: 10px; border-radius: 8px; background: rgba(255,255,255,0.03); }}",
+            ".label {{ display: block; color: var(--muted); font-size: 0.72rem; text-transform: uppercase; font-weight: 800; margin-bottom: 5px; }}",
+            ".value {{ overflow-wrap: anywhere; }}",
+            ".flash {{ padding: 12px 14px; border-radius: 8px; font-weight: 700; }}",
+            ".flash-success {{ background: rgba(101,217,135,0.14); color: var(--green); }}",
+            ".flash-error {{ background: rgba(255,138,138,0.14); color: #ffd2d2; }}",
+            "form {{ display: grid; gap: 10px; }}",
+            "label {{ color: var(--muted); font-size: 0.78rem; font-weight: 800; text-transform: uppercase; }}",
+            "input, button {{ width: 100%; min-height: 46px; border-radius: 8px; font: inherit; }}",
+            "input {{ border: 1px solid var(--line); background: #101217; color: var(--ink); padding: 10px 12px; letter-spacing: 0; }}",
+            "button {{ border: 0; background: var(--accent); color: #1d1406; font-weight: 900; cursor: pointer; }}",
+            "a {{ color: #8bd3ff; }}",
+            "</style></head><body>",
+            "<main>",
+            "<section class=\"panel\">",
+            "<div class=\"mark\">b</div>",
+            "<h1>Pair {device_name}</h1>",
+            "{flash_html}{lock_html}",
+            "<p>Browser control is locked until this browser is paired. Enter the local pairing code from <code>{code_path}</code>.</p>",
+            "<div class=\"facts\">",
+            "<div class=\"fact\"><span class=\"label\">Device</span><div class=\"value\">{device_name}</div></div>",
+            "<div class=\"fact\"><span class=\"label\">Model</span><div class=\"value\">{model}</div></div>",
+            "<div class=\"fact\"><span class=\"label\">Network</span><div class=\"value\">{connectivity}</div></div>",
+            "<div class=\"fact\"><span class=\"label\">Expires</span><div class=\"value\">{expires_at_ms}</div></div>",
+            "</div>",
+            "<form method=\"post\" action=\"/pair\">",
+            "<label for=\"pairing_code\">Pairing code</label>",
+            "<input id=\"pairing_code\" name=\"pairing_code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" autofocus>",
+            "<button type=\"submit\">Pair Browser</button>",
+            "</form>",
+            "<p><a href=\"/setup\">Setup</a> remains available after pairing for reconfiguration.</p>",
+            "</section>",
+            "</main></body></html>"
+        ),
+        device_name = escape_html(device_name),
+        model = escape_html(model),
+        connectivity = escape_html(&connectivity),
+        code_path = escape_html(&code_path),
+        expires_at_ms = challenge.expires_at_ms,
+        flash_html = flash_html,
+        lock_html = lock_html,
+    )
 }
 
 fn render_control_page(status: &ProvisioningStatus, flash: Option<&FlashMessage>) -> String {
@@ -1943,6 +2292,7 @@ fn html_with_status(status: &'static str, body: String) -> HttpResponse {
     HttpResponse {
         status,
         content_type: "text/html; charset=utf-8",
+        headers: Vec::new(),
         body: body.into_bytes(),
     }
 }
@@ -1953,6 +2303,7 @@ fn json_response<T: serde::Serialize>(status: &'static str, body: &T) -> HttpRes
     HttpResponse {
         status,
         content_type: "application/json; charset=utf-8",
+        headers: Vec::new(),
         body,
     }
 }
@@ -1977,6 +2328,58 @@ fn runtime_json_error(err: RuntimeClientError) -> HttpResponse {
         }
         RuntimeClientError::Remote { code, text } => json_error("400 Bad Request", &code, &text),
     }
+}
+
+fn pairing_json_error(err: PairingError) -> HttpResponse {
+    match err {
+        PairingError::InvalidCode => json_error(
+            "401 Unauthorized",
+            "invalid_pairing_code",
+            "pairing code was not accepted",
+        ),
+        PairingError::ExpiredCode => json_error(
+            "401 Unauthorized",
+            "expired_pairing_code",
+            "pairing code expired; a new code was generated",
+        ),
+        PairingError::Locked { until_ms } => json_error(
+            "429 Too Many Requests",
+            "pairing_locked",
+            &format!("too many failed pairing attempts; locked until {until_ms}"),
+        ),
+        PairingError::Store(err) => json_error(
+            "500 Internal Server Error",
+            "control_trust_unavailable",
+            &err.to_string(),
+        ),
+    }
+}
+
+fn pairing_error_text(err: &PairingError) -> String {
+    match err {
+        PairingError::InvalidCode => "pairing code was not accepted".into(),
+        PairingError::ExpiredCode => "pairing code expired; a new code was generated".into(),
+        PairingError::Locked { until_ms } => {
+            format!("too many failed pairing attempts; locked until {until_ms}")
+        }
+        PairingError::Store(err) => format!("browser trust state is unavailable: {err}"),
+    }
+}
+
+fn redirect_with_session(location: &'static str, token: &str) -> HttpResponse {
+    html_with_status(
+        "303 See Other",
+        "<!doctype html><meta charset=\"utf-8\"><title>paired</title><p>paired</p>".to_string(),
+    )
+    .with_header("Location", location)
+    .with_header("Set-Cookie", session_cookie(token))
+}
+
+fn session_cookie(token: &str) -> String {
+    format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+        SESSION_COOKIE_NAME, token, SESSION_MAX_AGE_SECONDS
+    )
 }
 
 fn next_request_id(prefix: &str) -> String {
@@ -2068,6 +2471,43 @@ mod tests {
         assert!(html.contains("/api/message"));
         assert!(html.contains("/api/bootstrap"));
         assert!(!html.contains("/var/lib/bunzo/secrets/openai.key"));
+    }
+
+    #[test]
+    fn pairing_page_does_not_render_pairing_code() {
+        let status = ready_status();
+        let challenge = PairingChallengeSummary {
+            code_path: "/var/lib/bunzo/control/pairing-code".into(),
+            expires_at_ms: 123,
+            locked_until_ms: None,
+        };
+
+        let html = render_pairing_page(&status, &challenge, None);
+        assert!(html.contains("/var/lib/bunzo/control/pairing-code"));
+        assert!(html.contains("pairing_code"));
+        assert!(!html.contains("1234567890"));
+    }
+
+    #[test]
+    fn cookie_helpers_find_control_session() {
+        let token = "a".repeat(64);
+        let request = HttpRequest {
+            method: "GET".into(),
+            path: "/api/bootstrap".into(),
+            headers: HashMap::from([(
+                "cookie".into(),
+                format!("theme=dark; {}={token}; other=value", SESSION_COOKIE_NAME),
+            )]),
+            body: Vec::new(),
+        };
+
+        assert_eq!(
+            request_session_token(&request).as_deref(),
+            Some(token.as_str())
+        );
+        let cookie = session_cookie(&token);
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
     }
 
     #[test]
