@@ -98,16 +98,20 @@ Responsibilities:
 - show provisioning status from `bunzo-provisiond`
 - submit the same canonical setup inputs through the provisioning socket API
 - after provisioning is `ready`, serve the local browser control surface
+- enforce browser-control pairing before post-ready control or setup
+  reconfiguration endpoints reach `bunzod` or `bunzo-provisiond`
 - send browser prompts, history summary requests, job list requests, and
   approval resolution requests through the existing `bunzod` Unix-socket API
-- avoid owning provisioning logic or writing `/var/lib/bunzo/` or `/etc/bunzo/`
+- own only HTTP transport trust state under `/var/lib/bunzo/control/`
+- avoid owning provisioning logic or writing provisioning/runtime config under
+  `/var/lib/bunzo/config/`, `/var/lib/bunzo/secrets/`, or `/etc/bunzo/`
   directly
 - avoid owning runtime execution, policy, task, scheduler, or audit logic
 
 Current shape: socket-activated HTTP on guest port `8080`. In the QEMU dev
 loop, `run-qemu.sh` forwards host port `8080` to that guest port. `/setup`
-stays available for setup/reconfiguration; `/` becomes the control UI once
-provisioning is ready.
+stays available for paired setup/reconfiguration; `/` becomes the paired
+control UI once provisioning is ready.
 
 ## Key data paths
 
@@ -125,6 +129,10 @@ provisioning is ready.
   `/var/lib/bunzo/config/provider.toml`
 - Canonical backend secret:
   `/var/lib/bunzo/secrets/openai.key`
+- Browser-control trust state:
+  `/var/lib/bunzo/control/trust.toml`
+- Local browser-control pairing code:
+  `/var/lib/bunzo/control/pairing-code`
 - Current runtime hostname:
   `/etc/hostname`
 - Current runtime connectivity config:
@@ -154,7 +162,8 @@ normal `bunzod` request path on the next shell request
 
 ### Browser control path
 
-`bunzo-setup-httpd /api/*` after provisioning is ready → `bunzod` →
+`bunzo-setup-httpd /api/*` after provisioning is ready and the browser session
+is paired → `bunzod` →
 runtime store/task creation → policy evaluation → skill/model execution →
 task events/state updates
 
@@ -191,14 +200,13 @@ runtime/task/policy path as interactive work
 - proactive interval jobs via `/jobs`
 - provisioning via `bunzo-provisiond` with both local-shell and headless HTTP
   frontends
-- local browser control after provisioning through the existing HTTP frontend
-  and `bunzod` runtime path
+- paired local browser control after provisioning through the existing HTTP
+  frontend and `bunzod` runtime path
 - boot-safe runtime hostname/network/config reconciliation from canonical
   provisioning state
 
 ### Next
 
-- trust/pairing model for browser control
 - richer historical action review in the browser surface
 
 ### Later
