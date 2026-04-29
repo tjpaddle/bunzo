@@ -100,8 +100,9 @@ Responsibilities:
 - after provisioning is `ready`, serve the local browser control surface
 - enforce browser-control pairing before post-ready control or setup
   reconfiguration endpoints reach `bunzod` or `bunzo-provisiond`
-- send browser prompts, history summary requests, job list requests, and
-  approval resolution requests through the existing `bunzod` Unix-socket API
+- send browser prompts, history summary/detail requests, job list requests,
+  and approval resolution requests through the existing `bunzod` Unix-socket
+  API
 - own only HTTP transport trust state under `/var/lib/bunzo/control/`
 - avoid owning provisioning logic or writing provisioning/runtime config under
   `/var/lib/bunzo/config/`, `/var/lib/bunzo/secrets/`, or `/etc/bunzo/`
@@ -111,7 +112,9 @@ Responsibilities:
 Current shape: socket-activated HTTP on guest port `8080`. In the QEMU dev
 loop, `run-qemu.sh` forwards host port `8080` to that guest port. `/setup`
 stays available for paired setup/reconfiguration; `/` becomes the paired
-control UI once provisioning is ready.
+control UI once provisioning is ready. Browser detail routes such as
+`/api/conversation` and `/api/task` are read-only HTTP adapters over `bunzod`
+protocol messages; they do not read the runtime SQLite store directly.
 
 ## Key data paths
 

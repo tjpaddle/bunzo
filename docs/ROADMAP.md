@@ -20,10 +20,11 @@ The current milestone focus can move to M9 phone control and later hardware
 replay. M7 and M8 are closed in the QEMU development loop, with remaining
 Wi-Fi AP/captive-portal and hardware-radio validation tracked as future
 connectivity hardening rather than blockers for the provisioning engine
-milestone. M9 browser control and trust/pairing are now QEMU-verified: the
-existing socket-activated HTTP frontend becomes a paired browser control
-surface after provisioning reaches `ready`, and post-setup actions still go
-through `bunzod`.
+milestone. M9 browser control is now QEMU-verified for the current browser
+surface: the existing socket-activated HTTP frontend becomes a paired browser
+control surface after provisioning reaches `ready`, and post-setup actions,
+history summaries, conversation detail, task detail, approvals, and tool
+resume still go through `bunzod`.
 
 ## Completed milestones
 
@@ -143,7 +144,7 @@ Open work:
 
 - [x] Local phone/browser client for an already-provisioned device
 - [x] Trust/pairing model
-- [ ] Access to replies plus historical action review
+- [x] Access to replies plus historical action review
 
 Done so far:
 
@@ -156,17 +157,21 @@ Done so far:
       approval/resume path
 - [x] Browser-control pairing gate with local pairing code, hashed durable
       trust state, HTTP-only session cookie, and post-ready `/setup` gating
+- [x] Browser conversation detail endpoint/view for stored user and assistant
+      replies
+- [x] Browser task detail endpoint/view for policy decisions, waits, tool
+      invocation/results, and completion history
 
-**Current status:** browser control plus trust/pairing are QEMU-verified.
-After setup is `ready`, unpaired browsers see a pairing page and control APIs
-return `401 pairing_required`. Pairing uses a local code under
+**Current status:** complete and QEMU-verified for the current browser-control
+scope. After setup is `ready`, unpaired browsers see a pairing page and
+control APIs return `401 pairing_required`. Pairing uses a local code under
 `/var/lib/bunzo/control/pairing-code`, stores hashed durable trust/session
 material under `/var/lib/bunzo/control/trust.toml`, and sets an HTTP-only
 browser session cookie. Paired control UI and `/api/*` endpoints send
-messages, list runtime history summaries, list jobs, surface waiting
-approvals, and resume approved tasks through the same `bunzod`
-task/policy/audit path used by `bunzo-shell` and `bunzo-schedulerd`. The next
-M9 gap is richer access to replies plus historical action review.
+messages, list runtime history summaries, list jobs, show conversation replies
+and task action history, surface waiting approvals, and resume approved tasks
+through the same `bunzod` task/policy/audit path used by `bunzo-shell` and
+`bunzo-schedulerd`.
 
 ## Hardware/stretch targets
 
