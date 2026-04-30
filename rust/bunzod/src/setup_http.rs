@@ -1461,12 +1461,14 @@ fn render_pairing_page(
     let lock_html = challenge
         .locked_until_ms
         .map(|until| {
+            let remaining = deadline_distance_text_at(until, current_time_ms());
             format!(
-                "<div class=\"flash flash-error\">Pairing is temporarily locked until {until}.</div>"
+                "<div class=\"flash flash-error\">Pairing is temporarily locked; try again {remaining}.</div>"
             )
         })
         .unwrap_or_default();
     let code_path = challenge.code_path.display().to_string();
+    let expires_text = deadline_distance_text(challenge.expires_at_ms);
 
     format!(
         concat!(
@@ -1509,7 +1511,7 @@ fn render_pairing_page(
             "<div class=\"fact\"><span class=\"label\">Device</span><div class=\"value\">{device_name}</div></div>",
             "<div class=\"fact\"><span class=\"label\">Model</span><div class=\"value\">{model}</div></div>",
             "<div class=\"fact\"><span class=\"label\">Network</span><div class=\"value\">{connectivity}</div></div>",
-            "<div class=\"fact\"><span class=\"label\">Expires</span><div class=\"value\">{expires_at_ms}</div></div>",
+            "<div class=\"fact\"><span class=\"label\">Expires</span><div class=\"value\">{expires_text}</div></div>",
             "</div>",
             "<form method=\"post\" action=\"/pair\">",
             "<label for=\"pairing_code\">Pairing code</label>",
@@ -1524,7 +1526,7 @@ fn render_pairing_page(
         model = escape_html(model),
         connectivity = escape_html(&connectivity),
         code_path = escape_html(&code_path),
-        expires_at_ms = challenge.expires_at_ms,
+        expires_text = escape_html(&expires_text),
         flash_html = flash_html,
         lock_html = lock_html,
     )
@@ -2614,7 +2616,10 @@ fn pairing_json_error(err: PairingError) -> HttpResponse {
         PairingError::Locked { until_ms } => json_error(
             "429 Too Many Requests",
             "pairing_locked",
-            &format!("too many failed pairing attempts; locked until {until_ms}"),
+            &format!(
+                "too many failed pairing attempts; try again {}",
+                deadline_distance_text(until_ms)
+            ),
         ),
         PairingError::Store(err) => json_error(
             "500 Internal Server Error",
@@ -2629,10 +2634,45 @@ fn pairing_error_text(err: &PairingError) -> String {
         PairingError::InvalidCode => "pairing code was not accepted".into(),
         PairingError::ExpiredCode => "pairing code expired; a new code was generated".into(),
         PairingError::Locked { until_ms } => {
-            format!("too many failed pairing attempts; locked until {until_ms}")
+            format!(
+                "too many failed pairing attempts; try again {}",
+                deadline_distance_text(*until_ms)
+            )
         }
         PairingError::Store(err) => format!("browser trust state is unavailable: {err}"),
     }
+}
+
+fn deadline_distance_text(deadline_ms: u64) -> String {
+    deadline_distance_text_at(deadline_ms, current_time_ms())
+}
+
+fn deadline_distance_text_at(deadline_ms: u64, now_ms: u64) -> String {
+    let remaining_ms = deadline_ms.saturating_sub(now_ms);
+    if remaining_ms == 0 {
+        return "now".into();
+    }
+    if remaining_ms < 60_000 {
+        return "in less than 1 minute".into();
+    }
+
+    let minutes = ceil_div_u64(remaining_ms, 60_000);
+    if minutes < 60 {
+        let unit = if minutes == 1 { "minute" } else { "minutes" };
+        return format!("in about {minutes} {unit}");
+    }
+
+    let hours = ceil_div_u64(minutes, 60);
+    let unit = if hours == 1 { "hour" } else { "hours" };
+    format!("in about {hours} {unit}")
+}
+
+fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
+    value / divisor + u64::from(value % divisor != 0)
+}
+
+fn current_time_ms() -> u64 {
+    u64::try_from(crate::ledger::now_ms()).unwrap_or(u64::MAX)
 }
 
 fn redirect_with_session(location: &'static str, token: &str) -> HttpResponse {
@@ -2716,6 +2756,27 @@ mod tests {
     }
 
     #[test]
+    fn deadline_distance_text_formats_relative_time() {
+        assert_eq!(deadline_distance_text_at(1_000, 1_000), "now");
+        assert_eq!(
+            deadline_distance_text_at(60_999, 1_000),
+            "in less than 1 minute"
+        );
+        assert_eq!(
+            deadline_distance_text_at(61_000, 1_000),
+            "in about 1 minute"
+        );
+        assert_eq!(
+            deadline_distance_text_at(901_000, 1_000),
+            "in about 15 minutes"
+        );
+        assert_eq!(
+            deadline_distance_text_at(7_201_000, 1_000),
+            "in about 2 hours"
+        );
+    }
+
+    #[test]
     fn json_body_parses_control_message() {
         let request = HttpRequest {
             method: "POST".into(),
@@ -2765,16 +2826,29 @@ mod tests {
     #[test]
     fn pairing_page_does_not_render_pairing_code() {
         let status = ready_status();
+        let expires_at_ms = current_time_ms().saturating_add(15 * 60 * 1000);
         let challenge = PairingChallengeSummary {
             code_path: "/var/lib/bunzo/control/pairing-code".into(),
-            expires_at_ms: 123,
+            expires_at_ms,
             locked_until_ms: None,
         };
 
         let html = render_pairing_page(&status, &challenge, None);
         assert!(html.contains("/var/lib/bunzo/control/pairing-code"));
         assert!(html.contains("pairing_code"));
+        assert!(html.contains("in about 15 minutes"));
+        assert!(!html.contains(&expires_at_ms.to_string()));
         assert!(!html.contains("1234567890"));
+    }
+
+    #[test]
+    fn pairing_lock_errors_use_relative_time() {
+        let text = pairing_error_text(&PairingError::Locked {
+            until_ms: current_time_ms().saturating_add(60 * 1000),
+        });
+
+        assert!(text.contains("try again in about 1 minute"));
+        assert!(!text.contains("locked until"));
     }
 
     #[test]

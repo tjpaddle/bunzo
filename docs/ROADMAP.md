@@ -161,17 +161,20 @@ Done so far:
       replies
 - [x] Browser task detail endpoint/view for policy decisions, waits, tool
       invocation/results, and completion history
+- [x] Browser pairing page polish for human-readable expiry and lockout
+      timing
 
 **Current status:** complete and QEMU-verified for the current browser-control
 scope. After setup is `ready`, unpaired browsers see a pairing page and
 control APIs return `401 pairing_required`. Pairing uses a local code under
 `/var/lib/bunzo/control/pairing-code`, stores hashed durable trust/session
 material under `/var/lib/bunzo/control/trust.toml`, and sets an HTTP-only
-browser session cookie. Paired control UI and `/api/*` endpoints send
-messages, list runtime history summaries, list jobs, show conversation replies
-and task action history, surface waiting approvals, and resume approved tasks
-through the same `bunzod` task/policy/audit path used by `bunzo-shell` and
-`bunzo-schedulerd`.
+browser session cookie; the pairing page and lockout errors show relative
+expiry timing instead of raw epoch values. Paired control UI and `/api/*`
+endpoints send messages, list runtime history summaries, list jobs, show
+conversation replies and task action history, surface waiting approvals, and
+resume approved tasks through the same `bunzod` task/policy/audit path used
+by `bunzo-shell` and `bunzo-schedulerd`.
 
 ## Hardware/stretch targets
 
