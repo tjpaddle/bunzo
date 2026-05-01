@@ -9,12 +9,11 @@ same task/policy/audit model as interactive work.
 
 ## Current state
 
-- M1 through M6 are operationally closed in the QEMU development loop.
-- M8 scheduler slice 1 is live: `bunzo-schedulerd` exists, `/jobs` exists, and
-  scheduled work creates normal `scheduled_job` task runs through the same
-  runtime path as shell requests.
-- The next major milestone is M7 provisioning: replace `/setup` file writes
-  with a real `bunzo-provisiond` service and durable config ownership.
+- M1 through M9 are operationally closed in the QEMU development loop.
+- Runtime, provisioning, scheduler, browser control, and approval paths all
+  use the same durable task/policy/audit model.
+- Hardware replay has started with the `cm5_nano_a` target. The image path
+  builds `sdcard.img`; hardware smoke replay is still outstanding.
 
 ## Recommended doc load order
 
@@ -51,6 +50,16 @@ Then:
 Important: `remote-build.sh` only sees pushed Git state. For uncommitted local
 changes, sync the tree to the remote host first or commit/push before building.
 
+For CM5-NANO-A hardware image work:
+
+```sh
+./scripts/remote-build.sh cm5_nano_a
+./scripts/remote-fetch-image.sh cm5_nano_a --dry-run
+```
+
+See [docs/HARDWARE_REPLAY.md](docs/HARDWARE_REPLAY.md) before flashing or
+claiming hardware replay.
+
 ### Native Linux build
 
 ```sh
@@ -82,6 +91,8 @@ Use this only when the remote builder is unavailable:
 
 - [STATE.md](STATE.md) — compact working state for new threads
 - [docs/ROADMAP.md](docs/ROADMAP.md) — milestone status and open work
+- [docs/HARDWARE_REPLAY.md](docs/HARDWARE_REPLAY.md) — CM5-NANO-A hardware
+  replay runbook
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — current runtime/service shape
 - [docs/PROVISIONING.md](docs/PROVISIONING.md) — M7 target design
 - [docs/VISION.md](docs/VISION.md) — long-term product direction

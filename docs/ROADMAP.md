@@ -16,15 +16,14 @@ The QEMU development loop has completed the core runtime foundations:
 - M7 provisioning engine
 - M8 scheduler
 
-The current milestone focus can move to M9 phone control and later hardware
-replay. M7 and M8 are closed in the QEMU development loop, with remaining
-Wi-Fi AP/captive-portal and hardware-radio validation tracked as future
-connectivity hardening rather than blockers for the provisioning engine
-milestone. M9 browser control is now QEMU-verified for the current browser
-surface: the existing socket-activated HTTP frontend becomes a paired browser
-control surface after provisioning reaches `ready`, and post-setup actions,
-history summaries, conversation detail, task detail, approvals, and tool
-resume still go through `bunzod`.
+The current milestone focus is hardware replay. M7 and M8 are closed in the
+QEMU development loop, with remaining Wi-Fi AP/captive-portal and
+hardware-radio validation tracked as future connectivity hardening rather than
+blockers for the provisioning engine milestone. M9 browser control is now
+QEMU-verified for the current browser surface: the existing socket-activated
+HTTP frontend becomes a paired browser control surface after provisioning
+reaches `ready`, and post-setup actions, history summaries, conversation
+detail, task detail, approvals, and tool resume still go through `bunzod`.
 
 ## Completed milestones
 
@@ -180,9 +179,20 @@ by `bunzo-shell` and `bunzo-schedulerd`.
 
 Still open:
 
+- [x] `bunzo_cm5_nano_a` hardware image target builds `sdcard.img`
+- [ ] Replay the post-M5 runtime/provisioning/scheduler/browser smoke path on
+      CM5-NANO-A hardware
 - [ ] `bunzo_rpi4` real hardware target
 - [ ] `bunzo_pc_x86_64` generic PC target
 - [ ] Replay the post-M5 runtime smoke path on hardware
+
+Current status: CM5-NANO-A is the first hardware replay target. The pushed
+`main` image path has been verified through
+`./scripts/remote-build.sh cm5_nano_a`, producing
+`output/cm5_nano_a/images/sdcard.img`. Repeatable artifact handoff and replay
+steps live in [HARDWARE_REPLAY.md](HARDWARE_REPLAY.md). Hardware replay is not
+complete until that image is flashed and the runtime, provisioning, scheduler,
+browser-control, approval, and final systemd checks pass on the board.
 
 ## Later
 
